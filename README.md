@@ -25,6 +25,14 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
                                               with the app token
 ```
 
+> **Unified (galaxy) environments:** the management and game GraphQL surfaces
+> are served by ONE API on one origin. Point `LT_MANAGEMENT_API_URL` at that
+> origin and everything else follows — `mintAppToken` still reveals the
+> `gameApiUrl` (the same origin), and `serverWithLeastClients` still returns
+> the Buddy fleet. On legacy split deployments the two APIs have separate
+> hosts; the flow is identical either way. App ids on galaxy environments are
+> 64-bit snowflakes (e.g. `73877390897664`).
+
 1. **Identity.** You supply one email + password (`LT_EMAIL`, `LT_PASSWORD`).
    The tool derives one account per simulated client with plus-addressing:
    `alice@studio.com` becomes `alice+lt-0000@studio.com`,
