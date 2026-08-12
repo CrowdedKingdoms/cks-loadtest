@@ -1,0 +1,6 @@
+# Review ownership for the release path. See the org ruleset on this branch:
+# it requires a pull request and a code owner's approval, and refuses direct pushes.
+# GitHub reads CODEOWNERS from the branch a PR TARGETS, so this file exists on both
+# test and prod rather than only on the default branch.
+
+/.github/ @michaelmarshall
