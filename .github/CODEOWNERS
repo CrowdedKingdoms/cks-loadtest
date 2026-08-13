@@ -1,0 +1,20 @@
+# Review ownership for the release path.
+#
+# GitHub consults this file ONLY when it evaluates pull request reviews. On its own it blocks
+# nothing. What enforces it is whichever org ruleset currently applies to THIS branch, and that
+# differs by branch and changes over time:
+#
+#   test, prod  -- a pull request is required and these paths need a code owner's approval.
+#   dev, main   -- locked to the org owner outright; there is no pull-request path, so this
+#                  file is dormant here and becomes the gate the moment that lock is lifted.
+#
+# It is kept on dev deliberately, ahead of need: when the locks are reversed, the protection
+# is already in place rather than being remembered afterwards.
+#
+# CODEOWNERS is read from the branch a pull request TARGETS, never from the default branch,
+# which is why it exists on each branch separately. A copy missing from one branch protects
+# nothing there and fails silently, by requesting no review at all.
+#
+# Ordinary changes need no approval -- the rule asks for zero. Only the paths below require one.
+
+/.github/ @michaelmarshall
