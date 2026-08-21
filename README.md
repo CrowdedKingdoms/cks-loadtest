@@ -25,13 +25,20 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
                                               with the app token
 ```
 
-> **Unified (galaxy) environments:** the management and game GraphQL surfaces
-> are served by ONE API on one origin. Point `LT_MANAGEMENT_API_URL` at that
-> origin and everything else follows — `mintAppToken` still reveals the
-> `gameApiUrl` (the same origin), and `serverWithLeastClients` still returns
-> the Buddy fleet. On legacy split deployments the two APIs have separate
-> hosts; the flow is identical either way. App ids on galaxy environments are
-> 64-bit snowflakes (e.g. `73877390897664`).
+> **ONE API, ONE ORIGIN — and "galaxy" is not what this is.** The management and
+> game GraphQL surfaces are two surfaces of the unified CK API
+> (`ck.<tier>.v7.cks-env.com`), which runs on PostgreSQL + Citus. Galaxy is a
+> different product and is not the CK data plane; this note said "galaxy
+> environments" for months and there is no such thing to point at. There is also
+> no split deployment left: `cks-management-api` is not a running service.
+>
+> Point `LT_MANAGEMENT_API_URL` at that one origin and everything else follows —
+> `mintAppToken` still reveals `gameApiUrl` (the app's OWN datacenter, which is
+> where its shards live), and `serverWithLeastClients` still returns the Buddy
+> fleet. App ids are 64-bit snowflakes (e.g. `73877390897664`).
+>
+> The variable keeps its `MANAGEMENT` name for compatibility; it is the unified
+> origin, not a second host.
 
 1. **Identity.** You supply one email + password (`LT_EMAIL`, `LT_PASSWORD`).
    The tool derives one account per simulated client with plus-addressing:
@@ -103,7 +110,7 @@ All options can be given as CLI flags, `LT_*` environment variables, or a
 ./build/cks-loadtest \
   --email you@studio.com \
   --password 'your-password' \
-  --management-api-url https://api.dev.crowdedkingdoms.com \
+  --management-api-url https://ck.dev.v7.cks-env.com \
   --app-id 42 \
   --clients 100 --threads 4 --update-hz 10 --duration-sec 300
 ```
