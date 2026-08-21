@@ -11,6 +11,17 @@ flow a real native game client uses.
 - Provisions its own player accounts deterministically and idempotently from
   one email + password.
 
+> **AUTHENTICATION IS PART OF THE MEASUREMENT, and this harness does it in-band.**
+> bcrypt at 10 rounds costs 0.4–1.4s per sign-in, so ten thousand bots
+> authenticating at run start burns API CPU in exactly the first seconds where
+> the numbers matter. Provisioning runs before the ramp (`provisionAll`, then
+> the ramp), which keeps it out of the steady state — but it is inside the
+> process you are timing, and **the harness does not currently report whether
+> any session was minted MID-RUN**. Until it does, a run whose latency tail
+> looks wrong in the first minute should be suspected of measuring bcrypt.
+> Field note 59: provision out of band, cache the session, and have the harness
+> say `0 sessions minted during the run` rather than leaving it to be inferred.
+
 ## How it works
 
 ```
