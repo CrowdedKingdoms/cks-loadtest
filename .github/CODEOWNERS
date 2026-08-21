@@ -8,10 +8,15 @@
 #   dev         -- locked to the org owner outright; there is no pull-request path, so this
 #                  file is dormant here and becomes the gate the moment that lock is lifted.
 #
-# There are three branches and only three. `main` was deleted on the remote in all fourteen repos
-# on 2026-08-21 and this header named it until then. The org ruleset `lock-main-and-dev` still
-# lists `refs/heads/main` in its `include`, which is now inert -- narrowing it is a separate,
-# deliberate edit, because that one rule covers `dev` as well.
+# There are three branches and only three. `main` was deleted on the remote on 2026-08-21 in
+# every repository on this model -- fourteen that day, then `galaxy` and `edge-of-epoch` once the
+# scope was derived from the org rather than enumerated -- and this header named it until then.
+# The org ruleset `lock-main-and-dev` still lists `refs/heads/main` in its `include`, which is now
+# inert; narrowing it is a separate, deliberate edit, because that one rule covers `dev` as well.
+#
+# Three repositories still hold a `main` beside dev/test/prod and are deliberately untouched:
+# `cks-management-api`, `cks-control-plane` and `crowded-kingdoms` are all ARCHIVED, so their
+# refs are read-only and tidying one would mean un-archiving it.
 #
 # It is kept on dev deliberately, ahead of need: when the locks are reversed, the protection
 # is already in place rather than being remembered afterwards.
