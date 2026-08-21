@@ -5,8 +5,13 @@
 # differs by branch and changes over time:
 #
 #   test, prod  -- a pull request is required and these paths need a code owner's approval.
-#   dev, main   -- locked to the org owner outright; there is no pull-request path, so this
+#   dev         -- locked to the org owner outright; there is no pull-request path, so this
 #                  file is dormant here and becomes the gate the moment that lock is lifted.
+#
+# There are three branches and only three. `main` was deleted on the remote in all fourteen repos
+# on 2026-08-21 and this header named it until then. The org ruleset `lock-main-and-dev` still
+# lists `refs/heads/main` in its `include`, which is now inert -- narrowing it is a separate,
+# deliberate edit, because that one rule covers `dev` as well.
 #
 # It is kept on dev deliberately, ahead of need: when the locks are reversed, the protection
 # is already in place rather than being remembered afterwards.
