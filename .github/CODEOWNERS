@@ -1,30 +1,36 @@
-# Review ownership for the release path.
+# Review ownership for the release path and the tooling that drives it.
 #
-# GitHub consults this file ONLY when it evaluates pull request reviews. On its own it blocks
-# nothing. What enforces it is whichever org ruleset currently applies to THIS branch, and that
-# differs by branch and changes over time:
+# GitHub consults this file ONLY when it evaluates a pull request's reviews, and ONLY from the
+# branch that pull request TARGETS -- never from the default branch. On its own it blocks
+# nothing: what gives it force is whichever org ruleset applies to THIS branch, and that is a
+# separate object that changes over time. A copy missing from one branch protects nothing there
+# and fails SILENTLY, by requesting no review at all, which is why the file exists on each of
+# the three branches separately and is kept identical across them.
 #
-#   test, prod  -- a pull request is required and these paths need a code owner's approval.
-#   dev         -- locked to the org owner outright; there is no pull-request path, so this
-#                  file is dormant here and becomes the gate the moment that lock is lifted.
+# WHAT THE PATHS BELOW MEAN, as of 2026-08-21. The operator's branch policy requires an admin
+# for any pull request into `dev` or `test` that touches CI or scripts, and requires an admin
+# to merge into `prod` at all. This file is the whole implementation of the first half: there
+# is no ruleset field for "CI or scripts", so the guarded set is exactly what is listed here.
+# A path absent from this list is a path any developer may change and merge alone.
+#
+# It is deliberately BROAD -- all of `/scripts/`, not a subdirectory of it. It owned
+# `/scripts/ci/` until 2026-08-21, which read as coverage and was not: it left
+# `release-gates/` unowned in cks-game-api, so the gates could be edited by the very change
+# they would have refused, and it left `stage-site-publisher-key.sh` and `migrations/`
+# unowned in infra-control-plane while owning `deploy-cp.sh` beside them.
+#
+# The cost is stated rather than discovered: an ordinary change to a helper script now waits on
+# the code owner. If that owner cannot keep up, the honest fix is to narrow this list on
+# purpose or add owners -- not to bypass it, because a gate bypassed on every run is not a gate.
 #
 # There are three branches and only three. `main` was deleted on the remote on 2026-08-21 in
-# every repository on this model -- fourteen that day, then `galaxy` and `edge-of-epoch` once the
-# scope was derived from the org rather than enumerated -- and this header named it until then.
-# The org ruleset `lock-main-and-dev` still lists `refs/heads/main` in its `include`, which is now
-# inert; narrowing it is a separate, deliberate edit, because that one rule covers `dev` as well.
-#
-# Three repositories still hold a `main` beside dev/test/prod and are deliberately untouched:
-# `cks-management-api`, `cks-control-plane` and `crowded-kingdoms` are all ARCHIVED, so their
+# every repository on this model. Three repos still hold a `main` and are deliberately
+# untouched: cks-management-api, cks-control-plane and crowded-kingdoms are ARCHIVED, so their
 # refs are read-only and tidying one would mean un-archiving it.
 #
-# It is kept on dev deliberately, ahead of need: when the locks are reversed, the protection
-# is already in place rather than being remembered afterwards.
-#
-# CODEOWNERS is read from the branch a pull request TARGETS, never from the default branch,
-# which is why it exists on each branch separately. A copy missing from one branch protects
-# nothing there and fails silently, by requesting no review at all.
-#
-# Ordinary changes need no approval -- the rule asks for zero. Only the paths below require one.
+# Owner: scripts/apply-codeowners.mjs, which DERIVES this file from the repo's own previous
+# copy rather than rendering a template -- so a repo-specific rule below is preserved, not
+# overwritten. Edit the tool, not the fourteen copies.
 
 /.github/ @michaelmarshall
+/scripts/ @michaelmarshall
