@@ -204,6 +204,21 @@ src/
 tests/wire_test.cpp   wire vectors cross-checked against the reference impl
 ```
 
+## Versioning
+
+**There is none, and there is deliberately no changelog.** This repository ships no
+versioned artifact: `project(cks-loadtest CXX)` declares no `VERSION`, there are no
+git tags, there is no release workflow, and nothing publishes a binary anywhere. A
+run is built from a checkout, so **the commit is the version** — record the SHA
+beside a measurement, because that is the only thing that identifies what produced
+it.
+
+That is worth stating rather than leaving to inference: an absent changelog in a
+repo that ships a versioned artifact is a gap, and an auditor sweeping for one
+should be able to tell the two cases apart without re-deriving this. If a released
+binary or image ever starts being published from here, that is the moment this
+section becomes wrong and a `CHANGELOG.md` becomes owed.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
