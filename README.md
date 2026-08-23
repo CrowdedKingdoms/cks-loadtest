@@ -73,7 +73,8 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
 
 ## Prerequisites
 
-- Your app must be reachable through a Management API + Game API deployment.
+- Your app must be reachable through a CK deployment. That is **one origin**
+  serving both the management and game GraphQL surfaces, not two hosts.
 - **Entitlements are your job.** The load tester is tier-agnostic: it does not
   inspect or manage app tiers, entitlements, or load limits. If a derived
   account is not entitled to the app, `mintAppToken` returns `FORBIDDEN` and
