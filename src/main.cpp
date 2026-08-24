@@ -86,14 +86,28 @@ int main(int argc, char** argv) {
     std::printf("management api: %s\n", config.managementApiUrl.c_str());
 
     // ---- Phase 1: provision (GraphQL) -----------------------------------
-    lt::Provisioner provisioner(config);
+    // A roster that cannot be read, or that belongs to another origin or
+    // population, throws here rather than degrading into signing everybody in.
+    std::unique_ptr<lt::Provisioner> provisionerPtr;
+    try {
+        provisionerPtr = std::make_unique<lt::Provisioner>(config);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        lt::GraphQLClient::globalCleanup();
+        return 2;
+    }
+    lt::Provisioner& provisioner = *provisionerPtr;
     std::vector<lt::ClientCredentials> creds = provisioner.provisionAll(g_stop);
     if (creds.empty()) {
         lt::GraphQLClient::globalCleanup();
         return g_stop.load() ? 130 : 1;
     }
-    std::printf("[provision] all %zu clients signed in, minted, and assigned\n",
+    std::printf("[provision] all %zu clients have a session, an app token, and "
+                "a Buddy assignment\n",
                 creds.size());
+    std::printf("[provision] sign-in: %d minted, %d reused from the roster\n",
+                provisioner.signIns().mintedProvisioning.load(),
+                provisioner.signIns().reused.load());
 
     // ---- Phase 2: simulate (UDP) -----------------------------------------
     lt::Stats stats;
@@ -109,6 +123,8 @@ int main(int argc, char** argv) {
     // Ramp schedule: batches of rampBatchSize activate every rampIntervalMs,
     // ordered by global client index; clients also respect their session
     // settle time (udpReadyAt).
+    // From here on, a sign-in is a MID-RUN sign-in and is reported as such.
+    provisioner.markRunStarted();
     const auto rampStart = std::chrono::steady_clock::now();
     for (auto& c : creds) {
         int batch = c.index / config.rampBatchSize;
@@ -170,7 +186,9 @@ int main(int argc, char** argv) {
     controlQueue.shutdown();
     controlThread.join();
     reporter.stop();
-    reporter.printFinalSummary();
+    reporter.printFinalSummary(provisioner.signIns().reused.load(),
+                               provisioner.signIns().mintedProvisioning.load(),
+                               provisioner.signIns().mintedMidRun.load());
 
     lt::GraphQLClient::globalCleanup();
     if (rxHealthFailed) return 3;

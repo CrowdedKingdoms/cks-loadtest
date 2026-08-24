@@ -99,8 +99,16 @@ std::string Config::derivedEmail(int index) const {
 std::string Config::validate() const {
     if (email.empty()) return "missing LT_EMAIL / --email";
     if (email.find('@') == std::string::npos) return "LT_EMAIL must be a full email address";
-    if (password.empty()) return "missing LT_PASSWORD / --password";
-    if (password.size() < 8) return "LT_PASSWORD must be at least 8 characters (API minimum)";
+    if (needsPassword()) {
+        if (password.empty()) {
+            return rosterFile.empty()
+                       ? "missing LT_PASSWORD / --password"
+                       : "missing LT_PASSWORD / --password: the roster may not "
+                         "cover every client and the rest must sign in. Set "
+                         "LT_ROSTER_REQUIRED=1 to refuse a short roster instead.";
+        }
+        if (password.size() < 8) return "LT_PASSWORD must be at least 8 characters (API minimum)";
+    }
     if (managementApiUrl.empty()) return "missing LT_MANAGEMENT_API_URL / --management-api-url";
     if (appId <= 0) return "missing/invalid LT_APP_ID / --app-id";
     if (clients < 1) return "LT_CLIENTS must be >= 1";
@@ -142,6 +150,8 @@ Config Config::load(int argc, char** argv) {
         ("stats-interval-sec", "Seconds between stats reports", cxxopts::value<int>())
         ("csv-out", "Append per-interval stats to this CSV file", cxxopts::value<std::string>())
         ("email-pattern", "Derived email pattern ({local},{domain},{index})", cxxopts::value<std::string>())
+        ("roster", "Pre-minted session roster JSON (a run then signs in nobody)", cxxopts::value<std::string>())
+        ("roster-required", "Refuse to run if the roster misses any client", cxxopts::value<bool>())
         ("verify-server-hmac", "Verify HMAC on signed server notifications", cxxopts::value<bool>())
         ("tls-insecure", "Skip TLS certificate verification (dev only)", cxxopts::value<bool>())
         ("session-settle-ms", "Wait after server assignment before UDP (ms)", cxxopts::value<int>())
@@ -186,6 +196,8 @@ Config Config::load(int argc, char** argv) {
     c.statsIntervalSec = layers.getInt("LT_STATS_INTERVAL_SEC", c.statsIntervalSec);
     c.csvOut = layers.get("LT_CSV_OUT", c.csvOut);
     c.emailPattern = layers.get("LT_EMAIL_PATTERN", c.emailPattern);
+    c.rosterFile = layers.get("LT_ROSTER_FILE", c.rosterFile);
+    c.rosterRequired = layers.getBool("LT_ROSTER_REQUIRED", c.rosterRequired);
     c.verifyServerHmac = layers.getBool("LT_VERIFY_SERVER_HMAC", c.verifyServerHmac);
     c.tlsInsecure = layers.getBool("LT_TLS_INSECURE", c.tlsInsecure);
     c.sessionSettleMs = layers.getInt("LT_SESSION_SETTLE_MS", c.sessionSettleMs);
@@ -221,6 +233,8 @@ Config Config::load(int argc, char** argv) {
     cliInt("stats-interval-sec", c.statsIntervalSec);
     cliStr("csv-out", c.csvOut);
     cliStr("email-pattern", c.emailPattern);
+    cliStr("roster", c.rosterFile);
+    cliBool("roster-required", c.rosterRequired);
     cliBool("verify-server-hmac", c.verifyServerHmac);
     cliBool("tls-insecure", c.tlsInsecure);
     cliInt("session-settle-ms", c.sessionSettleMs);

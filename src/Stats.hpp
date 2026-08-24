@@ -30,6 +30,20 @@ struct Stats {
     /// GENERIC_ERROR_MESSAGE counts keyed by wire error code.
     std::array<std::atomic<uint64_t>, 256> errorCodes{};
 
+    /// UNAUTHORIZED refusals that are the EXPECTED first contact with a Buddy.
+    ///
+    /// Buddy loads a session's permission window lazily, and the first spatial
+    /// packet is what triggers the load rather than something a longer settle
+    /// wait avoids: measured on dev, a 1500ms and an 8000ms
+    /// LT_SESSION_SETTLE_MS both produce exactly one refusal per client per
+    /// assignment. So this count is normally equal to the number of clients,
+    /// it is self-healing, and it means nothing is wrong.
+    ///
+    /// It is counted apart from `errorCodes[UNAUTHORIZED]` because at a
+    /// hundred clients an undifferentiated "UNAUTHORIZED: 100" in the summary
+    /// reads as a platform fault, and the run that produced it was clean.
+    std::atomic<uint64_t> unauthorizedFirstContact{0};
+
     // One-way latency (ms) from notification epoch tails.
     std::atomic<uint64_t> latencySamples{0};
     std::atomic<uint64_t> latencySumMs{0};
@@ -78,7 +92,12 @@ public:
     void stop();
 
     /// Print the end-of-run summary (totals, latency histogram, error codes).
-    void printFinalSummary() const;
+    /// `reused` / `mintedBefore` / `mintedDuring` are the sign-in tally, passed
+    /// as plain counts so Stats does not need to know about the provisioner.
+    /// Authentication is part of the measurement, so the run says what it did
+    /// rather than leaving a reader to infer it.
+    void printFinalSummary(int reused = -1, int mintedBefore = -1,
+                           int mintedDuring = -1) const;
 
 private:
     void run();

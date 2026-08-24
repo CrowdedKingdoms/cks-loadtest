@@ -1,5 +1,7 @@
 #include "Stats.hpp"
 
+#include "Wire.hpp"
+
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -143,9 +145,20 @@ void StatsReporter::run() {
     }
 }
 
-void StatsReporter::printFinalSummary() const {
+void StatsReporter::printFinalSummary(int reused, int mintedBefore,
+                                      int mintedDuring) const {
     Snapshot s = snapshot(stats_);
     std::printf("\n===== load test summary =====\n");
+    if (mintedDuring >= 0) {
+        std::printf("sign-in: %d session(s) minted DURING the run, "
+                    "%d before the ramp, %d reused from the roster\n",
+                    mintedDuring, mintedBefore, reused);
+        if (mintedDuring > 0) {
+            std::printf("  WARNING: a session minted during the run costs "
+                        "0.4-1.4s of API bcrypt, so the steady-state numbers "
+                        "below include it.\n");
+        }
+    }
     std::printf("tx: %" PRIu64 " packets, %" PRIu64 " bytes (%" PRIu64 " send errors)\n",
                 s.txPackets, s.txBytes, s.txSendErrors);
     std::printf("rx: %" PRIu64 " datagrams, %" PRIu64 " bytes, %" PRIu64
@@ -174,6 +187,8 @@ void StatsReporter::printFinalSummary() const {
         }
     }
 
+    uint64_t firstContact =
+        stats_.unauthorizedFirstContact.load(std::memory_order_relaxed);
     bool anyErr = false;
     for (int c = 0; c < 256; ++c) {
         uint64_t n = stats_.errorCodes[c].load(std::memory_order_relaxed);
@@ -183,6 +198,24 @@ void StatsReporter::printFinalSummary() const {
             anyErr = true;
         }
         std::printf("  code %d (%s): %" PRIu64 "\n", c, errorCodeName(c), n);
+    }
+    if (firstContact) {
+        uint64_t unauth =
+            stats_.errorCodes[wire::ERR_UNAUTHORIZED].load(std::memory_order_relaxed);
+        std::printf("  of which EXPECTED: %" PRIu64
+                    " on first contact with a Buddy, within 2s of an "
+                    "assignment. Buddy loads the permission window lazily and "
+                    "the client's own first packet triggers it, so roughly one "
+                    "per client is normal and not a fault.\n",
+                    firstContact);
+        if (unauth > firstContact) {
+            std::printf("  UNEXPLAINED: %" PRIu64
+                        " UNAUTHORIZED arrived LATER than that. These are not "
+                        "the lazy load. Check the granted tier carries runtime "
+                        "permissions; a steady stream means sessions are "
+                        "wedged.\n",
+                        unauth - firstContact);
+        }
     }
     std::printf("=============================\n");
     std::fflush(stdout);

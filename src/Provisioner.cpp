@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <ctime>
+#include <fstream>
 #include <mutex>
 #include <thread>
 
@@ -90,7 +91,88 @@ std::chrono::system_clock::time_point parseIso8601Utc(const std::string& iso,
     return std::chrono::system_clock::now() + std::chrono::seconds(fallbackSec);
 }
 
-Provisioner::Provisioner(const Config& config) : config_(config) {}
+/// Load a pre-minted session roster.
+///
+/// THE ORIGIN IS CHECKED, and that is the whole reason the file records one. A
+/// session minted against one tier is a syntactically valid bearer token that
+/// means nothing on another, so a roster carried between tiers produces
+/// authentication failures that read like a broken tier rather than like a
+/// misplaced file. Refusing here costs one comparison; diagnosing it later
+/// costs an afternoon.
+///
+/// A MISSING FILE IS A REFUSAL, never an empty roster. "Could not read the
+/// roster" and "the roster covers nobody" would otherwise be the same
+/// observation, and the second silently signs every client in -- which is
+/// exactly the cost the roster exists to avoid.
+Provisioner::Provisioner(const Config& config) : config_(config) {
+    if (config_.rosterFile.empty()) return;
+
+    std::ifstream f(config_.rosterFile);
+    if (!f) {
+        throw GraphQLError("cannot open LT_ROSTER_FILE '" + config_.rosterFile +
+                               "'. A roster that cannot be read is a refusal, "
+                               "not an empty roster: continuing would sign "
+                               "every client in and quietly measure bcrypt.",
+                           "", false);
+    }
+    nlohmann::json doc;
+    try {
+        f >> doc;
+    } catch (const std::exception& e) {
+        throw GraphQLError("LT_ROSTER_FILE '" + config_.rosterFile +
+                               "' is not valid JSON: " + e.what(),
+                           "", false);
+    }
+
+    // The roster names the origin it was minted against. Compare on the base
+    // URL the harness was pointed at, trailing slash insensitively.
+    auto trimSlash = [](std::string s) {
+        while (!s.empty() && s.back() == '/') s.pop_back();
+        return s;
+    };
+    if (doc.contains("origin") && doc["origin"].is_string()) {
+        std::string rosterOrigin = trimSlash(doc["origin"].get<std::string>());
+        std::string ours = trimSlash(config_.managementApiUrl);
+        if (rosterOrigin != ours) {
+            throw GraphQLError(
+                "LT_ROSTER_FILE was minted against '" + rosterOrigin +
+                    "' but this run targets '" + ours +
+                    "'. A session is only valid on the origin that issued it; "
+                    "re-provision the roster for this origin rather than "
+                    "pointing the harness at the other one.",
+                "", false);
+        }
+    }
+
+    for (const auto& entry : doc.value("sessions", nlohmann::json::array())) {
+        if (!entry.contains("index") || !entry.contains("token")) continue;
+        int idx = entry["index"].get<int>();
+        std::string token = entry["token"].get<std::string>();
+        if (token.empty()) continue;
+        roster_[idx] = std::move(token);
+        if (entry.contains("email") && entry["email"].is_string()) {
+            rosterEmails_[idx] = entry["email"].get<std::string>();
+        }
+    }
+}
+
+std::string Provisioner::rosterSession(int index, const std::string& email) const {
+    auto it = roster_.find(index);
+    if (it == roster_.end()) return "";
+    // A roster entry whose email disagrees with the pattern this run derives is
+    // a roster for a different population. Using it would authenticate as
+    // somebody else and report success, so it is a refusal.
+    auto e = rosterEmails_.find(index);
+    if (e != rosterEmails_.end() && e->second != email) {
+        throw GraphQLError(
+            "LT_ROSTER_FILE entry " + std::to_string(index) + " is for '" +
+                e->second + "' but this run derives '" + email +
+                "' from LT_EMAIL/LT_EMAIL_PATTERN. The roster belongs to a "
+                "different bot population; regenerate it or fix the pattern.",
+            "", false);
+    }
+    return it->second;
+}
 
 std::string Provisioner::signIn(GraphQLClient& mgmt, const std::string& email) {
     nlohmann::json creds = {{"email", email}, {"password", config_.password}};
@@ -203,6 +285,30 @@ void Provisioner::refreshToken(GraphQLClient& mgmt, ClientCredentials& c) {
 
 std::vector<ClientCredentials> Provisioner::provisionAll(std::atomic<bool>& stop) {
     const int total = config_.clients;
+
+    // Say what the roster covers BEFORE doing any work, and refuse a short one
+    // when asked to. A roster covering 40 of 100 clients is the dangerous
+    // middle: the run succeeds and sixty sign-ins disappear into the numbers.
+    if (!config_.rosterFile.empty()) {
+        int covered = 0;
+        for (int i = 0; i < total; ++i) {
+            if (roster_.count(i)) ++covered;
+        }
+        std::printf("[provision] roster: %d of %d client(s) have a pre-minted "
+                    "session (%d entr%s in %s)\n",
+                    covered, total, rosterSize(), rosterSize() == 1 ? "y" : "ies",
+                    config_.rosterFile.c_str());
+        if (covered < total && config_.rosterRequired) {
+            std::fprintf(stderr,
+                         "[provision] FATAL: LT_ROSTER_REQUIRED is set and the "
+                         "roster covers %d of %d clients. The remaining %d would "
+                         "each cost a bcrypt sign-in inside the process you are "
+                         "timing. Re-provision the roster for %d clients, or "
+                         "unset LT_ROSTER_REQUIRED to accept the cost.\n",
+                         covered, total, total - covered, total);
+            return {};
+        }
+    }
     std::vector<ClientCredentials> out(static_cast<size_t>(total));
     std::atomic<int> nextIndex{0};
     std::atomic<int> completed{0};
@@ -219,7 +325,21 @@ std::vector<ClientCredentials> Provisioner::provisionAll(std::atomic<bool>& stop
             c.index = i;
             c.email = config_.derivedEmail(i);
             try {
-                c.sessionToken = signIn(mgmt, c.email);
+                c.sessionToken = rosterSession(i, c.email);
+                if (!c.sessionToken.empty()) {
+                    signIns_.reused.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    c.sessionToken = signIn(mgmt, c.email);
+                    // Which counter this lands in is the difference between a
+                    // cost paid before the clock started and one inside the
+                    // steady state.
+                    if (runStarted_.load(std::memory_order_relaxed)) {
+                        signIns_.mintedMidRun.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        signIns_.mintedProvisioning.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                }
                 mintAppToken(mgmt, c);
                 bootstrapGameClient(c);
                 assignServer(c);
