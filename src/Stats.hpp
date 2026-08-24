@@ -43,6 +43,10 @@ struct Stats {
     /// hundred clients an undifferentiated "UNAUTHORIZED: 100" in the summary
     /// reads as a platform fault, and the run that produced it was clean.
     std::atomic<uint64_t> unauthorizedFirstContact{0};
+    /// UNAUTHORIZED refused because the client walked out of the server's
+    /// cached grid-permission box. The same lazy load as first contact, and
+    /// counted apart from it so a reader can see which of the two is happening.
+    std::atomic<uint64_t> unauthorizedWindowReload{0};
 
     // One-way latency (ms) from notification epoch tails.
     std::atomic<uint64_t> latencySamples{0};
@@ -96,8 +100,8 @@ public:
     /// as plain counts so Stats does not need to know about the provisioner.
     /// Authentication is part of the measurement, so the run says what it did
     /// rather than leaving a reader to infer it.
-    void printFinalSummary(int reused = -1, int mintedBefore = -1,
-                           int mintedDuring = -1) const;
+    void printFinalSummary(int permWindowRadiusChunks, int reused = -1,
+                           int mintedBefore = -1, int mintedDuring = -1) const;
 
 private:
     void run();

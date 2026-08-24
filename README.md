@@ -266,24 +266,77 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
   the accounts' granted tier carries no runtime permissions: tokens mint fine
   and every spatial message is refused.
 
-  The `UNEXPLAINED` line is deliberately not folded into the expected total, and
-  on current tiers it is usually non-zero on a longer run. Measured with 100
-  clients at 10 Hz, same roster, same app:
+- **A second, later batch of `UNAUTHORIZED` is the SAME lazy load, and it is
+  geometry rather than a timer.** These used to be reported as `UNEXPLAINED`,
+  which read as a platform fault and is not one. The server caches grid
+  permissions as a **box of radius 8 chunks centred where the last lookup ran**,
+  so a client that walks far enough leaves the box, and the packet that crosses
+  the edge is refused while the re-query is in flight — exactly as at first
+  contact, just later. The summary counts them separately:
 
-  | run length | expected | unexplained |
-  |---|---|---|
-  | 60 s | 100 | **0** |
-  | 120 s (dev) | 100 | 37 |
-  | 120 s (test) | 100 | 34 |
+  ```
+  code 7 (UNAUTHORIZED): 144
+    of which EXPECTED: 100 on first contact with a Buddy, within 2s ...
+    of which EXPECTED: 44 on crossing out of the server's cached ...
+  ```
 
-  So they are not a startup artefact and not tier-specific: **they begin
-  somewhere between 60 s and 120 s into a run**, at roughly a third of clients,
-  on both tiers. That bracket is the useful part — a run at 90 s and one at
-  150 s would narrow it in two attempts. The shape is consistent with a
-  server-side permission window or session entry being re-validated on a timer,
-  but nothing here has established that, which is exactly why the harness labels
-  the count unexplained instead of widening its window until the number looks
-  clean.
+  **The timing is a distance divided by a speed, not a timeout**, which is worth
+  understanding because the first guess is always a TTL. A chunk is 1600 uu and
+  the box radius is 8 chunks, so the edge is 12800 uu away: at the default
+  `LT_WALK_SPEED=150` that is **85 s** if a client walks along an axis and
+  **121 s** if it walks at 45°, since the box is square. Nothing can arrive
+  before 85 s, and nothing did.
+
+  Measured on dev, 100 clients at 10 Hz, same roster and app, varying one input
+  at a time:
+
+  | run | walk speed | spawn radius | first late refusal | late total |
+  |---|---|---|---|---|
+  | baseline, 180 s | 150 | 8 | **t+101 s** | 44 |
+  | 120 s | **0** | 8 | never | **0** |
+  | 120 s | **600** (4×) | 8 | **t+21 s** (4× earlier) | 79 |
+  | 150 s | 150 | **0** | never | **0** |
+
+  Those last two rows are the ones that settle it. Onset scales as **1/speed**,
+  and a run at full walk speed with `LT_SPAWN_RADIUS_CHUNKS=0` produces none at
+  all over 150 s — so no clock-driven mechanism is involved, because a token
+  TTL, an idle disconnect or a released session slot would all still fire in a
+  run where the clients are moving as fast as ever.
+
+  **Why the spawn radius matters, and why this is the harness's own doing.** The
+  walk is confined to `LT_SPAWN_RADIUS_CHUNKS` of the **world origin** (it
+  reverses direction at the edge), while the server's box is centred on each
+  client's **own spawn chunk**. A client that spawns at the origin has a box
+  containing the whole confinement area and can never leave it; one that spawns
+  at the edge is guaranteed to walk out of its box on the way to the far side.
+  That is why roughly a third to a half of clients see one and the rest never
+  do, and why setting the spawn radius to 0 removes them entirely. The
+  confinement is deliberate — it keeps clients close enough to replicate to each
+  other, which is the point of the load — so the harness reports the refusals
+  rather than tuning them away.
+
+  `LT_PERMISSION_WINDOW_RADIUS_CHUNKS` (default 8) is the radius the harness
+  *assumes* when classifying. It is never sent on the wire, and the server's
+  value is not discoverable from a client, so it is a declared assumption: set
+  it too small and ordinary refusals get filed as window reloads, set it too
+  large and they land in `UNEXPLAINED`.
+
+- **`UNEXPLAINED` is what remains, and it is the line worth chasing.** A refusal
+  that arrives while a client is neither newly assigned nor outside the modelled
+  box is not accounted for by either lazy load. Check that the accounts' granted
+  tier carries runtime permissions, and treat a steady stream as wedged sessions.
+  The bucket is kept deliberately reachable rather than widened until the number
+  reads zero — verified by running with the radius set absurdly high, which
+  correctly moves every window-reload refusal into it.
+
+  **Expect a residual of a few percent here even on a healthy tier**, so read the
+  trend rather than demanding zero: a measured baseline run was 100 first-contact,
+  51 window-reload and **9 unexplained out of 160**. The harness models a single
+  box while the server keeps several, and the two disagree about the centre by a
+  chunk or so under flight time, so a handful of genuine crossings get filed as
+  internal. That gap was deliberately not tuned away — anything that closed it
+  would be widening a model of the server's cache until the number looked clean,
+  and a real permission fault would then land inside the widened grace.
 - Exit code 3 means the RX health check tripped: traffic was sent but nothing
   was received (bad address, UDP blocked, or sessions never installed).
 
