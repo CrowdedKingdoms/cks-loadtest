@@ -266,11 +266,24 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
   the accounts' granted tier carries no runtime permissions: tokens mint fine
   and every spatial message is refused.
 
-  The `UNEXPLAINED` line is deliberately not folded into the expected total.
-  A 120 s, 100-client run on a live tier produced 37 of them, arriving late in
-  the run rather than at startup, and the cause is not yet established — so the
-  harness reports them as unexplained rather than widening its window until the
-  number looks clean.
+  The `UNEXPLAINED` line is deliberately not folded into the expected total, and
+  on current tiers it is usually non-zero on a longer run. Measured with 100
+  clients at 10 Hz, same roster, same app:
+
+  | run length | expected | unexplained |
+  |---|---|---|
+  | 60 s | 100 | **0** |
+  | 120 s (dev) | 100 | 37 |
+  | 120 s (test) | 100 | 34 |
+
+  So they are not a startup artefact and not tier-specific: **they begin
+  somewhere between 60 s and 120 s into a run**, at roughly a third of clients,
+  on both tiers. That bracket is the useful part — a run at 90 s and one at
+  150 s would narrow it in two attempts. The shape is consistent with a
+  server-side permission window or session entry being re-validated on a timer,
+  but nothing here has established that, which is exactly why the harness labels
+  the count unexplained instead of widening its window until the number looks
+  clean.
 - Exit code 3 means the RX health check tripped: traffic was sent but nothing
   was received (bad address, UDP blocked, or sessions never installed).
 
