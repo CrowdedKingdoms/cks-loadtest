@@ -182,6 +182,10 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
         // new gameTokenId on a new Buddy has its own permission window to load.
         // Re-arm so a reassignment's expected refusals are not misfiled.
         client.activatedAt = now;
+        client.permWindowCenterX = client.chunkX;
+        client.permWindowCenterY = client.chunkY;
+        client.permWindowCenterZ = client.chunkZ;
+        client.permWindowValid = true;
         if (!openSocket(client)) {
             std::fprintf(stderr,
                          "[worker %d] client %d: cannot open UDP socket to %s:%u "
@@ -230,6 +234,43 @@ void Worker::handleDatagram(SimClient& client, const uint8_t* data, size_t len) 
                     expectedFirstContact = true;
                     stats_.unauthorizedFirstContact.fetch_add(
                         1, std::memory_order_relaxed);
+                } else if (code == wire::ERR_UNAUTHORIZED && client.permWindowValid) {
+                    // The same lazy load, later in the run. The server caches
+                    // grid permissions as a BOX of radius R chunks centred
+                    // where the last lookup ran, so a walking client leaves it
+                    // and the packet that crosses the edge is refused while the
+                    // re-query is in flight. Measured: onset scales as 1/walk
+                    // speed (t+101s at 150 uu/s, t+21s at 600), and both a
+                    // stationary walk and a spawn radius of 0 produce none at
+                    // all -- so this is geometry, not a clock.
+                    //
+                    // R is the harness's ASSUMPTION about a server-side
+                    // constant it cannot read, so a refusal that arrives while
+                    // the client is still inside the modelled box stays
+                    // unexplained rather than being absorbed here. That is the
+                    // case worth alarming about and it must remain reachable.
+                    const int64_t r = config_.permWindowRadiusChunks;
+                    const auto nowTp = std::chrono::steady_clock::now();
+                    const bool sameEpisode =
+                        client.permReloadAt.time_since_epoch().count() != 0 &&
+                        nowTp - client.permReloadAt <
+                            std::chrono::milliseconds(config_.permReloadGraceMs);
+                    if (sameEpisode ||
+                        std::llabs(client.chunkX - client.permWindowCenterX) > r ||
+                        std::llabs(client.chunkY - client.permWindowCenterY) > r ||
+                        std::llabs(client.chunkZ - client.permWindowCenterZ) > r) {
+                        expectedFirstContact = true;
+                        stats_.unauthorizedWindowReload.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (!sameEpisode) {
+                            // Re-centre: the refusal triggered a fresh lookup
+                            // centred here, so this is the box from now on.
+                            client.permWindowCenterX = client.chunkX;
+                            client.permWindowCenterY = client.chunkY;
+                            client.permWindowCenterZ = client.chunkZ;
+                            client.permReloadAt = nowTp;
+                        }
+                    }
                 }
                 if (!client.errorLogged && !expectedFirstContact) {
                     client.errorLogged = true;

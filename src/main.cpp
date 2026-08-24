@@ -186,7 +186,8 @@ int main(int argc, char** argv) {
     controlQueue.shutdown();
     controlThread.join();
     reporter.stop();
-    reporter.printFinalSummary(provisioner.signIns().reused.load(),
+    reporter.printFinalSummary(config.permWindowRadiusChunks,
+                               provisioner.signIns().reused.load(),
                                provisioner.signIns().mintedProvisioning.load(),
                                provisioner.signIns().mintedMidRun.load());
 

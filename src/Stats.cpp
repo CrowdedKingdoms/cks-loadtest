@@ -145,7 +145,7 @@ void StatsReporter::run() {
     }
 }
 
-void StatsReporter::printFinalSummary(int reused, int mintedBefore,
+void StatsReporter::printFinalSummary(int permWindowRadiusChunks, int reused, int mintedBefore,
                                       int mintedDuring) const {
     Snapshot s = snapshot(stats_);
     std::printf("\n===== load test summary =====\n");
@@ -189,6 +189,8 @@ void StatsReporter::printFinalSummary(int reused, int mintedBefore,
 
     uint64_t firstContact =
         stats_.unauthorizedFirstContact.load(std::memory_order_relaxed);
+    uint64_t windowReload =
+        stats_.unauthorizedWindowReload.load(std::memory_order_relaxed);
     bool anyErr = false;
     for (int c = 0; c < 256; ++c) {
         uint64_t n = stats_.errorCodes[c].load(std::memory_order_relaxed);
@@ -208,13 +210,30 @@ void StatsReporter::printFinalSummary(int reused, int mintedBefore,
                     "the client's own first packet triggers it, so roughly one "
                     "per client is normal and not a fault.\n",
                     firstContact);
-        if (unauth > firstContact) {
+        if (windowReload) {
+            std::printf("  of which EXPECTED: %" PRIu64
+                        " on crossing out of the server's cached "
+                        "grid-permission box (assumed radius %d chunks). The "
+                        "same lazy load as first contact: the box is centred "
+                        "where the last lookup ran, so a walking client leaves "
+                        "it and the packet crossing the edge is refused while "
+                        "the re-query is in flight. Onset scales as 1/walk "
+                        "speed, so it is geometry rather than a timeout -- "
+                        "expect MORE of these the faster or further your "
+                        "clients walk, and none at all if they stand still.\n",
+                        windowReload, permWindowRadiusChunks);
+        }
+        if (unauth > firstContact + windowReload) {
             std::printf("  UNEXPLAINED: %" PRIu64
-                        " UNAUTHORIZED arrived LATER than that. These are not "
-                        "the lazy load. Check the granted tier carries runtime "
-                        "permissions; a steady stream means sessions are "
-                        "wedged.\n",
-                        unauth - firstContact);
+                        " UNAUTHORIZED arrived while the client was neither "
+                        "newly assigned NOR outside the modelled permission "
+                        "box. These are the ones worth chasing: check the "
+                        "granted tier carries runtime permissions, and a steady "
+                        "stream means sessions are wedged. If the count is "
+                        "large and your clients roam far, check "
+                        "LT_PERMISSION_WINDOW_RADIUS_CHUNKS matches the "
+                        "server's before reading it as a fault.\n",
+                        unauth - firstContact - windowReload);
         }
     }
     std::printf("=============================\n");

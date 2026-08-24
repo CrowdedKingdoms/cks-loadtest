@@ -115,6 +115,9 @@ std::string Config::validate() const {
     if (threads < 1) return "LT_THREADS must be >= 1";
     if (updateHz < 1 || updateHz > 1000) return "LT_UPDATE_HZ must be in [1, 1000]";
     if (distance < 0 || distance > 255) return "LT_DISTANCE must be in [0, 255]";
+    if (permWindowRadiusChunks < 0)
+        return "LT_PERMISSION_WINDOW_RADIUS_CHUNKS must be >= 0";
+    if (permReloadGraceMs < 0) return "LT_PERMISSION_RELOAD_GRACE_MS must be >= 0";
     if (decay < 0 || decay > 5) return "LT_DECAY must be in [0, 5]";
     if (provisionConcurrency < 1) return "LT_PROVISION_CONCURRENCY must be >= 1";
     if (rampBatchSize < 1) return "LT_RAMP_BATCH_SIZE must be >= 1";
@@ -142,6 +145,10 @@ Config Config::load(int argc, char** argv) {
         ("walk-speed", "Walk speed in Unreal units/second", cxxopts::value<double>())
         ("spawn-radius-chunks", "Spawn radius around origin, in chunks", cxxopts::value<int>())
         ("distance", "Replication distance (chunks)", cxxopts::value<int>())
+        ("permission-window-radius-chunks",
+         "Assumed radius of the server's cached grid-permission box, for "
+         "classifying UNAUTHORIZED refusals only",
+         cxxopts::value<int>())
         ("decay", "Decay rate 0=none 1=exponential 2..5=linear", cxxopts::value<int>())
         ("ramp-batch-size", "Clients activated per ramp batch", cxxopts::value<int>())
         ("ramp-interval-ms", "Interval between ramp batches (ms)", cxxopts::value<int>())
@@ -188,6 +195,10 @@ Config Config::load(int argc, char** argv) {
     c.walkSpeed = layers.getDouble("LT_WALK_SPEED", c.walkSpeed);
     c.spawnRadiusChunks = layers.getInt("LT_SPAWN_RADIUS_CHUNKS", c.spawnRadiusChunks);
     c.distance = layers.getInt("LT_DISTANCE", c.distance);
+    c.permWindowRadiusChunks = layers.getInt("LT_PERMISSION_WINDOW_RADIUS_CHUNKS",
+                                             c.permWindowRadiusChunks);
+    c.permReloadGraceMs =
+        layers.getInt("LT_PERMISSION_RELOAD_GRACE_MS", c.permReloadGraceMs);
     c.decay = layers.getInt("LT_DECAY", c.decay);
     c.rampBatchSize = layers.getInt("LT_RAMP_BATCH_SIZE", c.rampBatchSize);
     c.rampIntervalMs = layers.getInt("LT_RAMP_INTERVAL_MS", c.rampIntervalMs);
@@ -225,6 +236,7 @@ Config Config::load(int argc, char** argv) {
     if (cli.count("walk-speed")) c.walkSpeed = cli["walk-speed"].as<double>();
     cliInt("spawn-radius-chunks", c.spawnRadiusChunks);
     cliInt("distance", c.distance);
+    cliInt("permission-window-radius-chunks", c.permWindowRadiusChunks);
     cliInt("decay", c.decay);
     cliInt("ramp-batch-size", c.rampBatchSize);
     cliInt("ramp-interval-ms", c.rampIntervalMs);
