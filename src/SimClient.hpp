@@ -54,6 +54,12 @@ struct SimClient {
     // are normal (the server lazily loads permission windows); a persistent
     // stream means this session is wedged and needs a fresh assignment.
     int unauthorizedCount = 0;
+    // When this client last became ACTIVE on an assignment. UNAUTHORIZED
+    // refusals arriving shortly after are Buddy loading the permission window,
+    // which the first packet triggers; the load spans several send intervals,
+    // so the expected count per assignment is a handful rather than exactly
+    // one (measured: 137 refusals across 100 clients at 10 Hz).
+    std::chrono::steady_clock::time_point activatedAt{};
 
     uint8_t message[wire::ACTOR_UPDATE_SIZE] = {};
 

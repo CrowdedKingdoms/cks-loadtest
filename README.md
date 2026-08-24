@@ -37,8 +37,8 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
 ```
 
 > **ONE API, ONE ORIGIN — and "galaxy" is not what this is.** The management and
-> game GraphQL surfaces are two surfaces of the unified CK API
-> (`ck.<tier>.v7.cks-env.com`), which runs on PostgreSQL + Citus. Galaxy is a
+> game GraphQL surfaces are two surfaces of the unified CK API, which runs on
+> PostgreSQL + Citus. Galaxy is a
 > different product and is not the CK data plane; this note said "galaxy
 > environments" for months and there is no such thing to point at. There is also
 > no split deployment left: `cks-management-api` is not a running service.
@@ -94,6 +94,63 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
   With the default plus-addressing pattern they all land in the `LT_EMAIL`
   inbox on the first run. Confirmation is *not* required for the load test to
   run.
+- **The organization owning the app must be funded, or exempt from billing.**
+  This is a precondition, not a step the harness performs, and it is worth
+  stating plainly because an unfunded org does not fail cleanly — usage is
+  metered and gated, so a run against one measures a tier refusing work rather
+  than a tier doing it, and the numbers look like poor capacity. Fund the org
+  through whatever path your deployment provides before the run.
+
+  The harness deliberately holds no privileged path for this. Crediting a wallet
+  is an operator-only mutation, so a harness that funded its own target would be
+  unusable by anyone who is not the platform operator — including every tenant
+  load testing their own app. Configure and fund out of band, then point this at
+  it.
+
+## Provisioning sessions out of band (recommended)
+
+**Authentication is part of the measurement.** The API hashes passwords with
+bcrypt at 10 rounds, which costs 0.4–1.4 s of server CPU per sign-in. A hundred
+clients signing in at run start therefore spend API CPU in exactly the first
+seconds where the numbers matter, and what you measure is partly your own login
+storm.
+
+Mint the sessions first, and the run performs no sign-in at all:
+
+```bash
+LT_MANAGEMENT_API_URL="$MANAGEMENT_API_URL" \
+LT_EMAIL=bots@example.invalid \
+LT_PASSWORD='...' \
+LT_CLIENTS=100 \
+LT_ROSTER_FILE=roster.json \
+  scripts/provision-roster.sh
+
+LT_ROSTER_FILE=roster.json LT_ROSTER_REQUIRED=1 ./build/cks-loadtest --clients 100
+```
+
+Sessions last 30 days, so one roster serves many runs. `provision-roster.sh`
+uses only `login` and `register` — the public mutations any tenant can call —
+and needs no operator or infrastructure access. For a large population prefer
+`LT_PASSWORD_HMAC_SEED` over a single shared `LT_PASSWORD`: passwords are then
+derived per account and recomputable without being stored.
+
+**The point is the reported number, not the speed.** Every run prints its
+sign-in tally, and the one that matters is the first figure:
+
+```
+sign-in: 0 session(s) minted DURING the run, 0 before the ramp, 100 reused from the roster
+```
+
+A harness that absorbed its sign-in cost would print nothing here and look
+identical to one that had none. Four things are refused rather than tolerated,
+because each would otherwise silently reintroduce the cost or authenticate as
+the wrong population: a roster that cannot be read, one minted against a
+different origin, one whose emails disagree with `LT_EMAIL_PATTERN`, and — under
+`LT_ROSTER_REQUIRED=1` — one that covers only some of the clients.
+
+In-band sign-in remains fully supported and is the default with no roster
+configured. It is the simplest thing that works, and for small runs the cost is
+not worth managing.
 
 ## Build
 
@@ -122,10 +179,18 @@ All options can be given as CLI flags, `LT_*` environment variables, or a
 ./build/cks-loadtest \
   --email you@studio.com \
   --password 'your-password' \
-  --management-api-url https://ck.dev.v7.cks-env.com \
+  --management-api-url "$MANAGEMENT_API_URL" \
   --app-id 42 \
   --clients 100 --threads 4 --update-hz 10 --duration-sec 300
 ```
+
+No hostname appears in this repository, deliberately — see
+[.env.example](.env.example) for how to derive one. In short, from the wrapper
+checkout it is `tier_public_client_origin <tier>`, which looks the **published**
+client origin up in the hostname table. Its neighbour `tier_client_origin`
+derives the tier's internal **fleet** origin instead; both resolve and both
+serve, so choosing the wrong one produces a run that passes while measuring a
+host no customer uses.
 
 With Docker:
 
@@ -179,6 +244,33 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 - **errs / error codes** in the final summary map to the wire protocol error
   codes (e.g. `TOKEN_EXPIRED`, `UNAUTHORIZED`). Occasional `TOKEN_EXPIRED`
   around the ~30 min mark is normal — clients rotate tokens and resume.
+- **One `UNAUTHORIZED` per client at startup is expected and is not a fault.**
+  Buddy loads a session's permission window lazily and the client's own first
+  spatial packet is what triggers the load. The summary separates those from the
+  rest, by whether they arrived within 2 s of an assignment:
+
+  ```
+  code 7 (UNAUTHORIZED): 137
+    of which EXPECTED: 100 on first contact with a Buddy, within 2s ...
+    UNEXPLAINED: 37 UNAUTHORIZED arrived LATER than that. ...
+  ```
+
+  **Waiting longer does not avoid the startup one**, which is worth knowing
+  before you go looking for a race: measured on a live tier,
+  `LT_SESSION_SETTLE_MS` of 1500 and of 8000 produce the identical count,
+  because the trigger is the packet and not the clock. The window re-arms per
+  *assignment*, so a reassignment mid-run legitimately adds one.
+
+  The count of expected refusals should be close to your client count — 100
+  clients, 100 refusals. Substantially more, or a steady stream, usually means
+  the accounts' granted tier carries no runtime permissions: tokens mint fine
+  and every spatial message is refused.
+
+  The `UNEXPLAINED` line is deliberately not folded into the expected total.
+  A 120 s, 100-client run on a live tier produced 37 of them, arriving late in
+  the run rather than at startup, and the cause is not yet established — so the
+  harness reports them as unexplained rather than widening its window until the
+  number looks clean.
 - Exit code 3 means the RX health check tripped: traffic was sent but nothing
   was received (bad address, UDP blocked, or sessions never installed).
 
