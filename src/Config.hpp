@@ -23,6 +23,16 @@ struct Config {
     double walkSpeed = 150.0;          // LT_WALK_SPEED (Unreal units / s)
     int spawnRadiusChunks = 8;         // LT_SPAWN_RADIUS_CHUNKS
     int distance = 8;                  // LT_DISTANCE (replication distance, chunks)
+    // The radius, in chunks, of the server's cached grid-permission box. Used
+    // ONLY to classify UNAUTHORIZED refusals, never sent on the wire. The
+    // server's value is its own constant and is not discoverable from here, so
+    // this is a declared assumption: set it wrong and refusals move between the
+    // "window reload" and "unexplained" tallies, which is the visible symptom.
+    int permWindowRadiusChunks = 8;    // LT_PERMISSION_WINDOW_RADIUS_CHUNKS
+    // How long after a window-crossing refusal the follow-on refusals belong to
+    // the same reload episode. The server evicts under a backoff, so one
+    // crossing legitimately costs several packets.
+    int permReloadGraceMs = 5000;      // LT_PERMISSION_RELOAD_GRACE_MS
     int decay = 1;                     // LT_DECAY (0=none 1=exponential 2..5=linear)
 
     // Ramp-up / provisioning
@@ -39,6 +49,15 @@ struct Config {
     // {index} is the zero-padded client index.
     std::string emailPattern = "{local}+lt-{index}@{domain}"; // LT_EMAIL_PATTERN
 
+    // Pre-minted identity sessions, so a run performs no sign-in at all.
+    // Empty = sign in during provisioning (the portable default).
+    std::string rosterFile;            // LT_ROSTER_FILE
+    // Refuse to run when the roster cannot cover every client, instead of
+    // silently signing the remainder in. A partial roster is the shape that
+    // makes an unnoticed bcrypt convoy possible: it works, and the cost hides
+    // in the clients the file happened not to reach.
+    bool rosterRequired = false;       // LT_ROSTER_REQUIRED
+
     // Behavior toggles
     bool verifyServerHmac = false;     // LT_VERIFY_SERVER_HMAC
     bool tlsInsecure = false;          // LT_TLS_INSECURE (dev/self-signed only)
@@ -48,6 +67,11 @@ struct Config {
 
     /// Derive the sign-in email for a simulated client index.
     std::string derivedEmail(int index) const;
+
+    /// True when a password is needed at all. With a roster covering every
+    /// client the harness never signs in, so requiring LT_PASSWORD would be
+    /// requiring a secret for an operation that does not happen.
+    bool needsPassword() const { return rosterFile.empty() || !rosterRequired; }
 
     /// Parse CLI + env + optional config file. Exits with a usage message on
     /// --help or invalid/missing options.

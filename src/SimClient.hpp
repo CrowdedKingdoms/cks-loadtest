@@ -54,6 +54,26 @@ struct SimClient {
     // are normal (the server lazily loads permission windows); a persistent
     // stream means this session is wedged and needs a fresh assignment.
     int unauthorizedCount = 0;
+    // When this client last became ACTIVE on an assignment. UNAUTHORIZED
+    // refusals arriving shortly after are Buddy loading the permission window,
+    // which the first packet triggers; the load spans several send intervals,
+    // so the expected count per assignment is a handful rather than exactly
+    // one (measured: 137 refusals across 100 clients at 10 Hz).
+    std::chrono::steady_clock::time_point activatedAt{};
+
+    // Where the server's cached grid-permission box is centred, as far as this
+    // harness can model it: the chunk occupied when the last lookup ran. Set on
+    // activation and re-centred whenever a refusal triggers a re-query.
+    int64_t permWindowCenterX = 0;
+    int64_t permWindowCenterY = 0;
+    int64_t permWindowCenterZ = 0;
+    bool permWindowValid = false;
+    // When the last window-crossing refusal re-centred the box. Buddy evicts a
+    // stale window under a backoff and the re-query spans several send
+    // intervals, so one crossing produces an EPISODE of refusals rather than
+    // one -- its own logging calls them denial episodes. Without this the
+    // follow-on refusals look like they arrived inside the box.
+    std::chrono::steady_clock::time_point permReloadAt{};
 
     uint8_t message[wire::ACTOR_UPDATE_SIZE] = {};
 
