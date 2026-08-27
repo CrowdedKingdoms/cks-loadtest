@@ -14,7 +14,7 @@
 # Required env:
 #   LT_EMAIL, LT_PASSWORD, LT_MANAGEMENT_API_URL, LT_APP_ID, LT_CLIENTS
 #   OWNER_EMAIL                 owner account email
-#   OWNER_PASSWORD or OWNER_DEV_LOGIN=1 (dev stacks with DEV_AUTH_BYPASS)
+#   OWNER_PASSWORD              owner password
 #   TIER_ID                     tier to grant (see appAccessTiers)
 # Optional:
 #   LT_EMAIL_PATTERN            default '{local}+lt-{index}@{domain}'
@@ -43,19 +43,15 @@ fail_on_errors() { # fail_on_errors <response> <context>
   fi
 }
 
+# One way in. OWNER_DEV_LOGIN=1 used to select `devLogin` here, which issued a
+# session for any address with no proof of ownership; it is deleted from ck-api
+# and the password branch below was already the other half of this `if`.
 echo "signing in owner $OWNER_EMAIL..."
-if [[ "${OWNER_DEV_LOGIN:-0}" == "1" ]]; then
-  resp=$(gql 'mutation($i: DevLoginInput!){ devLogin(input:$i){ token } }' \
-             "$(jq -cn --arg e "$OWNER_EMAIL" '{i:{email:$e}}')")
-  fail_on_errors "$resp" "owner devLogin"
-  OWNER_TOKEN=$(jq -r '.data.devLogin.token' <<<"$resp")
-else
-  : "${OWNER_PASSWORD:?set OWNER_PASSWORD or OWNER_DEV_LOGIN=1}"
-  resp=$(gql 'mutation($i: LoginUserInput!){ login(loginUserInput:$i){ token } }' \
-             "$(jq -cn --arg e "$OWNER_EMAIL" --arg p "$OWNER_PASSWORD" '{i:{email:$e,password:$p}}')")
-  fail_on_errors "$resp" "owner login"
-  OWNER_TOKEN=$(jq -r '.data.login.token' <<<"$resp")
-fi
+: "${OWNER_PASSWORD:?set OWNER_PASSWORD (OWNER_DEV_LOGIN is gone: the bypass was removed from every tier)}"
+resp=$(gql 'mutation($i: LoginUserInput!){ login(loginUserInput:$i){ token } }' \
+           "$(jq -cn --arg e "$OWNER_EMAIL" --arg p "$OWNER_PASSWORD" '{i:{email:$e,password:$p}}')")
+fail_on_errors "$resp" "owner login"
+OWNER_TOKEN=$(jq -r '.data.login.token' <<<"$resp")
 
 granted=0
 for ((i = 0; i < LT_CLIENTS; i++)); do
