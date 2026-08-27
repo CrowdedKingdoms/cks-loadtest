@@ -15,6 +15,17 @@ namespace lt {
 
 namespace {
 
+/// How long after an assignment an UNAUTHORIZED is attributed to Buddy's lazy
+/// permission-window load rather than to a real refusal.
+///
+/// Not tunable, on purpose: this is a statement about the server's behaviour,
+/// not a preference. A knob here would let a run make its own error count look
+/// clean by widening the window, which is the opposite of what the
+/// classification is for. 2s is well clear of the observed load (a handful of
+/// refusals inside the first few hundred milliseconds at 10 Hz) and well short
+/// of anything a wedged session would stay quiet for.
+constexpr int FIRST_CONTACT_GRACE_MS = 2000;
+
 double steadySeconds() {
     return std::chrono::duration_cast<std::chrono::duration<double>>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -167,6 +178,14 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
             client.lastMoveTime = nowSec;
             client.lastSendTime = nowSec;
         }
+        // The first-contact grace window is per ASSIGNMENT, not per client: a
+        // new gameTokenId on a new Buddy has its own permission window to load.
+        // Re-arm so a reassignment's expected refusals are not misfiled.
+        client.activatedAt = now;
+        client.permWindowCenterX = client.chunkX;
+        client.permWindowCenterY = client.chunkY;
+        client.permWindowCenterZ = client.chunkZ;
+        client.permWindowValid = true;
         if (!openSocket(client)) {
             std::fprintf(stderr,
                          "[worker %d] client %d: cannot open UDP socket to %s:%u "
@@ -199,7 +218,61 @@ void Worker::handleDatagram(SimClient& client, const uint8_t* data, size_t len) 
             if (m.len >= 3) {
                 uint8_t code = m.data[2];
                 stats_.errorCodes[code].fetch_add(1, std::memory_order_relaxed);
-                if (!client.errorLogged) {
+                // UNAUTHORIZED shortly after an assignment is Buddy loading the
+                // permission window, which this client's own first packet
+                // triggered. Classify by a TIME WINDOW rather than by counting
+                // the first one: the load takes longer than one send interval,
+                // so a client at 10 Hz legitimately sees two or three, and
+                // treating only the first as expected reports the rest as
+                // faults. The raw errorCodes tally above still counts every
+                // refusal, so nothing is hidden by this classification.
+                bool expectedFirstContact = false;
+                if (code == wire::ERR_UNAUTHORIZED &&
+                    client.activatedAt.time_since_epoch().count() != 0 &&
+                    std::chrono::steady_clock::now() - client.activatedAt <
+                        std::chrono::milliseconds(FIRST_CONTACT_GRACE_MS)) {
+                    expectedFirstContact = true;
+                    stats_.unauthorizedFirstContact.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else if (code == wire::ERR_UNAUTHORIZED && client.permWindowValid) {
+                    // The same lazy load, later in the run. The server caches
+                    // grid permissions as a BOX of radius R chunks centred
+                    // where the last lookup ran, so a walking client leaves it
+                    // and the packet that crosses the edge is refused while the
+                    // re-query is in flight. Measured: onset scales as 1/walk
+                    // speed (t+101s at 150 uu/s, t+21s at 600), and both a
+                    // stationary walk and a spawn radius of 0 produce none at
+                    // all -- so this is geometry, not a clock.
+                    //
+                    // R is the harness's ASSUMPTION about a server-side
+                    // constant it cannot read, so a refusal that arrives while
+                    // the client is still inside the modelled box stays
+                    // unexplained rather than being absorbed here. That is the
+                    // case worth alarming about and it must remain reachable.
+                    const int64_t r = config_.permWindowRadiusChunks;
+                    const auto nowTp = std::chrono::steady_clock::now();
+                    const bool sameEpisode =
+                        client.permReloadAt.time_since_epoch().count() != 0 &&
+                        nowTp - client.permReloadAt <
+                            std::chrono::milliseconds(config_.permReloadGraceMs);
+                    if (sameEpisode ||
+                        std::llabs(client.chunkX - client.permWindowCenterX) > r ||
+                        std::llabs(client.chunkY - client.permWindowCenterY) > r ||
+                        std::llabs(client.chunkZ - client.permWindowCenterZ) > r) {
+                        expectedFirstContact = true;
+                        stats_.unauthorizedWindowReload.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (!sameEpisode) {
+                            // Re-centre: the refusal triggered a fresh lookup
+                            // centred here, so this is the box from now on.
+                            client.permWindowCenterX = client.chunkX;
+                            client.permWindowCenterY = client.chunkY;
+                            client.permWindowCenterZ = client.chunkZ;
+                            client.permReloadAt = nowTp;
+                        }
+                    }
+                }
+                if (!client.errorLogged && !expectedFirstContact) {
                     client.errorLogged = true;
                     std::fprintf(stderr,
                                  "[worker %d] client %d (%s) got error code %u "

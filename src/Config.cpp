@@ -99,14 +99,25 @@ std::string Config::derivedEmail(int index) const {
 std::string Config::validate() const {
     if (email.empty()) return "missing LT_EMAIL / --email";
     if (email.find('@') == std::string::npos) return "LT_EMAIL must be a full email address";
-    if (password.empty()) return "missing LT_PASSWORD / --password";
-    if (password.size() < 8) return "LT_PASSWORD must be at least 8 characters (API minimum)";
+    if (needsPassword()) {
+        if (password.empty()) {
+            return rosterFile.empty()
+                       ? "missing LT_PASSWORD / --password"
+                       : "missing LT_PASSWORD / --password: the roster may not "
+                         "cover every client and the rest must sign in. Set "
+                         "LT_ROSTER_REQUIRED=1 to refuse a short roster instead.";
+        }
+        if (password.size() < 8) return "LT_PASSWORD must be at least 8 characters (API minimum)";
+    }
     if (managementApiUrl.empty()) return "missing LT_MANAGEMENT_API_URL / --management-api-url";
     if (appId <= 0) return "missing/invalid LT_APP_ID / --app-id";
     if (clients < 1) return "LT_CLIENTS must be >= 1";
     if (threads < 1) return "LT_THREADS must be >= 1";
     if (updateHz < 1 || updateHz > 1000) return "LT_UPDATE_HZ must be in [1, 1000]";
     if (distance < 0 || distance > 255) return "LT_DISTANCE must be in [0, 255]";
+    if (permWindowRadiusChunks < 0)
+        return "LT_PERMISSION_WINDOW_RADIUS_CHUNKS must be >= 0";
+    if (permReloadGraceMs < 0) return "LT_PERMISSION_RELOAD_GRACE_MS must be >= 0";
     if (decay < 0 || decay > 5) return "LT_DECAY must be in [0, 5]";
     if (provisionConcurrency < 1) return "LT_PROVISION_CONCURRENCY must be >= 1";
     if (rampBatchSize < 1) return "LT_RAMP_BATCH_SIZE must be >= 1";
@@ -134,6 +145,10 @@ Config Config::load(int argc, char** argv) {
         ("walk-speed", "Walk speed in Unreal units/second", cxxopts::value<double>())
         ("spawn-radius-chunks", "Spawn radius around origin, in chunks", cxxopts::value<int>())
         ("distance", "Replication distance (chunks)", cxxopts::value<int>())
+        ("permission-window-radius-chunks",
+         "Assumed radius of the server's cached grid-permission box, for "
+         "classifying UNAUTHORIZED refusals only",
+         cxxopts::value<int>())
         ("decay", "Decay rate 0=none 1=exponential 2..5=linear", cxxopts::value<int>())
         ("ramp-batch-size", "Clients activated per ramp batch", cxxopts::value<int>())
         ("ramp-interval-ms", "Interval between ramp batches (ms)", cxxopts::value<int>())
@@ -142,6 +157,8 @@ Config Config::load(int argc, char** argv) {
         ("stats-interval-sec", "Seconds between stats reports", cxxopts::value<int>())
         ("csv-out", "Append per-interval stats to this CSV file", cxxopts::value<std::string>())
         ("email-pattern", "Derived email pattern ({local},{domain},{index})", cxxopts::value<std::string>())
+        ("roster", "Pre-minted session roster JSON (a run then signs in nobody)", cxxopts::value<std::string>())
+        ("roster-required", "Refuse to run if the roster misses any client", cxxopts::value<bool>())
         ("verify-server-hmac", "Verify HMAC on signed server notifications", cxxopts::value<bool>())
         ("tls-insecure", "Skip TLS certificate verification (dev only)", cxxopts::value<bool>())
         ("session-settle-ms", "Wait after server assignment before UDP (ms)", cxxopts::value<int>())
@@ -178,6 +195,10 @@ Config Config::load(int argc, char** argv) {
     c.walkSpeed = layers.getDouble("LT_WALK_SPEED", c.walkSpeed);
     c.spawnRadiusChunks = layers.getInt("LT_SPAWN_RADIUS_CHUNKS", c.spawnRadiusChunks);
     c.distance = layers.getInt("LT_DISTANCE", c.distance);
+    c.permWindowRadiusChunks = layers.getInt("LT_PERMISSION_WINDOW_RADIUS_CHUNKS",
+                                             c.permWindowRadiusChunks);
+    c.permReloadGraceMs =
+        layers.getInt("LT_PERMISSION_RELOAD_GRACE_MS", c.permReloadGraceMs);
     c.decay = layers.getInt("LT_DECAY", c.decay);
     c.rampBatchSize = layers.getInt("LT_RAMP_BATCH_SIZE", c.rampBatchSize);
     c.rampIntervalMs = layers.getInt("LT_RAMP_INTERVAL_MS", c.rampIntervalMs);
@@ -186,6 +207,8 @@ Config Config::load(int argc, char** argv) {
     c.statsIntervalSec = layers.getInt("LT_STATS_INTERVAL_SEC", c.statsIntervalSec);
     c.csvOut = layers.get("LT_CSV_OUT", c.csvOut);
     c.emailPattern = layers.get("LT_EMAIL_PATTERN", c.emailPattern);
+    c.rosterFile = layers.get("LT_ROSTER_FILE", c.rosterFile);
+    c.rosterRequired = layers.getBool("LT_ROSTER_REQUIRED", c.rosterRequired);
     c.verifyServerHmac = layers.getBool("LT_VERIFY_SERVER_HMAC", c.verifyServerHmac);
     c.tlsInsecure = layers.getBool("LT_TLS_INSECURE", c.tlsInsecure);
     c.sessionSettleMs = layers.getInt("LT_SESSION_SETTLE_MS", c.sessionSettleMs);
@@ -213,6 +236,7 @@ Config Config::load(int argc, char** argv) {
     if (cli.count("walk-speed")) c.walkSpeed = cli["walk-speed"].as<double>();
     cliInt("spawn-radius-chunks", c.spawnRadiusChunks);
     cliInt("distance", c.distance);
+    cliInt("permission-window-radius-chunks", c.permWindowRadiusChunks);
     cliInt("decay", c.decay);
     cliInt("ramp-batch-size", c.rampBatchSize);
     cliInt("ramp-interval-ms", c.rampIntervalMs);
@@ -221,6 +245,8 @@ Config Config::load(int argc, char** argv) {
     cliInt("stats-interval-sec", c.statsIntervalSec);
     cliStr("csv-out", c.csvOut);
     cliStr("email-pattern", c.emailPattern);
+    cliStr("roster", c.rosterFile);
+    cliBool("roster-required", c.rosterRequired);
     cliBool("verify-server-hmac", c.verifyServerHmac);
     cliBool("tls-insecure", c.tlsInsecure);
     cliInt("session-settle-ms", c.sessionSettleMs);
