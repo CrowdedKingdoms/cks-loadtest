@@ -11,6 +11,17 @@ flow a real native game client uses.
 - Provisions its own player accounts deterministically and idempotently from
   one email + password.
 
+> **AUTHENTICATION IS PART OF THE MEASUREMENT, and this harness does it in-band.**
+> bcrypt at 10 rounds costs 0.4–1.4s per sign-in, so ten thousand bots
+> authenticating at run start burns API CPU in exactly the first seconds where
+> the numbers matter. Provisioning runs before the ramp (`provisionAll`, then
+> the ramp), which keeps it out of the steady state — but it is inside the
+> process you are timing, and **the harness does not currently report whether
+> any session was minted MID-RUN**. Until it does, a run whose latency tail
+> looks wrong in the first minute should be suspected of measuring bcrypt.
+> Field note 59: provision out of band, cache the session, and have the harness
+> say `0 sessions minted during the run` rather than leaving it to be inferred.
+
 ## How it works
 
 ```
@@ -25,13 +36,20 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
                                               with the app token
 ```
 
-> **Unified (galaxy) environments:** the management and game GraphQL surfaces
-> are served by ONE API on one origin. Point `LT_MANAGEMENT_API_URL` at that
-> origin and everything else follows — `mintAppToken` still reveals the
-> `gameApiUrl` (the same origin), and `serverWithLeastClients` still returns
-> the Buddy fleet. On legacy split deployments the two APIs have separate
-> hosts; the flow is identical either way. App ids on galaxy environments are
-> 64-bit snowflakes (e.g. `73877390897664`).
+> **ONE API, ONE ORIGIN — and "galaxy" is not what this is.** The management and
+> game GraphQL surfaces are two surfaces of the unified CK API, which runs on
+> PostgreSQL + Citus. Galaxy is a
+> different product and is not the CK data plane; this note said "galaxy
+> environments" for months and there is no such thing to point at. There is also
+> no split deployment left: `cks-management-api` is not a running service.
+>
+> Point `LT_MANAGEMENT_API_URL` at that one origin and everything else follows —
+> `mintAppToken` still reveals `gameApiUrl` (the app's OWN datacenter, which is
+> where its shards live), and `serverWithLeastClients` still returns the Buddy
+> fleet. App ids are 64-bit snowflakes (e.g. `73877390897664`).
+>
+> The variable keeps its `MANAGEMENT` name for compatibility; it is the unified
+> origin, not a second host.
 
 1. **Identity.** You supply one email + password (`LT_EMAIL`, `LT_PASSWORD`).
    The tool derives one account per simulated client with plus-addressing:
@@ -55,7 +73,8 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
 
 ## Prerequisites
 
-- Your app must be reachable through a Management API + Game API deployment.
+- Your app must be reachable through a CK deployment. That is **one origin**
+  serving both the management and game GraphQL surfaces, not two hosts.
 - **Entitlements are your job.** The load tester is tier-agnostic: it does not
   inspect or manage app tiers, entitlements, or load limits. If a derived
   account is not entitled to the app, `mintAppToken` returns `FORBIDDEN` and
@@ -75,6 +94,63 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
   With the default plus-addressing pattern they all land in the `LT_EMAIL`
   inbox on the first run. Confirmation is *not* required for the load test to
   run.
+- **The organization owning the app must be funded, or exempt from billing.**
+  This is a precondition, not a step the harness performs, and it is worth
+  stating plainly because an unfunded org does not fail cleanly — usage is
+  metered and gated, so a run against one measures a tier refusing work rather
+  than a tier doing it, and the numbers look like poor capacity. Fund the org
+  through whatever path your deployment provides before the run.
+
+  The harness deliberately holds no privileged path for this. Crediting a wallet
+  is an operator-only mutation, so a harness that funded its own target would be
+  unusable by anyone who is not the platform operator — including every tenant
+  load testing their own app. Configure and fund out of band, then point this at
+  it.
+
+## Provisioning sessions out of band (recommended)
+
+**Authentication is part of the measurement.** The API hashes passwords with
+bcrypt at 10 rounds, which costs 0.4–1.4 s of server CPU per sign-in. A hundred
+clients signing in at run start therefore spend API CPU in exactly the first
+seconds where the numbers matter, and what you measure is partly your own login
+storm.
+
+Mint the sessions first, and the run performs no sign-in at all:
+
+```bash
+LT_MANAGEMENT_API_URL="$MANAGEMENT_API_URL" \
+LT_EMAIL=bots@example.invalid \
+LT_PASSWORD='...' \
+LT_CLIENTS=100 \
+LT_ROSTER_FILE=roster.json \
+  scripts/provision-roster.sh
+
+LT_ROSTER_FILE=roster.json LT_ROSTER_REQUIRED=1 ./build/cks-loadtest --clients 100
+```
+
+Sessions last 30 days, so one roster serves many runs. `provision-roster.sh`
+uses only `login` and `register` — the public mutations any tenant can call —
+and needs no operator or infrastructure access. For a large population prefer
+`LT_PASSWORD_HMAC_SEED` over a single shared `LT_PASSWORD`: passwords are then
+derived per account and recomputable without being stored.
+
+**The point is the reported number, not the speed.** Every run prints its
+sign-in tally, and the one that matters is the first figure:
+
+```
+sign-in: 0 session(s) minted DURING the run, 0 before the ramp, 100 reused from the roster
+```
+
+A harness that absorbed its sign-in cost would print nothing here and look
+identical to one that had none. Four things are refused rather than tolerated,
+because each would otherwise silently reintroduce the cost or authenticate as
+the wrong population: a roster that cannot be read, one minted against a
+different origin, one whose emails disagree with `LT_EMAIL_PATTERN`, and — under
+`LT_ROSTER_REQUIRED=1` — one that covers only some of the clients.
+
+In-band sign-in remains fully supported and is the default with no roster
+configured. It is the simplest thing that works, and for small runs the cost is
+not worth managing.
 
 ## Build
 
@@ -103,10 +179,18 @@ All options can be given as CLI flags, `LT_*` environment variables, or a
 ./build/cks-loadtest \
   --email you@studio.com \
   --password 'your-password' \
-  --management-api-url https://api.dev.crowdedkingdoms.com \
+  --management-api-url "$MANAGEMENT_API_URL" \
   --app-id 42 \
   --clients 100 --threads 4 --update-hz 10 --duration-sec 300
 ```
+
+No hostname appears in this repository, deliberately — see
+[.env.example](.env.example) for how to derive one. In short, from the wrapper
+checkout it is `tier_public_client_origin <tier>`, which looks the **published**
+client origin up in the hostname table. Its neighbour `tier_client_origin`
+derives the tier's internal **fleet** origin instead; both resolve and both
+serve, so choosing the wrong one produces a run that passes while measuring a
+host no customer uses.
 
 With Docker:
 
@@ -160,6 +244,99 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 - **errs / error codes** in the final summary map to the wire protocol error
   codes (e.g. `TOKEN_EXPIRED`, `UNAUTHORIZED`). Occasional `TOKEN_EXPIRED`
   around the ~30 min mark is normal — clients rotate tokens and resume.
+- **One `UNAUTHORIZED` per client at startup is expected and is not a fault.**
+  Buddy loads a session's permission window lazily and the client's own first
+  spatial packet is what triggers the load. The summary separates those from the
+  rest, by whether they arrived within 2 s of an assignment:
+
+  ```
+  code 7 (UNAUTHORIZED): 137
+    of which EXPECTED: 100 on first contact with a Buddy, within 2s ...
+    UNEXPLAINED: 37 UNAUTHORIZED arrived LATER than that. ...
+  ```
+
+  **Waiting longer does not avoid the startup one**, which is worth knowing
+  before you go looking for a race: measured on a live tier,
+  `LT_SESSION_SETTLE_MS` of 1500 and of 8000 produce the identical count,
+  because the trigger is the packet and not the clock. The window re-arms per
+  *assignment*, so a reassignment mid-run legitimately adds one.
+
+  The count of expected refusals should be close to your client count — 100
+  clients, 100 refusals. Substantially more, or a steady stream, usually means
+  the accounts' granted tier carries no runtime permissions: tokens mint fine
+  and every spatial message is refused.
+
+- **A second, later batch of `UNAUTHORIZED` is the SAME lazy load, and it is
+  geometry rather than a timer.** These used to be reported as `UNEXPLAINED`,
+  which read as a platform fault and is not one. The server caches grid
+  permissions as a **box of radius 8 chunks centred where the last lookup ran**,
+  so a client that walks far enough leaves the box, and the packet that crosses
+  the edge is refused while the re-query is in flight — exactly as at first
+  contact, just later. The summary counts them separately:
+
+  ```
+  code 7 (UNAUTHORIZED): 144
+    of which EXPECTED: 100 on first contact with a Buddy, within 2s ...
+    of which EXPECTED: 44 on crossing out of the server's cached ...
+  ```
+
+  **The timing is a distance divided by a speed, not a timeout**, which is worth
+  understanding because the first guess is always a TTL. A chunk is 1600 uu and
+  the box radius is 8 chunks, so the edge is 12800 uu away: at the default
+  `LT_WALK_SPEED=150` that is **85 s** if a client walks along an axis and
+  **121 s** if it walks at 45°, since the box is square. Nothing can arrive
+  before 85 s, and nothing did.
+
+  Measured on dev, 100 clients at 10 Hz, same roster and app, varying one input
+  at a time:
+
+  | run | walk speed | spawn radius | first late refusal | late total |
+  |---|---|---|---|---|
+  | baseline, 180 s | 150 | 8 | **t+101 s** | 44 |
+  | 120 s | **0** | 8 | never | **0** |
+  | 120 s | **600** (4×) | 8 | **t+21 s** (4× earlier) | 79 |
+  | 150 s | 150 | **0** | never | **0** |
+
+  Those last two rows are the ones that settle it. Onset scales as **1/speed**,
+  and a run at full walk speed with `LT_SPAWN_RADIUS_CHUNKS=0` produces none at
+  all over 150 s — so no clock-driven mechanism is involved, because a token
+  TTL, an idle disconnect or a released session slot would all still fire in a
+  run where the clients are moving as fast as ever.
+
+  **Why the spawn radius matters, and why this is the harness's own doing.** The
+  walk is confined to `LT_SPAWN_RADIUS_CHUNKS` of the **world origin** (it
+  reverses direction at the edge), while the server's box is centred on each
+  client's **own spawn chunk**. A client that spawns at the origin has a box
+  containing the whole confinement area and can never leave it; one that spawns
+  at the edge is guaranteed to walk out of its box on the way to the far side.
+  That is why roughly a third to a half of clients see one and the rest never
+  do, and why setting the spawn radius to 0 removes them entirely. The
+  confinement is deliberate — it keeps clients close enough to replicate to each
+  other, which is the point of the load — so the harness reports the refusals
+  rather than tuning them away.
+
+  `LT_PERMISSION_WINDOW_RADIUS_CHUNKS` (default 8) is the radius the harness
+  *assumes* when classifying. It is never sent on the wire, and the server's
+  value is not discoverable from a client, so it is a declared assumption: set
+  it too small and ordinary refusals get filed as window reloads, set it too
+  large and they land in `UNEXPLAINED`.
+
+- **`UNEXPLAINED` is what remains, and it is the line worth chasing.** A refusal
+  that arrives while a client is neither newly assigned nor outside the modelled
+  box is not accounted for by either lazy load. Check that the accounts' granted
+  tier carries runtime permissions, and treat a steady stream as wedged sessions.
+  The bucket is kept deliberately reachable rather than widened until the number
+  reads zero — verified by running with the radius set absurdly high, which
+  correctly moves every window-reload refusal into it.
+
+  **Expect a residual of a few percent here even on a healthy tier**, so read the
+  trend rather than demanding zero: a measured baseline run was 100 first-contact,
+  51 window-reload and **9 unexplained out of 160**. The harness models a single
+  box while the server keeps several, and the two disagree about the centre by a
+  chunk or so under flight time, so a handful of genuine crossings get filed as
+  internal. That gap was deliberately not tuned away — anything that closed it
+  would be widening a model of the server's cache until the number looked clean,
+  and a real permission fault would then land inside the widened grace.
 - Exit code 3 means the RX health check tripped: traffic was sent but nothing
   was received (bad address, UDP blocked, or sessions never installed).
 
@@ -184,6 +361,21 @@ src/
   Stats.*             counters, latency histogram, console/CSV reporter
 tests/wire_test.cpp   wire vectors cross-checked against the reference impl
 ```
+
+## Versioning
+
+**There is none, and there is deliberately no changelog.** This repository ships no
+versioned artifact: `project(cks-loadtest CXX)` declares no `VERSION`, there are no
+git tags, there is no release workflow, and nothing publishes a binary anywhere. A
+run is built from a checkout, so **the commit is the version** — record the SHA
+beside a measurement, because that is the only thing that identifies what produced
+it.
+
+That is worth stating rather than leaving to inference: an absent changelog in a
+repo that ships a versioned artifact is a gap, and an auditor sweeping for one
+should be able to tell the two cases apart without re-deriving this. If a released
+binary or image ever starts being published from here, that is the moment this
+section becomes wrong and a `CHANGELOG.md` becomes owed.
 
 ## License
 
