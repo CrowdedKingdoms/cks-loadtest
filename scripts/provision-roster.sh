@@ -102,7 +102,7 @@ derived_password() {
 }
 
 gql() { # query variables-json
-  curl -sS --max-time 60 "$API/graphql" \
+  curl -sS --max-time 60 --max-redirs 0 --proto '=https,http' "$API/graphql" \
     -H 'Content-Type: application/json' \
     --data-binary "$(jq -cn --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}')"
 }

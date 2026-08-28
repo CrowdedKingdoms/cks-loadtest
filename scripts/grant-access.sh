@@ -32,7 +32,7 @@ DOMAIN="${LT_EMAIL##*@}"
 gql() { # gql <query> <variables-json> [bearer]
   local auth=()
   [[ -n "${3:-}" ]] && auth=(-H "Authorization: Bearer $3")
-  curl -fsS "$GQL" -H 'Content-Type: application/json' "${auth[@]}" \
+  curl -fsS --max-redirs 0 --proto '=https,http' "$GQL" -H 'Content-Type: application/json' "${auth[@]}" \
     -d "$(jq -cn --arg q "$1" --argjson v "$2" '{query:$q, variables:$v}')"
 }
 
