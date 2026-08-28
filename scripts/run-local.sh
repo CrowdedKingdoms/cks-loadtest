@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Run cks-loadtest against the local builder stack: one cks-game-api on :3000
-# plus Buddies. Intended for development smoke tests.
+# Run cks-loadtest against a local CK API on :3000 plus local Buddy servers.
+# Intended for development smoke tests.
 #
-# ONE ORIGIN, NOT TWO. This script defaulted the management URL to :3001 and the
-# game URL to :3000, which described the split cks-management-api / cks-game-api
-# deployment that has not existed since 2026-08-06. cks-game-api serves both
-# surfaces and defaults to PORT 3000, so the old default pointed at nothing and
-# every local run died in provisioning. Override LT_MANAGEMENT_API_URL if you run
-# it on another port.
+# ONE ORIGIN, NOT TWO. This script used to default the management URL to :3001
+# and the game URL to :3000, which described a split deployment that no longer
+# exists. The CK API serves both GraphQL surfaces and defaults to PORT 3000, so
+# the old default pointed at nothing and every local run died in provisioning.
+# Override LT_MANAGEMENT_API_URL if you run it on another port.
 #
 # Usage: scripts/run-local.sh [extra cks-loadtest args...]
 set -euo pipefail
