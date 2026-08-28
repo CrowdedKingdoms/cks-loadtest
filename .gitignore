@@ -1,3 +1,10 @@
 build/
-loadtest.env
 *.csv
+
+# Credentials and session caches. Roster JSON holds live bearer tokens.
+*.env
+!.env.example
+loadtest.env
+roster.json
+loadtest-roster.json
+*-roster.json

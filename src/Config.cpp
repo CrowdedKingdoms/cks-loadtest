@@ -135,7 +135,10 @@ Config Config::load(int argc, char** argv) {
     opts.add_options()
         ("config", "Config file with KEY=VALUE lines (LT_* names)", cxxopts::value<std::string>())
         ("email", "Base account email (per-client emails are derived from it)", cxxopts::value<std::string>())
-        ("password", "Password for the base + derived accounts", cxxopts::value<std::string>())
+        ("password",
+         "Password for the base + derived accounts. Prefer LT_PASSWORD: argv is "
+         "visible in ps(1).",
+         cxxopts::value<std::string>())
         ("management-api-url", "Management API base URL, e.g. https://api.example.com", cxxopts::value<std::string>())
         ("game-api-url", "Game API base URL override (default: from mintAppToken)", cxxopts::value<std::string>())
         ("app-id", "App id to load test", cxxopts::value<int64_t>())
