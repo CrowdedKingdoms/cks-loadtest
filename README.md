@@ -16,11 +16,9 @@ flow a real native game client uses.
 > authenticating at run start burns API CPU in exactly the first seconds where
 > the numbers matter. Provisioning runs before the ramp (`provisionAll`, then
 > the ramp), which keeps it out of the steady state — but it is inside the
-> process you are timing, and **the harness does not currently report whether
-> any session was minted MID-RUN**. Until it does, a run whose latency tail
-> looks wrong in the first minute should be suspected of measuring bcrypt.
-> Field note 59: provision out of band, cache the session, and have the harness
-> say `0 sessions minted during the run` rather than leaving it to be inferred.
+> process you are timing. Prefer a pre-minted roster so the timed window prints
+> `0 session(s) minted DURING the run`. A run whose latency tail looks wrong in
+> the first minute, with a non-zero minted-during-run count, is measuring bcrypt.
 
 ## How it works
 
@@ -36,17 +34,12 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
                                               with the app token
 ```
 
-> **ONE API, ONE ORIGIN — and "galaxy" is not what this is.** The management and
-> game GraphQL surfaces are two surfaces of the unified CK API, which runs on
-> PostgreSQL + Citus. Galaxy is a
-> different product and is not the CK data plane; this note said "galaxy
-> environments" for months and there is no such thing to point at. There is also
-> no split deployment left: `cks-management-api` is not a running service.
->
-> Point `LT_MANAGEMENT_API_URL` at that one origin and everything else follows —
-> `mintAppToken` still reveals `gameApiUrl` (the app's OWN datacenter, which is
-> where its shards live), and `serverWithLeastClients` still returns the Buddy
-> fleet. App ids are 64-bit snowflakes (e.g. `73877390897664`).
+> **ONE API, ONE ORIGIN.** The management and game GraphQL surfaces are two
+> surfaces of the unified CK API. Point `LT_MANAGEMENT_API_URL` at that origin
+> and everything else follows — `mintAppToken` still reveals `gameApiUrl` (the
+> app's own datacenter, which is where its shards live), and
+> `serverWithLeastClients` still returns the Buddy fleet. App ids are 64-bit
+> snowflakes, unique per deployment; resolve yours rather than copying a number.
 >
 > The variable keeps its `MANAGEMENT` name for compatibility; it is the unified
 > origin, not a second host.
@@ -161,6 +154,7 @@ sudo apt-get install build-essential cmake libcurl4-openssl-dev libssl-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ctest --test-dir build          # wire-format + HMAC unit tests
+bash scripts/check-content-policy.sh   # source + build/ artefacts
 ```
 
 ### Docker
@@ -176,21 +170,19 @@ All options can be given as CLI flags, `LT_*` environment variables, or a
 [.env.example](.env.example) for the full annotated list.
 
 ```bash
+export LT_PASSWORD='your-password'   # prefer env over --password: argv is visible in ps(1)
 ./build/cks-loadtest \
   --email you@studio.com \
-  --password 'your-password' \
   --management-api-url "$MANAGEMENT_API_URL" \
-  --app-id 42 \
+  --app-id "$APP_ID" \
   --clients 100 --threads 4 --update-hz 10 --duration-sec 300
 ```
 
-No hostname appears in this repository, deliberately — see
-[.env.example](.env.example) for how to derive one. In short, from the wrapper
-checkout it is `tier_public_client_origin <tier>`, which looks the **published**
-client origin up in the hostname table. Its neighbour `tier_client_origin`
-derives the tier's internal **fleet** origin instead; both resolve and both
-serve, so choosing the wrong one produces a run that passes while measuring a
-host no customer uses.
+No hostname is checked in to this repository, deliberately. Set
+`LT_MANAGEMENT_API_URL` to the GraphQL origin your game clients already use —
+the same host they dial for sign-in. A second, "internal" origin that also
+answers is the wrong one to measure: the run will pass while exercising a host
+players never reach.
 
 With Docker:
 
@@ -212,9 +204,9 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 | Option / env | Default | Meaning |
 |---|---|---|
 | `--email` / `LT_EMAIL` | — | Base account email (required) |
-| `--password` / `LT_PASSWORD` | — | Password for base + derived accounts (min 8 chars) |
-| `--management-api-url` / `LT_MANAGEMENT_API_URL` | — | Management API base URL (required) |
-| `--app-id` / `LT_APP_ID` | — | App to load test (required) |
+| `--password` / `LT_PASSWORD` | — | Password for base + derived accounts (min 8 chars). Prefer `LT_PASSWORD`: `--password` is visible in `ps(1)`. |
+| `--management-api-url` / `LT_MANAGEMENT_API_URL` | — | CK GraphQL origin (required) |
+| `--app-id` / `LT_APP_ID` | — | App to load test (required; a per-deployment snowflake, no default) |
 | `--clients` / `LT_CLIENTS` | 10 | Simulated clients |
 | `--threads` / `LT_THREADS` | 1 | Worker threads |
 | `--update-hz` / `LT_UPDATE_HZ` | 10 | Actor updates per second per client |

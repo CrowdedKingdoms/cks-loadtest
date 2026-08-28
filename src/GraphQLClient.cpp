@@ -61,8 +61,18 @@ nlohmann::json GraphQLClient::request(const std::string& query,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 30000L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    // Do not follow redirects. A 3xx would carry the Authorization header to
+    // whatever Location named, including a different host or scheme. CK GraphQL
+    // never issues a redirect; a tenant pointing this harness at an origin they
+    // were given is trusting it not to walk their bearer token somewhere else.
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 0L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https,http");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
+                     static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     if (tlsInsecure_) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
