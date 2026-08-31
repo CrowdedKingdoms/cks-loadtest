@@ -1,0 +1,32 @@
+name: CI
+
+# Runs on a push to any branch and on pull requests. There is no release
+# pipeline: a run is built from a checkout, so the commit is the version.
+# cmake + ctest is the whole test surface; the content-policy job walks the
+# tree INCLUDING build/ because a compiled binary embeds string literals that
+# git grep cannot see.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: >
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential cmake libcurl4-openssl-dev libssl-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Content policy (source + build artefacts)
+        run: bash scripts/check-content-policy.sh
