@@ -1,36 +1,21 @@
-# Review ownership for the release path and the tooling that drives it.
+# Review ownership for CI and the scripts that drive a run.
 #
 # GitHub consults this file ONLY when it evaluates a pull request's reviews, and ONLY from the
 # branch that pull request TARGETS -- never from the default branch. On its own it blocks
-# nothing: what gives it force is whichever org ruleset applies to THIS branch, and that is a
-# separate object that changes over time. A copy missing from one branch protects nothing there
-# and fails SILENTLY, by requesting no review at all, which is why the file exists on each of
-# the three branches separately and is kept identical across them.
+# nothing: what gives it force is whichever repository ruleset applies to THIS branch.
+# A copy missing from one branch protects nothing there and fails SILENTLY, by requesting
+# no review at all, which is why the file exists on each of the three long-lived branches
+# (`dev`, `test`, `prod`) and is kept identical across them.
 #
-# WHAT THE PATHS BELOW MEAN, as of 2026-08-21. The operator's branch policy requires an admin
-# for any pull request into `dev` or `test` that touches CI or scripts, and requires an admin
-# to merge into `prod` at all. This file is the whole implementation of the first half: there
-# is no ruleset field for "CI or scripts", so the guarded set is exactly what is listed here.
-# A path absent from this list is a path any developer may change and merge alone.
+# There is no ruleset field for "CI or scripts", so the guarded set is exactly the paths
+# listed here. A path absent from this list is a path any maintainer may change and merge
+# alone. The list is deliberately broad — all of `/scripts/`, not a subdirectory of it —
+# because a helper that provisions accounts or grants access is as load-bearing as CI.
 #
-# It is deliberately BROAD -- all of `/scripts/`, not a subdirectory of it. It owned
-# `/scripts/ci/` until 2026-08-21, which read as coverage and was not: it left
-# `release-gates/` unowned in cks-game-api, so the gates could be edited by the very change
-# they would have refused, and it left `stage-site-publisher-key.sh` and `migrations/`
-# unowned in infra-control-plane while owning `deploy-cp.sh` beside them.
-#
-# The cost is stated rather than discovered: an ordinary change to a helper script now waits on
-# the code owner. If that owner cannot keep up, the honest fix is to narrow this list on
-# purpose or add owners -- not to bypass it, because a gate bypassed on every run is not a gate.
-#
-# There are three branches and only three. `main` was deleted on the remote on 2026-08-21 in
-# every repository on this model. Three repos still hold a `main` and are deliberately
-# untouched: cks-management-api, cks-control-plane and crowded-kingdoms are ARCHIVED, so their
-# refs are read-only and tidying one would mean un-archiving it.
-#
-# Owner: scripts/apply-codeowners.mjs, which DERIVES this file from the repo's own previous
-# copy rather than rendering a template -- so a repo-specific rule below is preserved, not
-# overwritten. Edit the tool, not the fourteen copies.
+# The cost is stated rather than discovered: an ordinary change to a helper script now
+# waits on the code owner. If that owner cannot keep up, the honest fix is to narrow this
+# list on purpose or add owners — not to bypass it, because a gate bypassed on every run
+# is not a gate.
 
 /.github/ @michaelmarshall
 /scripts/ @michaelmarshall
