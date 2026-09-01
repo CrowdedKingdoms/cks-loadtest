@@ -67,12 +67,18 @@ int main() {
     m1.used = 100;
     m1.activeClients = 100;
     m1.rungId = "r1";
+    m1.windowOpenEpochSec = 1756770000;
+    m1.windowDurationSec = 180;
     lt::IntervalRates iv;
     iv.txPps = 1000;
     iv.rxNotifPs = 800;
     auto ja = lt::buildStatsJson(m1, a, d, iv);
     lt::SnapshotMeta m2 = m1;
     m2.instanceId = "b";
+    // Later open, shorter window: the fanned-out rung-open reaches hosts milliseconds
+    // apart, and the merged blob must bound both rather than describe one of them.
+    m2.windowOpenEpochSec = 1756770002;
+    m2.windowDurationSec = 178;
     auto jb = lt::buildStatsJson(m2, a, d, iv);
     auto fleet = lt::mergeFleetStats({ja, jb});
     check(fleet["used"] == 200, "fleet used sums");
@@ -80,6 +86,23 @@ int main() {
     check(std::abs(fleet["interval"]["tx_pps"].get<double>() - 2000.0) < 0.01,
           "fleet tx_pps sums not averaged");
     check(fleet["window"]["counters"]["tx_packets"] == 120, "fleet window tx sums");
+    // The fleet window must carry an ABSOLUTE start, earliest of the hosts'. This
+    // reported 0 until 2026-09-01: nothing in the merge loop copied it, so a rung
+    // summary could not be aligned to a monitoring window without opening per_host.
+    check(fleet["window"]["open_epoch_sec"] == 1756770000,
+          "fleet window open is the EARLIEST host open, not zero");
+    check(std::abs(fleet["window"]["duration_sec"].get<double>() - 180.0) < 0.01,
+          "fleet window duration is the LONGEST host window");
+
+    // A host that never opened the window reports 0, and must not drag the fleet's
+    // start back to the epoch -- which is what a plain std::min would do.
+    lt::SnapshotMeta m3 = m1;
+    m3.instanceId = "c";
+    m3.windowOpenEpochSec = 0;
+    m3.windowDurationSec = 0;
+    auto fleet3 = lt::mergeFleetStats({ja, lt::buildStatsJson(m3, a, d, iv)});
+    check(fleet3["window"]["open_epoch_sec"] == 1756770000,
+          "a host with no window does not zero the fleet's window start");
 
     // round-trip JSON
     auto back = lt::CounterSnap::fromJson(a.toJson());

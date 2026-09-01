@@ -333,6 +333,24 @@ nlohmann::json mergeFleetStats(const std::vector<nlohmann::json>& hosts) {
             else if (rid != meta.rungId) disagree = "rung_id";
             meta.windowDurationSec =
                 std::max(meta.windowDurationSec, h["window"].value("duration_sec", 0.0));
+            // EARLIEST open, so the fleet window is the union of the hosts' windows
+            // rather than whichever host happened to be merged last. Without this the
+            // merged blob reported `open_epoch_sec: 0` — it was the one field the loop
+            // never carried across — and a rung then had no absolute start time in it.
+            // That matters to anything correlating a rung with a monitoring system:
+            // duration alone forces the reader to guess the start from the file's mtime,
+            // which is the close, and a window guessed backwards from the close of the
+            // NEXT rung silently spans this rung's ramp.
+            //
+            // MIN rather than max, paired with the max above, because the two together
+            // bound the interval every host was inside. `rung-open` is one fanned-out
+            // HTTP call, so the spread is milliseconds; a host that missed the call
+            // entirely reports 0 and is skipped rather than dragging the start to the
+            // epoch.
+            uint64_t open = h["window"].value("open_epoch_sec", static_cast<uint64_t>(0));
+            if (open != 0 && (meta.windowOpenEpochSec == 0 || open < meta.windowOpenEpochSec)) {
+                meta.windowOpenEpochSec = open;
+            }
         }
         if (first) {
             life = L;
