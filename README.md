@@ -6,7 +6,8 @@ updates, using the same public sign-in, token-minting, and server-assignment
 flow a real native game client uses.
 
 - Lightweight C++20: plain UDP sockets and a few worker threads drive
-  thousands of simulated clients from a single host.
+  thousands of simulated clients from a single host. A fleet of generators
+  is a row of the same binary plus `cks-loadtest-ctl`.
 - Runs natively on Ubuntu or anywhere Docker runs — no special host setup.
 - Provisions its own player accounts deterministically and idempotently from
   one email + password.
@@ -199,6 +200,68 @@ While running, a stats line prints every `LT_STATS_INTERVAL_SEC`:
 and a final summary (latency histogram, error-code breakdown) prints on exit.
 Add `--csv-out stats.csv` for a machine-readable per-interval log.
 
+## Progressive fleet
+
+One process can stay up for the whole test: load some clients, measure, write
+a rung summary, load more, never restart. Each VM owns a **global index
+range** so two generators never share accounts (Buddy sessions are per token;
+colliding emails steal sessions).
+
+Install recipe for VM `i` of `N`, capacity `C` each:
+
+```bash
+export LT_INDEX_BASE=$((i * C)) LT_INDEX_LIMIT=$C LT_CLIENTS=0
+export LT_INDEX_WIDTH=8
+export LT_CONTROL_BIND=0.0.0.0:9109
+export LT_CONTROL_TOKEN='...'          # required off-loopback; there is no TLS
+export LT_STATS_DIR=/var/lib/cks-loadtest
+export LT_ROSTER_FILE=roster.json LT_ROSTER_REQUIRED=1
+./cks-loadtest
+```
+
+Mint the whole population **once** (indices `0 .. N*C-1`), copy the same
+roster to every VM:
+
+```bash
+LT_INDEX_BASE=0 LT_INDEX_WIDTH=8 LT_CLIENTS=$((N * C)) \
+  scripts/provision-roster.sh
+```
+
+The orchestrating agent talks HTTP (`Authorization: Bearer $LT_CONTROL_TOKEN`)
+or, easier, runs `cks-loadtest-ctl` against a hosts file (one `http://host:9109`
+per line):
+
+```bash
+cks-loadtest-ctl --hosts hosts.txt status
+cks-loadtest-ctl --hosts hosts.txt add --count 200
+cks-loadtest-ctl --hosts hosts.txt wait --active-delta 200 --timeout-sec 120
+# wait returns when each host has provisioned AND ramped the new clients
+cks-loadtest-ctl --hosts hosts.txt rung-open --id r3
+cks-loadtest-ctl --hosts hosts.txt wait --stable-sec 30
+cks-loadtest-ctl --hosts hosts.txt rung-close --id r3 --out r3.fleet.json
+# ... add again, never shutting the generators down ...
+```
+
+`rung-close` writes per-host JSON (and `{LT_STATS_DIR}/rung-<id>.json` on each
+generator) plus one **fleet** summary. Merge rule: **sum** counts and rates,
+**max** of max latency, **merge histograms then read p50/p95/p99**. Averages
+of averages are refused.
+
+Control routes (all except `GET /health` require the bearer token):
+
+| Method | Role |
+|---|---|
+| `GET /health` | liveness |
+| `GET /v1/status` | instance id, index base/used/limit, active, busy, current rung |
+| `GET /v1/stats` | lifetime + open-window counters + last-interval rates |
+| `POST /v1/clients/add` | `{"count": N}` next unused indices (202; poll `status.busy`) |
+| `POST /v1/rung/open` | `{"id": "r3"}` mark a stats window (does not add clients) |
+| `POST /v1/rung/close` | persist the window summary |
+| `POST /v1/shutdown` | graceful stop |
+
+Put the control port on a private network. Binding anything other than
+loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
+
 ## Key options
 
 | Option / env | Default | Meaning |
@@ -207,7 +270,14 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 | `--password` / `LT_PASSWORD` | — | Password for base + derived accounts (min 8 chars). Prefer `LT_PASSWORD`: `--password` is visible in `ps(1)`. |
 | `--management-api-url` / `LT_MANAGEMENT_API_URL` | — | CK GraphQL origin (required) |
 | `--app-id` / `LT_APP_ID` | — | App to load test (required; a per-deployment snowflake, no default) |
-| `--clients` / `LT_CLIENTS` | 10 | Simulated clients |
+| `--clients` / `LT_CLIENTS` | 10 | Clients provisioned at start (0 = wait for HTTP add) |
+| `--index-base` / `LT_INDEX_BASE` | 0 | First global client index this process owns |
+| `--index-limit` / `LT_INDEX_LIMIT` | = clients | Max clients this process will ever hold |
+| `--index-width` / `LT_INDEX_WIDTH` | 4 | Zero-pad width for `{index}` (use 8 for a large fleet) |
+| `--instance-id` / `LT_INSTANCE_ID` | hostname | Id stamped on every stats blob |
+| `--control-bind` / `LT_CONTROL_BIND` | `127.0.0.1:9109` | HTTP control bind (`off` disables) |
+| `--control-token` / `LT_CONTROL_TOKEN` | — | Bearer token; required off-loopback |
+| `--stats-dir` / `LT_STATS_DIR` | — | Rung JSON + interval JSONL directory |
 | `--threads` / `LT_THREADS` | 1 | Worker threads |
 | `--update-hz` / `LT_UPDATE_HZ` | 10 | Actor updates per second per client |
 | `--walk-speed` / `LT_WALK_SPEED` | 150 | Walk speed (Unreal units/s) |
@@ -226,7 +296,8 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 ## Interpreting results
 
 - **tx pps** should equal `clients x update-hz` once the ramp completes. If it
-  lags, the load generator host is saturated — add threads or hosts.
+  lags, the load generator host is saturated — add threads, or add hosts and
+  partition `LT_INDEX_BASE` (see Progressive fleet).
 - **notif/s** measures replication fan-out: with all clients co-located it
   approaches `clients^2 x update-hz` (bounded by the server's interest
   management and your `--distance`).
@@ -342,7 +413,7 @@ traffic. Entitlement management stays with you (see Prerequisites).
 
 ```
 src/
-  main.cpp            wiring: provision -> ramp -> simulate -> report
+  main.cpp            wiring: harness + HTTP control + shutdown
   Config.*            CLI + env + config-file settings
   GraphQLClient.*     minimal libcurl GraphQL POST client
   Provisioner.*       login/register, mintAppToken, serverWithLeastClients
@@ -350,8 +421,11 @@ src/
   Hmac.hpp            HMAC-SHA256 sign/verify (OpenSSL)
   SimClient.hpp       per-client walk simulation + message template
   Worker.*            worker threads: epoll RX + tick TX
-  Stats.*             counters, latency histogram, console/CSV reporter
-tests/wire_test.cpp   wire vectors cross-checked against the reference impl
+  Stats.*             counters, windowed snapshots, fleet merge, reporter
+  Harness.*           long-lived generator: hot-add, rungs, workers
+  ControlServer.*     HTTP JSON control port
+  ctl.cpp             cks-loadtest-ctl (status/add/wait/rung/aggregate)
+tests/                wire, config, stats merge, hot-add, HTTP control
 ```
 
 ## Versioning

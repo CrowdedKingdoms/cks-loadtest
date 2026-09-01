@@ -32,6 +32,10 @@
 #   LT_PASSWORD='...' \
 #   scripts/provision-roster.sh
 #
+# Fleet slice (optional):
+#   LT_INDEX_BASE            first global index (default 0)
+#   LT_INDEX_WIDTH           zero-pad width for {index} (default 4; fleet: 8)
+#
 # Passwords, one of two ways:
 #   LT_PASSWORD            one shared password for every derived account
 #   LT_PASSWORD_HMAC_SEED  per-account password = Aa1!<HMAC-SHA256-base64url of
@@ -50,6 +54,8 @@ set -euo pipefail
 API="${LT_MANAGEMENT_API_URL:-}"
 EMAIL="${LT_EMAIL:-}"
 CLIENTS="${LT_CLIENTS:-10}"
+BASE="${LT_INDEX_BASE:-0}"
+WIDTH="${LT_INDEX_WIDTH:-4}"
 # NOT `${LT_EMAIL_PATTERN:-{local}+...}`: the first `}` inside the default
 # closes the parameter expansion, so the default silently becomes `{local` and
 # every derived address comes out malformed. Assign the fallback separately.
@@ -81,7 +87,7 @@ DOMAIN="${EMAIL#*@}"
 derived_email() {
   local idx padded out
   idx="$1"
-  padded=$(printf '%04d' "$idx")
+  padded=$(printf "%0${WIDTH}d" "$idx")
   out="${PATTERN//\{local\}/$LOCAL}"
   out="${out//\{domain\}/$DOMAIN}"
   out="${out//\{index\}/$padded}"
@@ -115,14 +121,14 @@ Q_LOGIN='mutation L($e:String!,$p:String!){ login(loginUserInput:{email:$e,passw
 # thing entirely.
 Q_REGISTER='mutation R($e:String!,$p:String!){ register(registerUserInput:{email:$e,password:$p}){ token user { userId } } }'
 
-echo "roster: $CLIENTS account(s) against $API"
+echo "roster: $CLIENTS account(s) starting at index $BASE (width $WIDTH) against $API"
 echo "  password source: $([ -n "$SEED" ] && echo 'HMAC-derived per account' || echo 'one shared LT_PASSWORD')"
 
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 : > "$tmp"
 
 minted=0; registered=0; failed=0
-for i in $(seq 0 $((CLIENTS - 1))); do
+for i in $(seq "$BASE" $((BASE + CLIENTS - 1))); do
   em=$(derived_email "$i")
   pw=$(derived_password "$em")
   vars=$(jq -cn --arg e "$em" --arg p "$pw" '{e:$e,p:$p}')
