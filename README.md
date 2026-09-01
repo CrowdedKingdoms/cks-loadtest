@@ -212,12 +212,42 @@ Install recipe for VM `i` of `N`, capacity `C` each:
 ```bash
 export LT_INDEX_BASE=$((i * C)) LT_INDEX_LIMIT=$C LT_CLIENTS=0
 export LT_INDEX_WIDTH=8
-export LT_CONTROL_BIND=0.0.0.0:9109
+export LT_CONTROL_BIND="$PRIVATE_IP:9109"   # the private address ITSELF, not 0.0.0.0
 export LT_CONTROL_TOKEN='...'          # required off-loopback; there is no TLS
 export LT_STATS_DIR=/var/lib/cks-loadtest
 export LT_ROSTER_FILE=roster.json LT_ROSTER_REQUIRED=1
 ./cks-loadtest
 ```
+
+**Bind the private address, not `0.0.0.0`.** A cloud VM usually has a public
+interface too, and `0.0.0.0` puts a token-gated, TLS-free control port on it —
+one leaked token then adds clients to your fleet from anywhere. Naming the
+private address is one string and cannot be got wrong by a firewall edit.
+
+With a roster covering every client (`LT_ROSTER_FILE` + `LT_ROSTER_REQUIRED=1`)
+no password is required and **none should be given**: the generators then hold
+session tokens for their own slice and no credential that could mint more.
+
+**Stop the machine's package manager from restarting the generator.** The point
+of this mode is a process that lives for the whole test, which makes it the
+first thing an unattended upgrade will interrupt. On Ubuntu, a run was cut at
+176 s of a 180 s window by `apt-daily-upgrade` stopping and starting the
+service, and the rung was lost:
+
+```bash
+sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer
+sudo systemctl mask unattended-upgrades.service apt-daily-upgrade.service apt-daily.service
+```
+
+`Restart=no` in a unit file does not help. It governs what the supervisor does
+when the process exits by itself; a stop requested by *another* unit is not that,
+so the setting never applies. Keep it anyway — a crash should stay visible rather
+than silently restarting empty mid-rung — but do not mistake it for protection.
+
+**Sync the generators' clocks to the same source as the servers**, or read
+latency per host. See *Interpreting results* below: the one-way estimate is
+offset by each generator's own clock error, and merging several hosts' samples
+produces a fleet figure that is a mixture of their offsets.
 
 Mint the whole population **once** (indices `0 .. N*C-1`), copy the same
 roster to every VM:
@@ -245,7 +275,23 @@ cks-loadtest-ctl --hosts hosts.txt rung-close --id r3 --out r3.fleet.json
 `rung-close` writes per-host JSON (and `{LT_STATS_DIR}/rung-<id>.json` on each
 generator) plus one **fleet** summary. Merge rule: **sum** counts and rates,
 **max** of max latency, **merge histograms then read p50/p95/p99**. Averages
-of averages are refused.
+of averages are refused. The fleet window carries the **earliest** host's
+`open_epoch_sec` and the **longest** `duration_sec`, so it bounds the interval
+every host was inside — which is what lets a rung be read back out of a
+monitoring system over exactly its own window instead of a guess.
+
+**Ramp before `rung-open`, as above.** The window then contains steady state
+only, which is why a healthy rung shows *zero* first-contact `UNAUTHORIZED` in
+its window while the lifetime count stays at roughly one per client. Both are
+worth reading; either alone misleads.
+
+**`aggregate` merges hosts within ONE rung.** It exists to re-merge per-host
+blobs offline — the files under `{LT_STATS_DIR}` — not to summarise a ladder.
+Handed several rungs it sums them, which is meaningless: five rungs of 50, 100,
+200, 300 and 400 clients merge into a confident *1050 clients* labelled with the
+first rung's id. It refuses that now (it reports the `rung_id` disagreement and
+exits non-zero), but a ladder summary is a table of rungs and this tool does not
+build one.
 
 Control routes (all except `GET /health` require the bearer token):
 
@@ -304,6 +350,24 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 - **lat~** is a one-way estimate from the server's epoch-millis stamp vs the
   local clock; it includes clock skew between the hosts, so watch its *trend*
   under load rather than its absolute value.
+
+  **On a fleet, do not merge it into one number.** Skew is per generator and it
+  is a constant offset on every sample that host takes, so a merged percentile
+  is a mixture of the generators' clock errors weighted by how many clients each
+  holds — a figure that moves when you add a host and not when the servers
+  change. Measured on two VMs of the same image running the same rung against
+  the same servers, with their windows opened in the same second:
+
+  | | generator A | generator B |
+  |---|---|---|
+  | p50 | 8.0 ms | **0.8 ms** |
+  | p95 | 14.9 ms | 6.3 ms |
+  | p99 | 18.7 ms | 7.0 ms |
+
+  An order of magnitude at p50, from clocks alone. Report per-host percentiles
+  side by side, or sync every generator to the same time source the servers use.
+  Trends survive skew — p95 rose on *both* hosts as fan-out grew — but levels do
+  not, and neither do comparisons between hosts.
 - **errs / error codes** in the final summary map to the wire protocol error
   codes (e.g. `TOKEN_EXPIRED`, `UNAUTHORIZED`). Occasional `TOKEN_EXPIRED`
   around the ~30 min mark is normal — clients rotate tokens and resume.

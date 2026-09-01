@@ -368,6 +368,26 @@ int main(int argc, char** argv) {
         } else {
             std::printf("%s\n", dumped.c_str());
         }
+        // THE SAME REFUSAL `rung-close` MAKES, and it was missing from the one
+        // command that needs it more. `rung-close` merges whatever the live fleet
+        // reports, and warns plus exits non-zero when the hosts disagree on which
+        // rung they were in. `aggregate` merges files the OPERATOR named -- the only
+        // place a wrong input is a typo rather than a fleet fault -- and it printed
+        // the warning nowhere and exited 0.
+        //
+        // Feeding it a whole ladder is the mistake worth catching, because the output
+        // looks entirely reasonable: five rungs of 50, 100, 200, 300 and 400 clients
+        // merge into a plausible "1050 clients" summary labelled with the FIRST
+        // rung's id. Sums across rungs are not a ladder summary, and nothing in the
+        // blob says so.
+        if (fleet.contains("warning")) {
+            std::fprintf(stderr, "warning: %s\n",
+                         fleet["warning"].get<std::string>().c_str());
+            std::fprintf(stderr,
+                         "aggregate merges hosts WITHIN one rung. Inputs from different "
+                         "rungs sum into a total that describes no measurement.\n");
+            if (rc == 0) rc = 1;
+        }
     } else {
         std::fprintf(stderr, "error: unknown command '%s'\n%s\n", cmd.c_str(),
                      opts.help().c_str());
