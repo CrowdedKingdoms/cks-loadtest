@@ -18,6 +18,8 @@
 #   TIER_ID                     tier to grant (see appAccessTiers)
 # Optional:
 #   LT_EMAIL_PATTERN            default '{local}+lt-{index}@{domain}'
+#   LT_INDEX_BASE               first global index (default 0)
+#   LT_INDEX_WIDTH              zero-pad width for {index} (default 4; fleet: 8)
 set -euo pipefail
 
 : "${LT_EMAIL:?}" "${LT_PASSWORD:?}" "${LT_MANAGEMENT_API_URL:?}" "${LT_APP_ID:?}" "${LT_CLIENTS:?}"
@@ -26,6 +28,8 @@ set -euo pipefail
 GQL="${LT_MANAGEMENT_API_URL%/}/graphql"
 DEFAULT_PATTERN='{local}+lt-{index}@{domain}'
 PATTERN="${LT_EMAIL_PATTERN:-$DEFAULT_PATTERN}"
+BASE="${LT_INDEX_BASE:-0}"
+WIDTH="${LT_INDEX_WIDTH:-4}"
 LOCAL="${LT_EMAIL%%@*}"
 DOMAIN="${LT_EMAIL##*@}"
 
@@ -54,8 +58,9 @@ fail_on_errors "$resp" "owner login"
 OWNER_TOKEN=$(jq -r '.data.login.token' <<<"$resp")
 
 granted=0
-for ((i = 0; i < LT_CLIENTS; i++)); do
-  idx=$(printf '%04d' "$i")
+end=$((BASE + LT_CLIENTS))
+for ((i = BASE; i < end; i++)); do
+  idx=$(printf "%0${WIDTH}d" "$i")
   email="${PATTERN//\{local\}/$LOCAL}"
   email="${email//\{domain\}/$DOMAIN}"
   email="${email//\{index\}/$idx}"

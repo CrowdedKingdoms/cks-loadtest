@@ -21,11 +21,14 @@ add_library(loadtest_core STATIC
   src/Provisioner.cpp
   src/Stats.cpp
   src/Worker.cpp
+  src/Harness.cpp
+  src/ControlServer.cpp
 )
 target_include_directories(loadtest_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cxxopts
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib
 )
 target_link_libraries(loadtest_core PUBLIC
   CURL::libcurl
@@ -36,9 +39,28 @@ target_link_libraries(loadtest_core PUBLIC
 add_executable(cks-loadtest src/main.cpp)
 target_link_libraries(cks-loadtest PRIVATE loadtest_core)
 
+add_executable(cks-loadtest-ctl src/ctl.cpp)
+target_link_libraries(cks-loadtest-ctl PRIVATE loadtest_core)
+
 enable_testing()
 add_executable(wire_test tests/wire_test.cpp)
 target_link_libraries(wire_test PRIVATE loadtest_core)
 add_test(NAME wire_test COMMAND wire_test)
 
-install(TARGETS cks-loadtest RUNTIME DESTINATION bin)
+add_executable(config_test tests/config_test.cpp)
+target_link_libraries(config_test PRIVATE loadtest_core)
+add_test(NAME config_test COMMAND config_test)
+
+add_executable(stats_test tests/stats_test.cpp)
+target_link_libraries(stats_test PRIVATE loadtest_core)
+add_test(NAME stats_test COMMAND stats_test)
+
+add_executable(worker_add_test tests/worker_add_test.cpp)
+target_link_libraries(worker_add_test PRIVATE loadtest_core)
+add_test(NAME worker_add_test COMMAND worker_add_test)
+
+add_executable(control_http_test tests/control_http_test.cpp)
+target_link_libraries(control_http_test PRIVATE loadtest_core)
+add_test(NAME control_http_test COMMAND control_http_test)
+
+install(TARGETS cks-loadtest cks-loadtest-ctl RUNTIME DESTINATION bin)

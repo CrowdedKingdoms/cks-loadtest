@@ -57,12 +57,18 @@ class Provisioner {
 public:
     explicit Provisioner(const Config& config);
 
-    /// Provision credentials for all configured clients, using
-    /// config.provisionConcurrency parallel threads. Fatal errors (bad
-    /// password, missing entitlement, unreachable API) print an actionable
-    /// message and abort the whole run by returning an empty vector.
+    /// Provision `count` clients starting at GLOBAL index `globalStart`
+    /// (inclusive), using config.provisionConcurrency parallel threads.
+    /// Fatal errors print an actionable message and return an empty vector.
     /// `stop` aborts provisioning early (e.g. on SIGINT).
-    std::vector<ClientCredentials> provisionAll(std::atomic<bool>& stop);
+    std::vector<ClientCredentials> provisionRange(int globalStart, int count,
+                                                  std::atomic<bool>& stop);
+
+    /// Provision the start-of-run slice: [indexBase, indexBase + clients).
+    std::vector<ClientCredentials> provisionAll(std::atomic<bool>& stop) {
+        if (config_.clients <= 0) return {};
+        return provisionRange(config_.indexBase, config_.clients, stop);
+    }
 
     /// Rotate the app token (refreshAppToken with the current app token as
     /// bearer) and install a session on a (possibly different) Buddy.

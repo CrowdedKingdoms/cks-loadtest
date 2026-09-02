@@ -4,8 +4,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace lt {
@@ -72,15 +74,60 @@ struct Layers {
     }
 };
 
+std::string defaultInstanceId() {
+    char buf[256];
+    if (gethostname(buf, sizeof(buf)) != 0) return "cks-loadtest";
+    buf[sizeof(buf) - 1] = '\0';
+    return buf;
+}
+
 } // namespace
 
-std::string Config::derivedEmail(int index) const {
+ControlBind parseControlBind(const std::string& spec) {
+    ControlBind b;
+    std::string s = trim(spec);
+    if (s.empty() || s == "off" || s == "none" || s == "disabled") {
+        b.disabled = true;
+        return b;
+    }
+    // [ipv6]:port
+    if (!s.empty() && s.front() == '[') {
+        auto rb = s.find(']');
+        if (rb == std::string::npos) {
+            b.host = s;
+            return b;
+        }
+        b.host = s.substr(1, rb - 1);
+        if (rb + 1 < s.size() && s[rb + 1] == ':') {
+            b.port = std::stoi(s.substr(rb + 2));
+        }
+    } else {
+        auto colon = s.rfind(':');
+        if (colon == std::string::npos) {
+            b.host = s;
+        } else {
+            b.host = s.substr(0, colon);
+            b.port = std::stoi(s.substr(colon + 1));
+        }
+    }
+    if (b.host.empty()) b.host = "0.0.0.0";
+    b.wildcard = (b.host == "0.0.0.0" || b.host == "*" || b.host == "::");
+    b.loopback = (b.host == "127.0.0.1" || b.host == "::1" || b.host == "localhost");
+    return b;
+}
+
+std::string Config::formatIndex(int globalIndex) const {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%0*d", indexWidth, globalIndex);
+    return buf;
+}
+
+std::string Config::derivedEmail(int globalIndex) const {
     size_t at = email.find('@');
     std::string local = at == std::string::npos ? email : email.substr(0, at);
     std::string domain = at == std::string::npos ? "" : email.substr(at + 1);
 
-    char idx[16];
-    std::snprintf(idx, sizeof(idx), "%04d", index);
+    std::string idx = formatIndex(globalIndex);
 
     std::string out = emailPattern;
     auto replaceAll = [&out](const std::string& from, const std::string& to) {
@@ -111,7 +158,7 @@ std::string Config::validate() const {
     }
     if (managementApiUrl.empty()) return "missing LT_MANAGEMENT_API_URL / --management-api-url";
     if (appId <= 0) return "missing/invalid LT_APP_ID / --app-id";
-    if (clients < 1) return "LT_CLIENTS must be >= 1";
+    if (clients < 0) return "LT_CLIENTS must be >= 0";
     if (threads < 1) return "LT_THREADS must be >= 1";
     if (updateHz < 1 || updateHz > 1000) return "LT_UPDATE_HZ must be in [1, 1000]";
     if (distance < 0 || distance > 255) return "LT_DISTANCE must be in [0, 255]";
@@ -121,6 +168,22 @@ std::string Config::validate() const {
     if (decay < 0 || decay > 5) return "LT_DECAY must be in [0, 5]";
     if (provisionConcurrency < 1) return "LT_PROVISION_CONCURRENCY must be >= 1";
     if (rampBatchSize < 1) return "LT_RAMP_BATCH_SIZE must be >= 1";
+    if (indexBase < 0) return "LT_INDEX_BASE must be >= 0";
+    if (indexWidth < 1 || indexWidth > 16) return "LT_INDEX_WIDTH must be in [1, 16]";
+    if (indexLimit < 0) return "LT_INDEX_LIMIT must be >= 0";
+    if (indexLimit < clients) return "LT_INDEX_LIMIT must be >= LT_CLIENTS";
+    auto bind = parsedBind();
+    if (!bind.disabled) {
+        if (bind.port < 1 || bind.port > 65535) return "LT_CONTROL_BIND port out of range";
+        if (!bind.loopback && controlToken.empty()) {
+            return "LT_CONTROL_TOKEN is required when LT_CONTROL_BIND is not loopback "
+                   "(a fleet bind without a token would accept unauthenticated adds)";
+        }
+    }
+    if (clients == 0 && bind.disabled) {
+        return "LT_CLIENTS is 0 and the control port is off: nothing would run. "
+               "Set LT_CLIENTS > 0 or enable LT_CONTROL_BIND so an agent can add clients";
+    }
     return "";
 }
 
@@ -142,7 +205,7 @@ Config Config::load(int argc, char** argv) {
         ("management-api-url", "Management API base URL, e.g. https://api.example.com", cxxopts::value<std::string>())
         ("game-api-url", "Game API base URL override (default: from mintAppToken)", cxxopts::value<std::string>())
         ("app-id", "App id to load test", cxxopts::value<int64_t>())
-        ("clients", "Number of simulated clients", cxxopts::value<int>())
+        ("clients", "Clients to provision at start (0 = wait for HTTP add)", cxxopts::value<int>())
         ("threads", "Worker threads", cxxopts::value<int>())
         ("update-hz", "Actor updates per second per client", cxxopts::value<int>())
         ("walk-speed", "Walk speed in Unreal units/second", cxxopts::value<double>())
@@ -153,6 +216,13 @@ Config Config::load(int argc, char** argv) {
          "classifying UNAUTHORIZED refusals only",
          cxxopts::value<int>())
         ("decay", "Decay rate 0=none 1=exponential 2..5=linear", cxxopts::value<int>())
+        ("instance-id", "Id stamped on every stats blob (default: hostname)", cxxopts::value<std::string>())
+        ("index-base", "First global client index this process owns", cxxopts::value<int>())
+        ("index-limit", "Max clients this process will ever hold", cxxopts::value<int>())
+        ("index-width", "Zero-pad width for {index} in emails (fleet: 8)", cxxopts::value<int>())
+        ("control-bind", "HTTP control bind host:port (off disables; default 127.0.0.1:9109)", cxxopts::value<std::string>())
+        ("control-token", "Bearer token for the control port (required off-loopback)", cxxopts::value<std::string>())
+        ("stats-dir", "Directory for rung JSON and interval JSONL", cxxopts::value<std::string>())
         ("ramp-batch-size", "Clients activated per ramp batch", cxxopts::value<int>())
         ("ramp-interval-ms", "Interval between ramp batches (ms)", cxxopts::value<int>())
         ("provision-concurrency", "Parallel GraphQL provisioning requests", cxxopts::value<int>())
@@ -203,6 +273,13 @@ Config Config::load(int argc, char** argv) {
     c.permReloadGraceMs =
         layers.getInt("LT_PERMISSION_RELOAD_GRACE_MS", c.permReloadGraceMs);
     c.decay = layers.getInt("LT_DECAY", c.decay);
+    c.instanceId = layers.get("LT_INSTANCE_ID", c.instanceId);
+    c.indexBase = layers.getInt("LT_INDEX_BASE", c.indexBase);
+    c.indexLimit = layers.getInt("LT_INDEX_LIMIT", c.indexLimit);
+    c.indexWidth = layers.getInt("LT_INDEX_WIDTH", c.indexWidth);
+    c.controlBind = layers.get("LT_CONTROL_BIND", c.controlBind);
+    c.controlToken = layers.get("LT_CONTROL_TOKEN", c.controlToken);
+    c.statsDir = layers.get("LT_STATS_DIR", c.statsDir);
     c.rampBatchSize = layers.getInt("LT_RAMP_BATCH_SIZE", c.rampBatchSize);
     c.rampIntervalMs = layers.getInt("LT_RAMP_INTERVAL_MS", c.rampIntervalMs);
     c.provisionConcurrency = layers.getInt("LT_PROVISION_CONCURRENCY", c.provisionConcurrency);
@@ -241,6 +318,13 @@ Config Config::load(int argc, char** argv) {
     cliInt("distance", c.distance);
     cliInt("permission-window-radius-chunks", c.permWindowRadiusChunks);
     cliInt("decay", c.decay);
+    cliStr("instance-id", c.instanceId);
+    cliInt("index-base", c.indexBase);
+    cliInt("index-limit", c.indexLimit);
+    cliInt("index-width", c.indexWidth);
+    cliStr("control-bind", c.controlBind);
+    cliStr("control-token", c.controlToken);
+    cliStr("stats-dir", c.statsDir);
     cliInt("ramp-batch-size", c.rampBatchSize);
     cliInt("ramp-interval-ms", c.rampIntervalMs);
     cliInt("provision-concurrency", c.provisionConcurrency);
@@ -256,11 +340,14 @@ Config Config::load(int argc, char** argv) {
     cliInt("rx-health-timeout-sec", c.rxHealthTimeoutSec);
     cliInt("token-refresh-lead-sec", c.tokenRefreshLeadSec);
 
+    if (c.instanceId.empty()) c.instanceId = defaultInstanceId();
+    if (c.indexLimit < 0) c.indexLimit = c.clients;
+    if (c.clients > 0 && c.threads > c.clients) c.threads = c.clients;
+
     if (std::string err = c.validate(); !err.empty()) {
         std::fprintf(stderr, "error: %s\nRun with --help for usage.\n", err.c_str());
         std::exit(2);
     }
-    if (c.threads > c.clients) c.threads = c.clients;
     return c;
 }
 

@@ -19,5 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home loadtest
 COPY --from=build /src/build/cks-loadtest /usr/local/bin/cks-loadtest
+COPY --from=build /src/build/cks-loadtest-ctl /usr/local/bin/cks-loadtest-ctl
 USER loadtest
 ENTRYPOINT ["cks-loadtest"]

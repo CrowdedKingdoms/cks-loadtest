@@ -54,10 +54,32 @@ Worker::~Worker() {
 
 void Worker::addClient(ClientCredentials creds,
                        std::chrono::steady_clock::time_point activateAt) {
-    SimClient c;
-    c.creds = std::move(creds);
-    c.activateAt = activateAt;
-    clients_.push_back(std::move(c));
+    PendingAdd p;
+    p.creds = std::move(creds);
+    p.activateAt = activateAt;
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    pending_.push_back(std::move(p));
+}
+
+int Worker::slotOf(const SimClient& client) const {
+    return static_cast<int>(&client - clients_.data());
+}
+
+void Worker::applyPendingClients() {
+    std::vector<PendingAdd> incoming;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        if (pending_.empty()) return;
+        incoming.swap(pending_);
+    }
+    for (auto& p : incoming) {
+        SimClient c;
+        c.creds = std::move(p.creds);
+        c.activateAt = p.activateAt;
+        clients_.push_back(std::move(c));
+        clientCount_.store(static_cast<int>(clients_.size()),
+                           std::memory_order_relaxed);
+    }
 }
 
 void Worker::start() {
@@ -95,7 +117,7 @@ bool Worker::openSocket(SimClient& client) {
 
     epoll_event ev{};
     ev.events = EPOLLIN;
-    ev.data.u32 = static_cast<uint32_t>(&client - clients_.data());
+    ev.data.u32 = static_cast<uint32_t>(slotOf(client));
     if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
         close(fd);
         return false;
@@ -123,7 +145,7 @@ void Worker::suspendClient(SimClient& client, ControlRequest::Kind kind) {
 
     ControlRequest req;
     req.workerIndex = index_;
-    req.clientIndex = static_cast<int>(&client - clients_.data());
+    req.clientIndex = slotOf(client);
     req.kind = kind;
     req.creds = client.creds;
     control_.push(std::move(req));
@@ -367,7 +389,7 @@ void Worker::sendDueUpdates(double nowSec) {
             client.refreshRequested = true;
             ControlRequest req;
             req.workerIndex = index_;
-            req.clientIndex = static_cast<int>(&client - clients_.data());
+            req.clientIndex = slotOf(client);
             req.kind = ControlRequest::Kind::REFRESH;
             req.creds = client.creds;
             control_.push(std::move(req));
@@ -402,6 +424,7 @@ void Worker::run() {
     epoll_event events[MAX_EVENTS];
 
     while (running_.load(std::memory_order_acquire)) {
+        applyPendingClients();
         applyPendingUpdates();
 
         auto now = std::chrono::steady_clock::now();
