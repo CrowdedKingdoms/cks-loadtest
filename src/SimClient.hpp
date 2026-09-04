@@ -42,6 +42,9 @@ struct SimClient {
     uint8_t sequence = 0;
     double lastSendTime = 0;
     double lastMoveTime = 0;
+    // When this client last received ANY datagram on its current assignment
+    // (steady seconds). Reset on activation; see Config::rxSilentReassignSec.
+    double lastRxTime = 0;
 
     // Set when a refresh request is in flight so we only ask once.
     bool refreshRequested = false;
