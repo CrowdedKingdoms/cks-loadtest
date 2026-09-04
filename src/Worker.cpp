@@ -200,6 +200,7 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
             client.lastMoveTime = nowSec;
             client.lastSendTime = nowSec;
         }
+        client.lastRxTime = nowSec;
         // The first-contact grace window is per ASSIGNMENT, not per client: a
         // new gameTokenId on a new Buddy has its own permission window to load.
         // Re-arm so a reassignment's expected refusals are not misfiled.
@@ -226,6 +227,7 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
 void Worker::handleDatagram(SimClient& client, const uint8_t* data, size_t len) {
     stats_.rxDatagrams.fetch_add(1, std::memory_order_relaxed);
     stats_.rxBytes.fetch_add(len, std::memory_order_relaxed);
+    client.lastRxTime = steadySeconds();
     if (len == 0) return;
 
     if (data[0] == wire::MESSAGE_BUNDLE) {
@@ -377,6 +379,18 @@ void Worker::sendDueUpdates(double nowSec) {
 
     for (auto& client : clients_) {
         if (client.state != SimClient::State::ACTIVE) continue;
+        // Orphan check, before this tick's send: a client that has heard
+        // nothing for the window is talking to a Buddy that dropped it
+        // (restart, shed without a reconnect command, silent drop). On the
+        // 2026-09-03 ladder ~750 of 1 500 clients sent into nothing for eight
+        // minutes after a watchdog restart, and the population became a
+        // number nobody could state. A real client would rejoin; so does this.
+        if (config_.rxSilentReassignSec > 0 &&
+            nowSec - client.lastRxTime > config_.rxSilentReassignSec) {
+            stats_.rxSilentReassigns.fetch_add(1, std::memory_order_relaxed);
+            suspendClient(client, ControlRequest::Kind::REASSIGN);
+            continue;
+        }
         if (nowSec - client.lastSendTime < interval) continue;
         client.lastSendTime += interval;
         // If we fell far behind (scheduler stall), don't burst-catch-up.

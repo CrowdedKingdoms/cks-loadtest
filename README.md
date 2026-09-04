@@ -330,6 +330,7 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 | `--spawn-radius-chunks` / `LT_SPAWN_RADIUS_CHUNKS` | 8 | Spawn/bounce radius around origin |
 | `--ramp-batch-size` / `LT_RAMP_BATCH_SIZE` | 10 | Clients activated per ramp batch |
 | `--ramp-interval-ms` / `LT_RAMP_INTERVAL_MS` | 1000 | Delay between ramp batches |
+| `--rx-silent-reassign-sec` / `LT_RX_SILENT_REASSIGN_SEC` | 0 | Re-assign a client that has received nothing at all for this many seconds on its current assignment (a Buddy that restarted or dropped the session answers nothing; no other trigger sees it). 0 = off; a lone client in an empty chunk legitimately hears nothing, so set it on fleet runs (30 on the ladder). Counted as `rx_silent_reassigns`. |
 | `--provision-concurrency` / `LT_PROVISION_CONCURRENCY` | 4 | Parallel GraphQL provisioning |
 | `--duration-sec` / `LT_DURATION_SEC` | 0 | Run time (0 = until Ctrl-C) |
 | `--csv-out` / `LT_CSV_OUT` | — | Per-interval CSV stats file |

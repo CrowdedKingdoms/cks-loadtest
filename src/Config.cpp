@@ -168,6 +168,7 @@ std::string Config::validate() const {
     if (decay < 0 || decay > 5) return "LT_DECAY must be in [0, 5]";
     if (provisionConcurrency < 1) return "LT_PROVISION_CONCURRENCY must be >= 1";
     if (rampBatchSize < 1) return "LT_RAMP_BATCH_SIZE must be >= 1";
+    if (rxSilentReassignSec < 0) return "LT_RX_SILENT_REASSIGN_SEC must be >= 0";
     if (indexBase < 0) return "LT_INDEX_BASE must be >= 0";
     if (indexWidth < 1 || indexWidth > 16) return "LT_INDEX_WIDTH must be in [1, 16]";
     if (indexLimit < 0) return "LT_INDEX_LIMIT must be >= 0";
@@ -282,6 +283,7 @@ Config Config::load(int argc, char** argv) {
     c.statsDir = layers.get("LT_STATS_DIR", c.statsDir);
     c.rampBatchSize = layers.getInt("LT_RAMP_BATCH_SIZE", c.rampBatchSize);
     c.rampIntervalMs = layers.getInt("LT_RAMP_INTERVAL_MS", c.rampIntervalMs);
+    c.rxSilentReassignSec = layers.getInt("LT_RX_SILENT_REASSIGN_SEC", c.rxSilentReassignSec);
     c.provisionConcurrency = layers.getInt("LT_PROVISION_CONCURRENCY", c.provisionConcurrency);
     c.durationSec = layers.getInt("LT_DURATION_SEC", c.durationSec);
     c.statsIntervalSec = layers.getInt("LT_STATS_INTERVAL_SEC", c.statsIntervalSec);
@@ -327,6 +329,7 @@ Config Config::load(int argc, char** argv) {
     cliStr("stats-dir", c.statsDir);
     cliInt("ramp-batch-size", c.rampBatchSize);
     cliInt("ramp-interval-ms", c.rampIntervalMs);
+    cliInt("rx-silent-reassign-sec", c.rxSilentReassignSec);
     cliInt("provision-concurrency", c.provisionConcurrency);
     cliInt("duration-sec", c.durationSec);
     cliInt("stats-interval-sec", c.statsIntervalSec);

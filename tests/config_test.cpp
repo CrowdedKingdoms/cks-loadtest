@@ -57,6 +57,15 @@ int main() {
     c.controlToken = "secret";
     check(c.validate().empty(), "wildcard with token is ok");
 
+    // The orphan window is off by default (a lone client legitimately hears
+    // nothing) and refuses a negative value; 30 is what the fleet ladder sets.
+    check(c.rxSilentReassignSec == 0, "rx-silent reassign is off by default");
+    c.rxSilentReassignSec = -1;
+    check(!c.validate().empty(), "negative rx-silent window is refused");
+    c.rxSilentReassignSec = 30;
+    check(c.validate().empty(), "rx-silent window of 30 validates");
+    c.rxSilentReassignSec = 0;
+
     c.controlBind = "off";
     c.clients = 0;
     check(!c.validate().empty(), "zero clients and no control is refused");

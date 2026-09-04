@@ -67,6 +67,15 @@ struct Config {
     // Ramp-up / provisioning
     int rampBatchSize = 10;            // LT_RAMP_BATCH_SIZE
     int rampIntervalMs = 1000;         // LT_RAMP_INTERVAL_MS
+    // A client that has been sending for this long with NOTHING received --
+    // no notification, no refusal, no reconnect command -- is orphaned: its
+    // Buddy restarted or dropped the session and answers nothing, which no
+    // other trigger sees (a restarted Buddy's port is open, so there is no
+    // ICMP; a dropped session is a silent drop, not an UNAUTHORIZED). It asks
+    // for a fresh assignment, like a real client whose game went quiet would.
+    // 0 disables: a lone client in an empty chunk legitimately hears nothing,
+    // so this is for fleet runs (LT_RX_SILENT_REASSIGN_SEC=30 on the ladder).
+    int rxSilentReassignSec = 0;       // LT_RX_SILENT_REASSIGN_SEC
     int provisionConcurrency = 4;      // LT_PROVISION_CONCURRENCY
 
     // Run control

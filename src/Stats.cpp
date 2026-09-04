@@ -102,6 +102,7 @@ nlohmann::json countersJson(const CounterSnap& s) {
         {"rx_other_spatial", s.rxOtherSpatial},
         {"rx_error_messages", s.rxErrorMessages},
         {"rx_reconnect_commands", s.rxReconnectCommands},
+        {"rx_silent_reassigns", s.rxSilentReassigns},
         {"rx_hmac_failures", s.rxHmacFailures},
         {"rx_malformed", s.rxMalformed},
         {"token_refreshes", s.tokenRefreshes},
@@ -170,6 +171,7 @@ CounterSnap CounterSnap::minus(const CounterSnap& now, const CounterSnap& origin
     d.rxOtherSpatial = satSub(now.rxOtherSpatial, origin.rxOtherSpatial);
     d.rxErrorMessages = satSub(now.rxErrorMessages, origin.rxErrorMessages);
     d.rxReconnectCommands = satSub(now.rxReconnectCommands, origin.rxReconnectCommands);
+    d.rxSilentReassigns = satSub(now.rxSilentReassigns, origin.rxSilentReassigns);
     d.rxHmacFailures = satSub(now.rxHmacFailures, origin.rxHmacFailures);
     d.rxMalformed = satSub(now.rxMalformed, origin.rxMalformed);
     d.tokenRefreshes = satSub(now.tokenRefreshes, origin.tokenRefreshes);
@@ -210,6 +212,7 @@ CounterSnap CounterSnap::plus(const CounterSnap& a, const CounterSnap& b) {
     s.rxOtherSpatial += b.rxOtherSpatial;
     s.rxErrorMessages += b.rxErrorMessages;
     s.rxReconnectCommands += b.rxReconnectCommands;
+    s.rxSilentReassigns += b.rxSilentReassigns;
     s.rxHmacFailures += b.rxHmacFailures;
     s.rxMalformed += b.rxMalformed;
     s.tokenRefreshes += b.tokenRefreshes;
@@ -247,6 +250,7 @@ CounterSnap CounterSnap::fromJson(const nlohmann::json& j) {
     s.rxOtherSpatial = jU64(j, "rx_other_spatial");
     s.rxErrorMessages = jU64(j, "rx_error_messages");
     s.rxReconnectCommands = jU64(j, "rx_reconnect_commands");
+    s.rxSilentReassigns = jU64(j, "rx_silent_reassigns");
     s.rxHmacFailures = jU64(j, "rx_hmac_failures");
     s.rxMalformed = jU64(j, "rx_malformed");
     s.tokenRefreshes = jU64(j, "token_refreshes");
