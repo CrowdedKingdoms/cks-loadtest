@@ -64,10 +64,13 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
    one-way latency estimate.
 5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken`,
    sent to the app's own Game API URL from step 2 so every routed statement
-   stays in the app's datacenter; the client KEEPS its Buddy and the refreshed
-   token is installed on first contact, as a real client's is),
-   `COMMAND_RECONNECT` triggers reassignment to another Buddy, and the run
-   fails fast if traffic goes out but nothing ever comes back.
+   stays in the app's datacenter) and the refreshed token is then placed with
+   `serverWithLeastClients` again -- the only call that installs a token on a
+   Buddy; a Buddy drops packets for a token it was never told about, silently.
+   The client stays put when placement returns the server it already had, and
+   only a real move counts as a `reassignment`. `COMMAND_RECONNECT` triggers
+   reassignment to another Buddy, and the run fails fast if traffic goes out
+   but nothing ever comes back.
 
 ## Pose profiles: a load test you can see in the game
 
