@@ -169,7 +169,15 @@ struct SimClient {
     void placeInCube(const Config& cfg) {
         const int64_t n = cfg.volumeChunks;
         const int64_t slots = n * n * n;
-        const int64_t idx = ((static_cast<int64_t>(creds.index) % slots) + slots) % slots;
+        const int64_t raw = ((static_cast<int64_t>(creds.index) % slots) + slots) % slots;
+        // A PERMUTATION of the slot index before the mixed-radix split. Plain
+        // mixed radix fills one horizontal slice before it starts the next, so a
+        // SMALL population (60 bots on dev) stood as a wall at one edge of the
+        // cube and the minimap showed a half-empty square. Multiplying by
+        // 1 + n + n^2 -- congruent to 1 mod n, so coprime to n^3 -- walks the
+        // diagonal first and spreads every axis from the first handful of clients,
+        // while consecutive indices still land in distinct chunks.
+        const int64_t idx = (raw * (1 + n + n * n)) % slots;
         const int64_t i1 = idx % n;
         const int64_t iup = (idx / n) % n;
         const int64_t i2 = (idx / (n * n)) % n;

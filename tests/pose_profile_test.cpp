@@ -157,6 +157,20 @@ int main() {
             }
         }
         check(slots.size() == 512, "512 consecutive global indices fill 512 distinct chunks");
+
+        // A small fleet spreads over every axis rather than standing in one slice:
+        // the first 60 indices (dev's verification run) touch every chunk column
+        // on x, y and z.
+        std::set<int64_t> sx, sy, sz;
+        for (int i = 0; i < 60; ++i) {
+            SimClient c = clientAt(i);
+            c.initSimulation(cfg, 0.0);
+            sx.insert(c.chunkX);
+            sy.insert(c.chunkY);
+            sz.insert(c.chunkZ);
+        }
+        check(sx.size() == 8 && sy.size() == 8 && sz.size() == 8,
+              "60 clients span all 8 chunk columns on every axis");
         check(std::llabs(std::get<0>(*slots.begin())) <= 4, "horizontal chunks are centred on the origin");
 
         // Vertical spread: the cube reaches chunk y 7, well above BWF's 3-layer terrain,
