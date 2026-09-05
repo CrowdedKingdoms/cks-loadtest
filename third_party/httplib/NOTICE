@@ -1,0 +1,3 @@
+cpp-httplib v0.18.3 — MIT License, Copyright (c) 2024 Yuji Hirose.
+Vendored as httplib.h for the generator's HTTP control port.
+https://github.com/yhirose/cpp-httplib

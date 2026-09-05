@@ -1,12 +1,96 @@
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace lt {
+
+/// Mergeable counter snapshot (lifetime or a rung window).
+struct CounterSnap {
+    uint64_t txPackets = 0;
+    uint64_t txBytes = 0;
+    uint64_t txSendErrors = 0;
+    uint64_t rxDatagrams = 0;
+    uint64_t rxBytes = 0;
+    uint64_t rxBundles = 0;
+    uint64_t rxActorNotifications = 0;
+    uint64_t rxOtherSpatial = 0;
+    uint64_t rxErrorMessages = 0;
+    uint64_t rxReconnectCommands = 0;
+    uint64_t rxSilentReassigns = 0;
+    uint64_t rxHmacFailures = 0;
+    uint64_t rxMalformed = 0;
+    uint64_t tokenRefreshes = 0;
+    uint64_t reassignments = 0;
+    uint64_t controlFailures = 0;
+    uint64_t unauthorizedFirstContact = 0;
+    uint64_t unauthorizedWindowReload = 0;
+    uint64_t latencySamples = 0;
+    uint64_t latencySumMs = 0;
+    uint64_t latencyMaxMs = 0;
+    static constexpr int LATENCY_BUCKETS = 23;
+    std::array<uint64_t, LATENCY_BUCKETS> latencyHist{};
+    std::array<uint64_t, 256> errorCodes{};
+    int signInReused = 0;
+    int signInMintedBefore = 0;
+    int signInMintedDuring = 0;
+
+    static CounterSnap minus(const CounterSnap& now, const CounterSnap& origin);
+    static CounterSnap plus(const CounterSnap& a, const CounterSnap& b);
+    nlohmann::json toJson() const;
+    static CounterSnap fromJson(const nlohmann::json& j);
+};
+
+/// Upper bounds (exclusive) of latency histogram buckets, last bucket is +inf.
+/// 22 finite bounds + overflow = 23 buckets.
+inline constexpr int64_t kLatencyBounds[CounterSnap::LATENCY_BUCKETS - 1] = {
+    1,    2,    3,    4,    5,    7,    10,   15,   20,   25,  30,
+    40,   50,   75,   100,  150,  200,  250,  400,  600,  1000, 2000};
+
+/// Interpolated percentile in milliseconds from a histogram. `p` in [0, 1].
+double percentileMs(const CounterSnap& snap, double p);
+
+/// Last completed reporter interval (rates, not totals).
+struct IntervalRates {
+    double dtSec = 0;
+    uint64_t epochSec = 0;
+    double txPps = 0;
+    double txBps = 0;
+    double rxDps = 0;
+    double rxBps = 0;
+    double rxNotifPs = 0;
+    double avgLatencyMs = 0;
+};
+
+/// Extra fields the HTTP snapshot stamps that live on the harness, not Stats.
+struct SnapshotMeta {
+    std::string instanceId;
+    int indexBase = 0;
+    int used = 0;
+    int limit = 0;
+    bool busy = false;
+    std::string addError;
+    std::string rungId;
+    uint64_t windowOpenEpochSec = 0;
+    double windowDurationSec = 0;
+    int activeClients = 0;
+    int suspendedClients = 0;
+};
+
+nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifetime,
+                              const CounterSnap& window, const IntervalRates& interval);
+
+/// Merge N host snapshots (each is buildStatsJson output). Sums counts and
+/// rates, max of max latency, merged histograms then percentiles.
+nlohmann::json mergeFleetStats(const std::vector<nlohmann::json>& hosts);
 
 /// Global counters, written by worker threads with relaxed atomics and read
 /// by the reporter thread. Latency is a one-way estimate derived from the
@@ -24,82 +108,67 @@ struct Stats {
     std::atomic<uint64_t> rxOtherSpatial{0};
     std::atomic<uint64_t> rxErrorMessages{0};
     std::atomic<uint64_t> rxReconnectCommands{0};
+    std::atomic<uint64_t> rxSilentReassigns{0};
     std::atomic<uint64_t> rxHmacFailures{0};
     std::atomic<uint64_t> rxMalformed{0};
 
-    /// GENERIC_ERROR_MESSAGE counts keyed by wire error code.
     std::array<std::atomic<uint64_t>, 256> errorCodes{};
 
-    /// UNAUTHORIZED refusals that are the EXPECTED first contact with a Buddy.
-    ///
-    /// Buddy loads a session's permission window lazily, and the first spatial
-    /// packet is what triggers the load rather than something a longer settle
-    /// wait avoids: measured on dev, a 1500ms and an 8000ms
-    /// LT_SESSION_SETTLE_MS both produce exactly one refusal per client per
-    /// assignment. So this count is normally equal to the number of clients,
-    /// it is self-healing, and it means nothing is wrong.
-    ///
-    /// It is counted apart from `errorCodes[UNAUTHORIZED]` because at a
-    /// hundred clients an undifferentiated "UNAUTHORIZED: 100" in the summary
-    /// reads as a platform fault, and the run that produced it was clean.
     std::atomic<uint64_t> unauthorizedFirstContact{0};
-    /// UNAUTHORIZED refused because the client walked out of the server's
-    /// cached grid-permission box. The same lazy load as first contact, and
-    /// counted apart from it so a reader can see which of the two is happening.
     std::atomic<uint64_t> unauthorizedWindowReload{0};
 
-    // One-way latency (ms) from notification epoch tails.
     std::atomic<uint64_t> latencySamples{0};
     std::atomic<uint64_t> latencySumMs{0};
     std::atomic<uint64_t> latencyMaxMs{0};
-    /// Buckets: <5, <10, <25, <50, <100, <250, <1000, >=1000 ms.
-    static constexpr int LATENCY_BUCKETS = 8;
-    std::array<std::atomic<uint64_t>, LATENCY_BUCKETS> latencyHist{};
+    std::array<std::atomic<uint64_t>, CounterSnap::LATENCY_BUCKETS> latencyHist{};
+    /// Max latency observed since the open window; reset on markWindow().
+    std::atomic<uint64_t> windowLatencyMaxMs{0};
 
-    // Gauges maintained by workers / control thread.
     std::atomic<int> activeClients{0};
     std::atomic<int> suspendedClients{0};
     std::atomic<uint64_t> tokenRefreshes{0};
     std::atomic<uint64_t> reassignments{0};
     std::atomic<uint64_t> controlFailures{0};
 
-    void recordLatencyMs(int64_t ms) {
-        if (ms < 0) ms = 0; // clock skew can make the estimate negative
-        latencySamples.fetch_add(1, std::memory_order_relaxed);
-        latencySumMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
-        uint64_t prev = latencyMaxMs.load(std::memory_order_relaxed);
-        while (static_cast<uint64_t>(ms) > prev &&
-               !latencyMaxMs.compare_exchange_weak(prev, static_cast<uint64_t>(ms),
-                                                   std::memory_order_relaxed)) {
-        }
-        static constexpr int64_t bounds[LATENCY_BUCKETS - 1] = {5, 10, 25, 50,
-                                                                100, 250, 1000};
-        int bucket = LATENCY_BUCKETS - 1;
-        for (int i = 0; i < LATENCY_BUCKETS - 1; ++i) {
-            if (ms < bounds[i]) {
-                bucket = i;
-                break;
-            }
-        }
-        latencyHist[bucket].fetch_add(1, std::memory_order_relaxed);
-    }
+    void recordLatencyMs(int64_t ms);
+
+    CounterSnap loadLifetime() const;
+    void markWindow(std::string id);
+    CounterSnap loadWindow() const; // lifetime minus origin; window max
+
+    std::string rungId() const;
+    uint64_t windowOpenEpochSec() const;
+    double windowDurationSec() const;
+
+    void setInterval(const IntervalRates& r);
+    IntervalRates interval() const;
+
+    void setSignIn(int reused, int mintedBefore, int mintedDuring);
+    void loadSignIn(int& reused, int& mintedBefore, int& mintedDuring) const;
+
+private:
+    mutable std::mutex mu_;
+    CounterSnap windowOrigin_{};
+    std::string rungId_;
+    uint64_t windowOpenEpochSec_ = 0;
+    std::chrono::steady_clock::time_point windowOpenSteady_{};
+    IntervalRates interval_{};
+    int signInReused_ = 0;
+    int signInMintedBefore_ = 0;
+    int signInMintedDuring_ = 0;
 };
 
-/// Periodic console (and optional CSV) reporter. Runs on its own thread;
-/// call stop() then join via destructor or stop() explicitly.
+/// Periodic console (and optional CSV / JSONL) reporter.
 class StatsReporter {
 public:
-    StatsReporter(Stats& stats, int intervalSec, std::string csvPath);
+    StatsReporter(Stats& stats, int intervalSec, std::string csvPath,
+                  std::string jsonlPath, std::string instanceId);
     ~StatsReporter();
 
     void start();
     void stop();
 
     /// Print the end-of-run summary (totals, latency histogram, error codes).
-    /// `reused` / `mintedBefore` / `mintedDuring` are the sign-in tally, passed
-    /// as plain counts so Stats does not need to know about the provisioner.
-    /// Authentication is part of the measurement, so the run says what it did
-    /// rather than leaving a reader to infer it.
     void printFinalSummary(int permWindowRadiusChunks, int reused = -1,
                            int mintedBefore = -1, int mintedDuring = -1) const;
 
@@ -109,6 +178,8 @@ private:
     Stats& stats_;
     int intervalSec_;
     std::string csvPath_;
+    std::string jsonlPath_;
+    std::string instanceId_;
     std::atomic<bool> running_{false};
     std::thread thread_;
 };
