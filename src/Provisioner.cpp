@@ -25,7 +25,19 @@ mutation Mint($input: MintAppTokenInput!) {
   mintAppToken(input: $input) { token gameTokenId appId expiresAt gameApiUrl }
 })";
 
+// The refresh names the Buddy the client is on so the API authorizes the NEW token
+// there; `authorizedServer` set means "keep your session, switch tokens", null means
+// "re-place" (the node is gone, draining, Full or not local to the app).
 constexpr const char* REFRESH_MUTATION = R"(
+mutation Refresh($currentServer: CurrentServerInput) {
+  refreshAppToken(currentServer: $currentServer) {
+    token gameTokenId appId expiresAt gameApiUrl
+    authorizedServer { ip4 clientPort }
+  }
+})";
+
+// For an API older than ck-api v1.83.7, which has neither the argument nor the field.
+constexpr const char* LEGACY_REFRESH_MUTATION = R"(
 mutation Refresh {
   refreshAppToken { token gameTokenId appId expiresAt gameApiUrl }
 })";
@@ -273,14 +285,43 @@ void Provisioner::assignServer(ClientCredentials& c) {
                    std::chrono::milliseconds(config_.sessionSettleMs);
 }
 
-void Provisioner::refreshToken(GraphQLClient& mgmt, ClientCredentials& c) {
-    auto data = requestWithRetry(mgmt, REFRESH_MUTATION, nlohmann::json::object(),
-                                 c.appToken);
+bool Provisioner::refreshToken(GraphQLClient& mgmt, ClientCredentials& c) {
+    nlohmann::json data;
+    if (!legacyRefresh_.load(std::memory_order_relaxed) && !c.serverIp4.empty()) {
+        nlohmann::json vars = {{"currentServer",
+                                {{"ip4", c.serverIp4}, {"clientPort", c.serverPort}}}};
+        try {
+            data = requestWithRetry(mgmt, REFRESH_MUTATION, vars, c.appToken);
+        } catch (const GraphQLError& e) {
+            // An API that does not know `currentServer` rejects the DOCUMENT, not
+            // the call; remember that once and use the old shape from then on.
+            const std::string what = e.what();
+            if (e.isTransport() || what.find("currentServer") == std::string::npos) throw;
+            legacyRefresh_.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "[control] the API predates refreshAppToken(currentServer); "
+                                 "every refresh will re-place (reassignments == refreshes)\n");
+        }
+    }
+    if (data.is_null()) {
+        data = requestWithRetry(mgmt, LEGACY_REFRESH_MUTATION, nlohmann::json::object(),
+                                c.appToken);
+    }
     const auto& fresh = data["refreshAppToken"];
     c.appToken = fresh["token"].get<std::string>();
     c.gameTokenId = std::stoll(fresh["gameTokenId"].get<std::string>());
     c.tokenExpiresAt = parseIso8601Utc(fresh["expiresAt"].get<std::string>());
-    // The new gameTokenId has no Buddy session yet; the caller must reassign.
+    if (fresh.contains("authorizedServer") && !fresh["authorizedServer"].is_null()) {
+        // The NEW token is installed on the node the client is on. Keep the socket
+        // target; give the datagram the same settle the first placement gets.
+        const auto& srv = fresh["authorizedServer"];
+        c.serverIp4 = srv["ip4"].get<std::string>();
+        c.serverPort = static_cast<uint16_t>(srv["clientPort"].get<int>());
+        c.udpReadyAt = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(config_.sessionSettleMs);
+        return true;
+    }
+    // No session anywhere for the new gameTokenId; the caller must re-place.
+    return false;
 }
 
 std::vector<ClientCredentials> Provisioner::provisionRange(int globalStart,

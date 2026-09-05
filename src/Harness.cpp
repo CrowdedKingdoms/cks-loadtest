@@ -19,6 +19,7 @@ void controlLoop(Provisioner& provisioner, ControlQueue& queue,
         update.clientIndex = req.clientIndex;
         update.creds = std::move(req.creds);
         try {
+            bool keptServer = false;
             if (req.kind == ControlRequest::Kind::REFRESH) {
                 // REFRESH WHERE THE CLIENT PLAYS. `mintAppToken` handed this client
                 // its app's own Game API URL -- the instance in the datacenter that
@@ -31,26 +32,29 @@ void controlLoop(Provisioner& provisioner, ControlQueue& queue,
                     update.creds.gameApiUrl != provisioner.config().managementApiUrl) {
                     GraphQLClient game(update.creds.gameApiUrl,
                                        provisioner.config().tlsInsecure);
-                    provisioner.refreshToken(game, update.creds);
+                    keptServer = provisioner.refreshToken(game, update.creds);
                 } else {
-                    provisioner.refreshToken(mgmt, update.creds);
+                    keptServer = provisioner.refreshToken(mgmt, update.creds);
                 }
                 stats.tokenRefreshes.fetch_add(1, std::memory_order_relaxed);
-                // A REFRESHED TOKEN HAS NO SESSION ANYWHERE YET, and only
-                // `serverWithLeastClients` installs one: it picks a server and sends
-                // that Buddy the token authorization. A Buddy that was never told
-                // about a token drops its packets SILENTLY -- no refusal, no
-                // notification -- so "keep the old Buddy and let first contact
-                // install it" (tried 2026-09-05) left every refreshed client mute for
-                // exactly `LT_RX_SILENT_REASSIGN_SEC` and then reassigned anyway.
-                // Until the API can authorize a refreshed token on the client's
-                // CURRENT server (open item), a refresh must re-ask for placement.
-                // The client stays put whenever placement hands back the server it
-                // already had, and only a real move counts as a reassignment.
+                // A REFRESHED TOKEN IS KNOWN ONLY TO THE BUDDY THE API TOLD. A Buddy
+                // that was never told about a token drops its packets SILENTLY -- no
+                // refusal, no notification -- so "keep the old Buddy and let first
+                // contact install it" (tried 2026-09-05) left every refreshed client
+                // mute for `LT_RX_SILENT_REASSIGN_SEC` and then reassigned anyway.
+                // Since ck-api v1.83.7 the refresh names the client's current server
+                // and the API authorizes the new token THERE (`authorizedServer`);
+                // the client keeps its session and nothing moves. Only when the API
+                // could not (node gone, draining, Full, not local, or an older API)
+                // does a refresh re-ask for placement, and only a real move counts as
+                // a reassignment.
+                if (keptServer) {
+                    stats.refreshesKeptServer.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             const std::string previousIp4 = update.creds.serverIp4;
             const uint16_t previousPort = update.creds.serverPort;
-            for (int attempt = 1;; ++attempt) {
+            for (int attempt = 1; !keptServer; ++attempt) {
                 try {
                     provisioner.assignServer(update.creds);
                     break;
