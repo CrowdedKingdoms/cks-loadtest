@@ -78,7 +78,7 @@ player would ever experience. Two profiles ship:
 | `LT_POSE_FORMAT` | payload | positions | up axis | chunk |
 |---|---|---|---|---|
 | `ue5` (default) | 88-byte float64 state v2 (`version`, position, rotation, velocity, crouch, attachments) | Unreal units, local to the chunk | Z | 1600 uu |
-| `bwf` | 48-byte float32 pose ([`actorCodec.ts`](https://github.com/CrowdedKingdoms/Crowdy-Games/blob/dev/blocks-with-friends/src/session/actorCodec.ts)): `x y z yaw pitch vx vy vz flags heldBlockId _ updatedAt _`) | world blocks, absolute | Y | 16 blocks |
+| `bwf` | 48-byte float32 pose, the layout Blocks With Friends' own client encodes (`x y z yaw pitch vx vy vz flags heldBlockId _ updatedAt _`; see `Wire.hpp`, namespace `bwfpose`) | world blocks, absolute | Y | 16 blocks |
 
 Against Blocks With Friends use `LT_POSE_FORMAT=bwf LT_VOLUME_CHUNKS=8`: the
 fleet fills an 8 x 8 x 8 chunk cube standing on chunk y 0 (BWF's terrain is
