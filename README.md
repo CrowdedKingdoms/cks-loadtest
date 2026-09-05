@@ -56,14 +56,42 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
 3. **Server assignment.** Each client calls `serverWithLeastClients` on the
    Game API, which returns a Buddy address **and installs the client's UDP
    session** on it server-side.
-4. **Traffic.** Each client opens one UDP socket, walks a random 2D path
-   around the origin, and sends signed `ACTOR_UPDATE_REQUEST_2` messages at
-   the configured rate. Inbound notifications, bundles, and errors are parsed
-   and counted; the server epoch in notification tails yields a one-way
-   latency estimate.
-5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken` +
-   re-assign), `COMMAND_RECONNECT` triggers reassignment to another Buddy,
-   and the run fails fast if traffic goes out but nothing ever comes back.
+4. **Traffic.** Each client opens one UDP socket, moves through the world
+   (a random 2D walk around the origin, or a 3D drift inside a cube of chunks
+   -- see *Pose profiles* below), and sends signed `ACTOR_UPDATE_REQUEST_2`
+   messages at the configured rate. Inbound notifications, bundles, and errors
+   are parsed and counted; the server epoch in notification tails yields a
+   one-way latency estimate.
+5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken`; the
+   client KEEPS its Buddy and the refreshed token is installed on first
+   contact, as a real client's is), `COMMAND_RECONNECT` triggers reassignment
+   to another Buddy, and the run fails fast if traffic goes out but nothing
+   ever comes back.
+
+## Pose profiles: a load test you can see in the game
+
+The platform relays the actor-state payload opaquely, so the servers accept any
+bytes -- but the game you point this at renders only the layout it speaks, and a
+load test whose players are invisible in the game is measuring a population no
+player would ever experience. Two profiles ship:
+
+| `LT_POSE_FORMAT` | payload | positions | up axis | chunk |
+|---|---|---|---|---|
+| `ue5` (default) | 88-byte float64 state v2 (`version`, position, rotation, velocity, crouch, attachments) | Unreal units, local to the chunk | Z | 1600 uu |
+| `bwf` | 48-byte float32 pose ([`actorCodec.ts`](https://github.com/CrowdedKingdoms/Crowdy-Games/blob/dev/blocks-with-friends/src/session/actorCodec.ts)): `x y z yaw pitch vx vy vz flags heldBlockId _ updatedAt _`) | world blocks, absolute | Y | 16 blocks |
+
+Against Blocks With Friends use `LT_POSE_FORMAT=bwf LT_VOLUME_CHUNKS=8`: the
+fleet fills an 8 x 8 x 8 chunk cube standing on chunk y 0 (BWF's terrain is
+chunk layers 0-2, so most bots drift in the sky above spawn), and a player at
+spawn sees them as avatars with dots spread across the minimap. Sent with the
+default `ue5` profile, BWF decodes the bytes as x ~ 0, y = 0 (below bedrock) and
+a scattered z: an invisible population whose minimap dots form a straight line.
+Every ladder up to 2026-09-05 was run that way; its fan-out numbers came from a
+17 x 17 x 1 plane, not the cube, and are not comparable with a `bwf` run.
+
+Visual confirmation is part of a ladder: on each steady rung open the game at
+spawn and screenshot the view and the minimap into the run directory. Avatars
+visible and moving, dots distributed, no straight line.
 
 ## Prerequisites
 
@@ -326,8 +354,12 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 | `--stats-dir` / `LT_STATS_DIR` | — | Rung JSON + interval JSONL directory |
 | `--threads` / `LT_THREADS` | 1 | Worker threads |
 | `--update-hz` / `LT_UPDATE_HZ` | 10 | Actor updates per second per client |
-| `--walk-speed` / `LT_WALK_SPEED` | 150 | Walk speed (Unreal units/s) |
-| `--spawn-radius-chunks` / `LT_SPAWN_RADIUS_CHUNKS` | 8 | Spawn/bounce radius around origin |
+| `--walk-speed` / `LT_WALK_SPEED` | 150 (`ue5`) / 4 (`bwf`) | Movement speed in the pose's position units per second |
+| `--spawn-radius-chunks` / `LT_SPAWN_RADIUS_CHUNKS` | 8 | Spawn/bounce radius around origin (2D walk only) |
+| `--pose-format` / `LT_POSE_FORMAT` | `ue5` | Actor-state payload the clients write: `ue5` (88-byte float64 state v2, chunk-local Unreal units, Z up) or `bwf` (48-byte float32 pose Blocks With Friends decodes: world blocks, Y up). See *Pose profiles*. |
+| `--chunk-size-units` / `LT_CHUNK_SIZE_UNITS` | 1600 (`ue5`) / 16 (`bwf`) | Edge of one chunk in the pose's position units |
+| `--volume-chunks` / `LT_VOLUME_CHUNKS` | 0 | 0 = the 2D walk; N = an N x N x N chunk cube centred on the origin chunk horizontally, filled uniformly by global client index, every client drifting in 3D and bouncing off the faces. 8 is the 512-chunk geometry that exercises per-ring decay. |
+| `--volume-base-up` / `LT_VOLUME_BASE_UP` | 0 | Lowest vertical chunk of the cube |
 | `--ramp-batch-size` / `LT_RAMP_BATCH_SIZE` | 10 | Clients activated per ramp batch |
 | `--ramp-interval-ms` / `LT_RAMP_INTERVAL_MS` | 1000 | Delay between ramp batches |
 | `--rx-silent-reassign-sec` / `LT_RX_SILENT_REASSIGN_SEC` | 0 | Re-assign a client that has received nothing at all for this many seconds on its current assignment (a Buddy that restarted or dropped the session answers nothing; no other trigger sees it). 0 = off; a lone client in an empty chunk legitimately hears nothing, so set it on fleet runs (30 on the ladder). Counted as `rx_silent_reassigns`. |

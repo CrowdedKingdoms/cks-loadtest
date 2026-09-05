@@ -22,6 +22,24 @@ void controlLoop(Provisioner& provisioner, ControlQueue& queue,
             if (req.kind == ControlRequest::Kind::REFRESH) {
                 provisioner.refreshToken(mgmt, update.creds);
                 stats.tokenRefreshes.fetch_add(1, std::memory_order_relaxed);
+                // A REAL CLIENT KEEPS ITS BUDDY ACROSS A REFRESH, and so does this
+                // one now. Until 2026-09-05 a refresh also re-ran
+                // serverWithLeastClients, so every refresh was a re-placement:
+                // `reassignments == token_refreshes` on every generator of the
+                // test ladder (75 -> 4 500 across the rungs), whole buddies
+                // emptied mid-window when a batch's tokens aged out together, and
+                // `buddy_clients_collapsed` fired with no shed anywhere. The
+                // refreshed token goes to the SAME server; Buddy installs it on
+                // first contact (the lazy lookup the harness already classifies as
+                // an expected refusal). If that Buddy is gone, the send-error and
+                // rx-silent triggers ask for a real reassignment as before.
+                if (!update.creds.serverIp4.empty() && update.creds.serverPort != 0) {
+                    update.creds.udpReadyAt =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(provisioner.config().sessionSettleMs);
+                    workers[static_cast<size_t>(req.workerIndex)]->postUpdate(std::move(update));
+                    continue;
+                }
             }
             for (int attempt = 1;; ++attempt) {
                 try {

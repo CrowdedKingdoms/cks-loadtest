@@ -415,11 +415,11 @@ void Worker::sendDueUpdates(double nowSec) {
             stats_.txSendErrors.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        ssize_t n = send(client.fd, client.message, wire::ACTOR_UPDATE_SIZE, 0);
-        if (n == static_cast<ssize_t>(wire::ACTOR_UPDATE_SIZE)) {
+        const size_t msgSize = SimClient::messageSize(config_);
+        ssize_t n = send(client.fd, client.message, msgSize, 0);
+        if (n == static_cast<ssize_t>(msgSize)) {
             stats_.txPackets.fetch_add(1, std::memory_order_relaxed);
-            stats_.txBytes.fetch_add(wire::ACTOR_UPDATE_SIZE,
-                                     std::memory_order_relaxed);
+            stats_.txBytes.fetch_add(msgSize, std::memory_order_relaxed);
             client.consecutiveSendErrors = 0;
         } else {
             stats_.txSendErrors.fetch_add(1, std::memory_order_relaxed);
