@@ -62,11 +62,12 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
    messages at the configured rate. Inbound notifications, bundles, and errors
    are parsed and counted; the server epoch in notification tails yields a
    one-way latency estimate.
-5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken`; the
-   client KEEPS its Buddy and the refreshed token is installed on first
-   contact, as a real client's is), `COMMAND_RECONNECT` triggers reassignment
-   to another Buddy, and the run fails fast if traffic goes out but nothing
-   ever comes back.
+5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken`,
+   sent to the app's own Game API URL from step 2 so every routed statement
+   stays in the app's datacenter; the client KEEPS its Buddy and the refreshed
+   token is installed on first contact, as a real client's is),
+   `COMMAND_RECONNECT` triggers reassignment to another Buddy, and the run
+   fails fast if traffic goes out but nothing ever comes back.
 
 ## Pose profiles: a load test you can see in the game
 

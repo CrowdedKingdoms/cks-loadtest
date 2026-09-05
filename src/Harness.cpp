@@ -20,7 +20,21 @@ void controlLoop(Provisioner& provisioner, ControlQueue& queue,
         update.creds = std::move(req.creds);
         try {
             if (req.kind == ControlRequest::Kind::REFRESH) {
-                provisioner.refreshToken(mgmt, update.creds);
+                // REFRESH WHERE THE CLIENT PLAYS. `mintAppToken` handed this client
+                // its app's own Game API URL -- the instance in the datacenter that
+                // holds the app's shards -- and a real client refreshes against
+                // that. Through the management alias the request lands on either
+                // datacenter, and every routed statement on the far one is a
+                // cross-datacenter hop: measured ~60-66 ms each, four of them, on
+                // 2026-09-05 (refreshAppToken 390-440 ms against 55 ms for `me`).
+                if (!update.creds.gameApiUrl.empty() &&
+                    update.creds.gameApiUrl != provisioner.config().managementApiUrl) {
+                    GraphQLClient game(update.creds.gameApiUrl,
+                                       provisioner.config().tlsInsecure);
+                    provisioner.refreshToken(game, update.creds);
+                } else {
+                    provisioner.refreshToken(mgmt, update.creds);
+                }
                 stats.tokenRefreshes.fetch_add(1, std::memory_order_relaxed);
                 // A REAL CLIENT KEEPS ITS BUDDY ACROSS A REFRESH, and so does this
                 // one now. Until 2026-09-05 a refresh also re-ran
