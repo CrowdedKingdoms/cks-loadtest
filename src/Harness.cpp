@@ -36,25 +36,20 @@ void controlLoop(Provisioner& provisioner, ControlQueue& queue,
                     provisioner.refreshToken(mgmt, update.creds);
                 }
                 stats.tokenRefreshes.fetch_add(1, std::memory_order_relaxed);
-                // A REAL CLIENT KEEPS ITS BUDDY ACROSS A REFRESH, and so does this
-                // one now. Until 2026-09-05 a refresh also re-ran
-                // serverWithLeastClients, so every refresh was a re-placement:
-                // `reassignments == token_refreshes` on every generator of the
-                // test ladder (75 -> 4 500 across the rungs), whole buddies
-                // emptied mid-window when a batch's tokens aged out together, and
-                // `buddy_clients_collapsed` fired with no shed anywhere. The
-                // refreshed token goes to the SAME server; Buddy installs it on
-                // first contact (the lazy lookup the harness already classifies as
-                // an expected refusal). If that Buddy is gone, the send-error and
-                // rx-silent triggers ask for a real reassignment as before.
-                if (!update.creds.serverIp4.empty() && update.creds.serverPort != 0) {
-                    update.creds.udpReadyAt =
-                        std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(provisioner.config().sessionSettleMs);
-                    workers[static_cast<size_t>(req.workerIndex)]->postUpdate(std::move(update));
-                    continue;
-                }
+                // A REFRESHED TOKEN HAS NO SESSION ANYWHERE YET, and only
+                // `serverWithLeastClients` installs one: it picks a server and sends
+                // that Buddy the token authorization. A Buddy that was never told
+                // about a token drops its packets SILENTLY -- no refusal, no
+                // notification -- so "keep the old Buddy and let first contact
+                // install it" (tried 2026-09-05) left every refreshed client mute for
+                // exactly `LT_RX_SILENT_REASSIGN_SEC` and then reassigned anyway.
+                // Until the API can authorize a refreshed token on the client's
+                // CURRENT server (open item), a refresh must re-ask for placement.
+                // The client stays put whenever placement hands back the server it
+                // already had, and only a real move counts as a reassignment.
             }
+            const std::string previousIp4 = update.creds.serverIp4;
+            const uint16_t previousPort = update.creds.serverPort;
             for (int attempt = 1;; ++attempt) {
                 try {
                     provisioner.assignServer(update.creds);
@@ -70,7 +65,11 @@ void controlLoop(Provisioner& provisioner, ControlQueue& queue,
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                 }
             }
-            stats.reassignments.fetch_add(1, std::memory_order_relaxed);
+            const bool moved = update.creds.serverIp4 != previousIp4 ||
+                               update.creds.serverPort != previousPort;
+            if (req.kind != ControlRequest::Kind::REFRESH || moved) {
+                stats.reassignments.fetch_add(1, std::memory_order_relaxed);
+            }
         } catch (const std::exception& e) {
             stats.controlFailures.fetch_add(1, std::memory_order_relaxed);
             std::fprintf(stderr, "[control] client %d %s failed: %s\n",
