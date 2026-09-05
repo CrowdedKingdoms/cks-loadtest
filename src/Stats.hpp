@@ -29,6 +29,7 @@ struct CounterSnap {
     uint64_t rxHmacFailures = 0;
     uint64_t rxMalformed = 0;
     uint64_t tokenRefreshes = 0;
+    uint64_t refreshesKeptServer = 0; // refreshes whose new token the API authorized on the current Buddy
     uint64_t reassignments = 0;
     uint64_t controlFailures = 0;
     uint64_t unauthorizedFirstContact = 0;
@@ -127,6 +128,7 @@ struct Stats {
     std::atomic<int> activeClients{0};
     std::atomic<int> suspendedClients{0};
     std::atomic<uint64_t> tokenRefreshes{0};
+    std::atomic<uint64_t> refreshesKeptServer{0};
     std::atomic<uint64_t> reassignments{0};
     std::atomic<uint64_t> controlFailures{0};
 
