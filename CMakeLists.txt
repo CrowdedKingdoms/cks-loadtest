@@ -59,6 +59,10 @@ add_executable(worker_add_test tests/worker_add_test.cpp)
 target_link_libraries(worker_add_test PRIVATE loadtest_core)
 add_test(NAME worker_add_test COMMAND worker_add_test)
 
+add_executable(pose_profile_test tests/pose_profile_test.cpp)
+target_link_libraries(pose_profile_test PRIVATE loadtest_core)
+add_test(NAME pose_profile_test COMMAND pose_profile_test)
+
 add_executable(control_http_test tests/control_http_test.cpp)
 target_link_libraries(control_http_test PRIVATE loadtest_core)
 add_test(NAME control_http_test COMMAND control_http_test)

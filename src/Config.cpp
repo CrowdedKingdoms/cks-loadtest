@@ -162,6 +162,10 @@ std::string Config::validate() const {
     if (threads < 1) return "LT_THREADS must be >= 1";
     if (updateHz < 1 || updateHz > 1000) return "LT_UPDATE_HZ must be in [1, 1000]";
     if (distance < 0 || distance > 255) return "LT_DISTANCE must be in [0, 255]";
+    if (poseFormat != "ue5" && poseFormat != "bwf")
+        return "LT_POSE_FORMAT must be 'ue5' or 'bwf'";
+    if (volumeChunks < 0 || volumeChunks > 64) return "LT_VOLUME_CHUNKS must be in [0, 64]";
+    if (spawnRadiusChunks < 0) return "LT_SPAWN_RADIUS_CHUNKS must be >= 0";
     if (permWindowRadiusChunks < 0)
         return "LT_PERMISSION_WINDOW_RADIUS_CHUNKS must be >= 0";
     if (permReloadGraceMs < 0) return "LT_PERMISSION_RELOAD_GRACE_MS must be >= 0";
@@ -212,6 +216,17 @@ Config Config::load(int argc, char** argv) {
         ("walk-speed", "Walk speed in Unreal units/second", cxxopts::value<double>())
         ("spawn-radius-chunks", "Spawn radius around origin, in chunks", cxxopts::value<int>())
         ("distance", "Replication distance (chunks)", cxxopts::value<int>())
+        ("pose-format",
+         "Actor-state payload: ue5 (88-byte float64 state, the default) or bwf "
+         "(48-byte float32 pose Blocks With Friends decodes)",
+         cxxopts::value<std::string>())
+        ("chunk-size-units",
+         "Chunk edge in position units (default: 1600 for ue5, 16 for bwf)",
+         cxxopts::value<double>())
+        ("volume-chunks",
+         "0 = 2D walk within the spawn radius; N = an N x N x N chunk cube with 3D drift",
+         cxxopts::value<int>())
+        ("volume-base-up", "Lowest vertical chunk of the cube", cxxopts::value<int>())
         ("permission-window-radius-chunks",
          "Assumed radius of the server's cached grid-permission box, for "
          "classifying UNAUTHORIZED refusals only",
@@ -269,6 +284,10 @@ Config Config::load(int argc, char** argv) {
     c.walkSpeed = layers.getDouble("LT_WALK_SPEED", c.walkSpeed);
     c.spawnRadiusChunks = layers.getInt("LT_SPAWN_RADIUS_CHUNKS", c.spawnRadiusChunks);
     c.distance = layers.getInt("LT_DISTANCE", c.distance);
+    c.poseFormat = layers.get("LT_POSE_FORMAT", c.poseFormat);
+    c.chunkSizeUnits = layers.getDouble("LT_CHUNK_SIZE_UNITS", c.chunkSizeUnits);
+    c.volumeChunks = layers.getInt("LT_VOLUME_CHUNKS", c.volumeChunks);
+    c.volumeBaseUp = layers.getInt("LT_VOLUME_BASE_UP", c.volumeBaseUp);
     c.permWindowRadiusChunks = layers.getInt("LT_PERMISSION_WINDOW_RADIUS_CHUNKS",
                                              c.permWindowRadiusChunks);
     c.permReloadGraceMs =
@@ -318,6 +337,10 @@ Config Config::load(int argc, char** argv) {
     if (cli.count("walk-speed")) c.walkSpeed = cli["walk-speed"].as<double>();
     cliInt("spawn-radius-chunks", c.spawnRadiusChunks);
     cliInt("distance", c.distance);
+    if (cli.count("pose-format")) c.poseFormat = cli["pose-format"].as<std::string>();
+    if (cli.count("chunk-size-units")) c.chunkSizeUnits = cli["chunk-size-units"].as<double>();
+    cliInt("volume-chunks", c.volumeChunks);
+    cliInt("volume-base-up", c.volumeBaseUp);
     cliInt("permission-window-radius-chunks", c.permWindowRadiusChunks);
     cliInt("decay", c.decay);
     cliStr("instance-id", c.instanceId);

@@ -34,9 +34,30 @@ struct Config {
     int clients = 10;                  // LT_CLIENTS
     int threads = 1;                   // LT_THREADS
     int updateHz = 10;                 // LT_UPDATE_HZ
-    double walkSpeed = 150.0;          // LT_WALK_SPEED (Unreal units / s)
+    // Position units per second. <= 0 derives it from the pose format: 150
+    // Unreal units/s for ue5, 4 blocks/s for bwf (a brisk walk; 150 blocks/s is
+    // nine chunks a second and leaves every permission window every second).
+    double walkSpeed = -1.0;           // LT_WALK_SPEED
     int spawnRadiusChunks = 8;         // LT_SPAWN_RADIUS_CHUNKS
     int distance = 8;                  // LT_DISTANCE (replication distance, chunks)
+    // Which actor-state payload each client writes (Wire.hpp):
+    //   ue5  the 88-byte float64 state v2, the platform's reference and the
+    //        default; positions in Unreal units local to the chunk, Z up.
+    //   bwf  the 48-byte float32 pose Blocks With Friends decodes; positions in
+    //        world blocks, Y up, chunk = 16 blocks.
+    // A game renders only the profile it speaks; the servers relay either.
+    std::string poseFormat = "ue5";    // LT_POSE_FORMAT
+    // Edge of one chunk in the pose's position units. <= 0 derives it from the
+    // pose format (1600 for ue5, 16 for bwf).
+    double chunkSizeUnits = -1.0;      // LT_CHUNK_SIZE_UNITS
+    // Population shape. 0 = the original 2D random walk on the ground plane,
+    // confined to spawnRadiusChunks of the origin. N >= 1 = a cube of N x N x N
+    // chunks, centred on the origin chunk horizontally and standing on
+    // volumeBaseUp vertically, filled uniformly by GLOBAL client index, every
+    // client drifting in 3D and bouncing off the faces. 8 is the 8x8x8 /
+    // 512-chunk geometry that exercises per-ring decay.
+    int volumeChunks = 0;              // LT_VOLUME_CHUNKS
+    int volumeBaseUp = 0;              // LT_VOLUME_BASE_UP (lowest vertical chunk)
     // The radius, in chunks, of the server's cached grid-permission box. Used
     // ONLY to classify UNAUTHORIZED refusals, never sent on the wire. The
     // server's value is its own constant and is not discoverable from here, so
@@ -115,6 +136,18 @@ struct Config {
     bool needsPassword() const { return rosterFile.empty() || !rosterRequired; }
 
     ControlBind parsedBind() const { return parseControlBind(controlBind); }
+
+    bool isBwf() const { return poseFormat == "bwf"; }
+    /// Chunk edge in position units, resolved per pose format when unset.
+    double effectiveChunkSize() const {
+        if (chunkSizeUnits > 0) return chunkSizeUnits;
+        return isBwf() ? 16.0 : 1600.0;
+    }
+    /// Movement speed in position units per second, resolved per pose format.
+    double effectiveWalkSpeed() const {
+        if (walkSpeed > 0) return walkSpeed;
+        return isBwf() ? 4.0 : 150.0;
+    }
 
     /// Parse CLI + env + optional config file. Exits with a usage message on
     /// --help or invalid/missing options.
