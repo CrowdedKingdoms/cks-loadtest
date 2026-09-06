@@ -94,18 +94,149 @@ constexpr size_t B_CROUCH = 80;
 constexpr size_t E_ATTACHMENTS = 81;
 } // namespace state
 
-/// Signed ACTOR_UPDATE_REQUEST_2: 68 + 88 + 41 = 197 bytes.
-constexpr size_t ACTOR_UPDATE_SIZE = HEADER_SIZE + state::SIZE + TAIL_WITH_HMAC;
-constexpr size_t ACTOR_UPDATE_HMAC_OFFSET = HEADER_SIZE + state::SIZE; // 156
-constexpr size_t ACTOR_UPDATE_TOKEN_ID_OFFSET = ACTOR_UPDATE_HMAC_OFFSET + hmac::TAG_SIZE;
-constexpr size_t ACTOR_UPDATE_SEQ_OFFSET = ACTOR_UPDATE_TOKEN_ID_OFFSET + 8;
+/// Actor pose payload as Blocks With Friends encodes and decodes it
+/// (`blocks-with-friends/src/session/actorCodec.ts`): 48 bytes, little-endian
+/// float32 fields, positions in world BLOCKS (Y up, chunk = 16 blocks), yaw and
+/// pitch in radians, `flags` bit0 = grounded, bit1 = mob (never set by a player),
+/// `heldBlockId` a block id, `updatedAt` epoch milliseconds as float64.
+///
+/// WHY A SECOND PROFILE EXISTS. The platform relays the payload opaquely, so a
+/// load test "against" a game can send anything and the servers will not care --
+/// but the game will. Every ladder up to 2026-09-05 targeted BWF with the UE5
+/// state above, and BWF decoded it as x ~ 0 (the version byte as a denormal),
+/// y = 0 (below bedrock, so no avatar) and z = the mantissa bits of the UE5
+/// posX: an invisible population whose minimap dots formed a straight line.
+/// A load test a player can see is the only kind whose fan-out numbers mean
+/// what the game's players would experience.
+namespace bwfpose {
+constexpr size_t SIZE = 48;
+constexpr size_t X = 0;
+constexpr size_t Y = 4;
+constexpr size_t Z = 8;
+constexpr size_t YAW = 12;
+constexpr size_t PITCH = 16;
+constexpr size_t VELOCITY_X = 20;
+constexpr size_t VELOCITY_Y = 24;
+constexpr size_t VELOCITY_Z = 28;
+constexpr size_t FLAGS = 32;
+constexpr size_t HELD_BLOCK_ID = 33;
+constexpr size_t UPDATED_AT = 36;   // float64
+constexpr uint8_t FLAG_GROUNDED = 0x01;
+constexpr uint8_t FLAG_MOB = 0x02;
+} // namespace bwfpose
+
+/// Which actor-state payload a client writes.
+enum class PoseFormat : uint8_t {
+    UE5 = 0,  ///< 88-byte float64 state v2 (the reference; the default)
+    BWF = 1,  ///< 48-byte float32 pose Blocks With Friends decodes
+};
+
+constexpr size_t payloadSize(PoseFormat f) {
+    return f == PoseFormat::BWF ? bwfpose::SIZE : state::SIZE;
+}
+/// Signed ACTOR_UPDATE_REQUEST_2 length for a profile: header + payload + tail.
+constexpr size_t actorUpdateSize(PoseFormat f) {
+    return HEADER_SIZE + payloadSize(f) + TAIL_WITH_HMAC;
+}
+constexpr size_t actorUpdateHmacOffset(PoseFormat f) {
+    return HEADER_SIZE + payloadSize(f);
+}
+constexpr size_t actorUpdateTokenIdOffset(PoseFormat f) {
+    return actorUpdateHmacOffset(f) + hmac::TAG_SIZE;
+}
+constexpr size_t actorUpdateSeqOffset(PoseFormat f) {
+    return actorUpdateTokenIdOffset(f) + 8;
+}
+
+/// Signed ACTOR_UPDATE_REQUEST_2 with the UE5 state: 68 + 88 + 41 = 197 bytes.
+/// These four are the UE5 profile's offsets; per-profile code uses the
+/// functions above. The largest profile sizes the client's message buffer.
+constexpr size_t ACTOR_UPDATE_SIZE = actorUpdateSize(PoseFormat::UE5);
+constexpr size_t ACTOR_UPDATE_HMAC_OFFSET = actorUpdateHmacOffset(PoseFormat::UE5); // 156
+constexpr size_t ACTOR_UPDATE_TOKEN_ID_OFFSET = actorUpdateTokenIdOffset(PoseFormat::UE5);
+constexpr size_t ACTOR_UPDATE_SEQ_OFFSET = actorUpdateSeqOffset(PoseFormat::UE5);
+constexpr size_t ACTOR_UPDATE_MAX_SIZE = ACTOR_UPDATE_SIZE;
+static_assert(actorUpdateSize(PoseFormat::BWF) <= ACTOR_UPDATE_MAX_SIZE);
 
 inline void writeI64(uint8_t* dst, int64_t v) { std::memcpy(dst, &v, 8); }
 inline void writeF64(uint8_t* dst, double v) { std::memcpy(dst, &v, 8); }
+inline void writeF32(uint8_t* dst, float v) { std::memcpy(dst, &v, 4); }
 inline int64_t readI64(const uint8_t* src) {
     int64_t v;
     std::memcpy(&v, src, 8);
     return v;
+}
+inline float readF32(const uint8_t* src) {
+    float v;
+    std::memcpy(&v, src, 4);
+    return v;
+}
+inline double readF64(const uint8_t* src) {
+    double v;
+    std::memcpy(&v, src, 8);
+    return v;
+}
+
+/// The values one send carries, in the profile's own units and axes.
+struct ActorPose {
+    double posX = 0, posY = 0, posZ = 0;
+    double pitch = 0, yaw = 0, roll = 0;      // UE5: degrees; BWF: radians (roll unused)
+    double velX = 0, velY = 0, velZ = 0;
+    bool grounded = false;                    // BWF flags bit0
+    double updatedAtMs = 0;                   // BWF only
+};
+
+/// Fill the static fields of a signed actor-update template for a profile.
+inline void initActorUpdateTemplateFmt(uint8_t* buf, PoseFormat fmt, const char* uuid32,
+                                       int64_t appId, int64_t gameTokenId,
+                                       uint8_t distance, DecayRate decay) {
+    std::memset(buf, 0, ACTOR_UPDATE_MAX_SIZE);
+    buf[off::TYPE] = ACTOR_UPDATE_REQUEST_2;
+    writeI64(buf + off::APP_ID, appId);
+    buf[off::DISTANCE] = distance;
+    buf[off::DECAY] = static_cast<uint8_t>(decay);
+    buf[off::CONTAINS_AUTH] = 1;
+    std::memcpy(buf + off::UUID, uuid32, 32);
+    if (fmt == PoseFormat::UE5) buf[HEADER_SIZE + state::VERSION] = state::VERSION_VALUE;
+    writeI64(buf + actorUpdateTokenIdOffset(fmt), gameTokenId);
+}
+
+/// Patch the per-send fields for a profile and re-sign. See finalizeActorUpdate.
+inline bool finalizeActorUpdateFmt(uint8_t* buf, PoseFormat fmt, int64_t chunkX,
+                                   int64_t chunkY, int64_t chunkZ, const ActorPose& p,
+                                   uint8_t seq, const uint8_t* token64) {
+    writeI64(buf + off::CHUNK_X, chunkX);
+    writeI64(buf + off::CHUNK_Y, chunkY);
+    writeI64(buf + off::CHUNK_Z, chunkZ);
+    uint8_t* st = buf + off::PAYLOAD;
+    if (fmt == PoseFormat::BWF) {
+        writeF32(st + bwfpose::X, static_cast<float>(p.posX));
+        writeF32(st + bwfpose::Y, static_cast<float>(p.posY));
+        writeF32(st + bwfpose::Z, static_cast<float>(p.posZ));
+        writeF32(st + bwfpose::YAW, static_cast<float>(p.yaw));
+        writeF32(st + bwfpose::PITCH, static_cast<float>(p.pitch));
+        writeF32(st + bwfpose::VELOCITY_X, static_cast<float>(p.velX));
+        writeF32(st + bwfpose::VELOCITY_Y, static_cast<float>(p.velY));
+        writeF32(st + bwfpose::VELOCITY_Z, static_cast<float>(p.velZ));
+        // Never FLAG_MOB (or the NPC flag BWF's mob codec defines): the game routes
+        // those to lanes that expect a mob or an NPC suffix, not a player.
+        st[bwfpose::FLAGS] = p.grounded ? bwfpose::FLAG_GROUNDED : 0;
+        st[bwfpose::HELD_BLOCK_ID] = 0;
+        writeF64(st + bwfpose::UPDATED_AT, p.updatedAtMs);
+    } else {
+        writeF64(st + state::POSITION_X, p.posX);
+        writeF64(st + state::POSITION_Y, p.posY);
+        writeF64(st + state::POSITION_Z, p.posZ);
+        writeF64(st + state::ROTATION_PITCH, p.pitch);
+        writeF64(st + state::ROTATION_YAW, p.yaw);
+        writeF64(st + state::ROTATION_ROLL, p.roll);
+        writeF64(st + state::VELOCITY_X, p.velX);
+        writeF64(st + state::VELOCITY_Y, p.velY);
+        writeF64(st + state::VELOCITY_Z, p.velZ);
+    }
+    buf[actorUpdateSeqOffset(fmt)] = seq;
+    return hmac::spatialSign(buf, actorUpdateHmacOffset(fmt), token64,
+                             buf + actorUpdateHmacOffset(fmt));
 }
 
 /// Fill the static fields of a signed actor-update template. Chunk coords,

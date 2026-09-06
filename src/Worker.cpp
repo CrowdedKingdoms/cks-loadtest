@@ -54,10 +54,32 @@ Worker::~Worker() {
 
 void Worker::addClient(ClientCredentials creds,
                        std::chrono::steady_clock::time_point activateAt) {
-    SimClient c;
-    c.creds = std::move(creds);
-    c.activateAt = activateAt;
-    clients_.push_back(std::move(c));
+    PendingAdd p;
+    p.creds = std::move(creds);
+    p.activateAt = activateAt;
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    pending_.push_back(std::move(p));
+}
+
+int Worker::slotOf(const SimClient& client) const {
+    return static_cast<int>(&client - clients_.data());
+}
+
+void Worker::applyPendingClients() {
+    std::vector<PendingAdd> incoming;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        if (pending_.empty()) return;
+        incoming.swap(pending_);
+    }
+    for (auto& p : incoming) {
+        SimClient c;
+        c.creds = std::move(p.creds);
+        c.activateAt = p.activateAt;
+        clients_.push_back(std::move(c));
+        clientCount_.store(static_cast<int>(clients_.size()),
+                           std::memory_order_relaxed);
+    }
 }
 
 void Worker::start() {
@@ -95,7 +117,7 @@ bool Worker::openSocket(SimClient& client) {
 
     epoll_event ev{};
     ev.events = EPOLLIN;
-    ev.data.u32 = static_cast<uint32_t>(&client - clients_.data());
+    ev.data.u32 = static_cast<uint32_t>(slotOf(client));
     if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
         close(fd);
         return false;
@@ -123,7 +145,7 @@ void Worker::suspendClient(SimClient& client, ControlRequest::Kind kind) {
 
     ControlRequest req;
     req.workerIndex = index_;
-    req.clientIndex = static_cast<int>(&client - clients_.data());
+    req.clientIndex = slotOf(client);
     req.kind = kind;
     req.creds = client.creds;
     control_.push(std::move(req));
@@ -178,6 +200,7 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
             client.lastMoveTime = nowSec;
             client.lastSendTime = nowSec;
         }
+        client.lastRxTime = nowSec;
         // The first-contact grace window is per ASSIGNMENT, not per client: a
         // new gameTokenId on a new Buddy has its own permission window to load.
         // Re-arm so a reassignment's expected refusals are not misfiled.
@@ -204,6 +227,7 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
 void Worker::handleDatagram(SimClient& client, const uint8_t* data, size_t len) {
     stats_.rxDatagrams.fetch_add(1, std::memory_order_relaxed);
     stats_.rxBytes.fetch_add(len, std::memory_order_relaxed);
+    client.lastRxTime = steadySeconds();
     if (len == 0) return;
 
     if (data[0] == wire::MESSAGE_BUNDLE) {
@@ -355,6 +379,18 @@ void Worker::sendDueUpdates(double nowSec) {
 
     for (auto& client : clients_) {
         if (client.state != SimClient::State::ACTIVE) continue;
+        // Orphan check, before this tick's send: a client that has heard
+        // nothing for the window is talking to a Buddy that dropped it
+        // (restart, shed without a reconnect command, silent drop). On the
+        // 2026-09-03 ladder ~750 of 1 500 clients sent into nothing for eight
+        // minutes after a watchdog restart, and the population became a
+        // number nobody could state. A real client would rejoin; so does this.
+        if (config_.rxSilentReassignSec > 0 &&
+            nowSec - client.lastRxTime > config_.rxSilentReassignSec) {
+            stats_.rxSilentReassigns.fetch_add(1, std::memory_order_relaxed);
+            suspendClient(client, ControlRequest::Kind::REASSIGN);
+            continue;
+        }
         if (nowSec - client.lastSendTime < interval) continue;
         client.lastSendTime += interval;
         // If we fell far behind (scheduler stall), don't burst-catch-up.
@@ -367,7 +403,7 @@ void Worker::sendDueUpdates(double nowSec) {
             client.refreshRequested = true;
             ControlRequest req;
             req.workerIndex = index_;
-            req.clientIndex = static_cast<int>(&client - clients_.data());
+            req.clientIndex = slotOf(client);
             req.kind = ControlRequest::Kind::REFRESH;
             req.creds = client.creds;
             control_.push(std::move(req));
@@ -379,11 +415,11 @@ void Worker::sendDueUpdates(double nowSec) {
             stats_.txSendErrors.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        ssize_t n = send(client.fd, client.message, wire::ACTOR_UPDATE_SIZE, 0);
-        if (n == static_cast<ssize_t>(wire::ACTOR_UPDATE_SIZE)) {
+        const size_t msgSize = SimClient::messageSize(config_);
+        ssize_t n = send(client.fd, client.message, msgSize, 0);
+        if (n == static_cast<ssize_t>(msgSize)) {
             stats_.txPackets.fetch_add(1, std::memory_order_relaxed);
-            stats_.txBytes.fetch_add(wire::ACTOR_UPDATE_SIZE,
-                                     std::memory_order_relaxed);
+            stats_.txBytes.fetch_add(msgSize, std::memory_order_relaxed);
             client.consecutiveSendErrors = 0;
         } else {
             stats_.txSendErrors.fetch_add(1, std::memory_order_relaxed);
@@ -402,6 +438,7 @@ void Worker::run() {
     epoll_event events[MAX_EVENTS];
 
     while (running_.load(std::memory_order_acquire)) {
+        applyPendingClients();
         applyPendingUpdates();
 
         auto now = std::chrono::steady_clock::now();

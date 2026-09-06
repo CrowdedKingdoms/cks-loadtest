@@ -6,7 +6,8 @@ updates, using the same public sign-in, token-minting, and server-assignment
 flow a real native game client uses.
 
 - Lightweight C++20: plain UDP sockets and a few worker threads drive
-  thousands of simulated clients from a single host.
+  thousands of simulated clients from a single host. A fleet of generators
+  is a row of the same binary plus `cks-loadtest-ctl`.
 - Runs natively on Ubuntu or anywhere Docker runs — no special host setup.
 - Provisions its own player accounts deterministically and idempotently from
   one email + password.
@@ -55,14 +56,53 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
 3. **Server assignment.** Each client calls `serverWithLeastClients` on the
    Game API, which returns a Buddy address **and installs the client's UDP
    session** on it server-side.
-4. **Traffic.** Each client opens one UDP socket, walks a random 2D path
-   around the origin, and sends signed `ACTOR_UPDATE_REQUEST_2` messages at
-   the configured rate. Inbound notifications, bundles, and errors are parsed
-   and counted; the server epoch in notification tails yields a one-way
-   latency estimate.
-5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken` +
-   re-assign), `COMMAND_RECONNECT` triggers reassignment to another Buddy,
-   and the run fails fast if traffic goes out but nothing ever comes back.
+4. **Traffic.** Each client opens one UDP socket, moves through the world
+   (a random 2D walk around the origin, or a 3D drift inside a cube of chunks
+   -- see *Pose profiles* below), and sends signed `ACTOR_UPDATE_REQUEST_2`
+   messages at the configured rate. Inbound notifications, bundles, and errors
+   are parsed and counted; the server epoch in notification tails yields a
+   one-way latency estimate.
+5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken`,
+   sent to the app's own Game API URL from step 2 so every routed statement
+   stays in the app's datacenter). The refresh names the Buddy the client is
+   on (`currentServer`), and the API authorizes the NEW token there -- a Buddy
+   drops packets for a token it was never told about, silently, so this is
+   what lets a client keep its session across a refresh. The response's
+   `authorizedServer` set means "keep the socket target, switch tokens"
+   (counted as `refreshes_kept_server`); null means that node can no longer
+   serve the app (gone, draining, Full, not local) and the client is placed
+   again with `serverWithLeastClients`. Against an API older than ck-api
+   `v1.83.7` the harness falls back to the old mutation and every refresh
+   re-places. Only a real move counts as a `reassignment`; on a healthy fleet
+   `reassignments` should stay near 0 through a refresh wave, where before
+   it equalled `token_refreshes`. `COMMAND_RECONNECT` triggers
+   reassignment to another Buddy, and the run fails fast if traffic goes out
+   but nothing ever comes back.
+
+## Pose profiles: a load test you can see in the game
+
+The platform relays the actor-state payload opaquely, so the servers accept any
+bytes -- but the game you point this at renders only the layout it speaks, and a
+load test whose players are invisible in the game is measuring a population no
+player would ever experience. Two profiles ship:
+
+| `LT_POSE_FORMAT` | payload | positions | up axis | chunk |
+|---|---|---|---|---|
+| `ue5` (default) | 88-byte float64 state v2 (`version`, position, rotation, velocity, crouch, attachments) | Unreal units, local to the chunk | Z | 1600 uu |
+| `bwf` | 48-byte float32 pose, the layout Blocks With Friends' own client encodes (`x y z yaw pitch vx vy vz flags heldBlockId _ updatedAt _`; see `Wire.hpp`, namespace `bwfpose`) | world blocks, absolute | Y | 16 blocks |
+
+Against Blocks With Friends use `LT_POSE_FORMAT=bwf LT_VOLUME_CHUNKS=8`: the
+fleet fills an 8 x 8 x 8 chunk cube standing on chunk y 0 (BWF's terrain is
+chunk layers 0-2, so most bots drift in the sky above spawn), and a player at
+spawn sees them as avatars with dots spread across the minimap. Sent with the
+default `ue5` profile, BWF decodes the bytes as x ~ 0, y = 0 (below bedrock) and
+a scattered z: an invisible population whose minimap dots form a straight line.
+Every ladder up to 2026-09-05 was run that way; its fan-out numbers came from a
+17 x 17 x 1 plane, not the cube, and are not comparable with a `bwf` run.
+
+Visual confirmation is part of a ladder: on each steady rung open the game at
+spawn and screenshot the view and the minimap into the run directory. Avatars
+visible and moving, dots distributed, no straight line.
 
 ## Prerequisites
 
@@ -199,6 +239,114 @@ While running, a stats line prints every `LT_STATS_INTERVAL_SEC`:
 and a final summary (latency histogram, error-code breakdown) prints on exit.
 Add `--csv-out stats.csv` for a machine-readable per-interval log.
 
+## Progressive fleet
+
+One process can stay up for the whole test: load some clients, measure, write
+a rung summary, load more, never restart. Each VM owns a **global index
+range** so two generators never share accounts (Buddy sessions are per token;
+colliding emails steal sessions).
+
+Install recipe for VM `i` of `N`, capacity `C` each:
+
+```bash
+export LT_INDEX_BASE=$((i * C)) LT_INDEX_LIMIT=$C LT_CLIENTS=0
+export LT_INDEX_WIDTH=8
+export LT_CONTROL_BIND="$PRIVATE_IP:9109"   # the private address ITSELF, not 0.0.0.0
+export LT_CONTROL_TOKEN='...'          # required off-loopback; there is no TLS
+export LT_STATS_DIR=/var/lib/cks-loadtest
+export LT_ROSTER_FILE=roster.json LT_ROSTER_REQUIRED=1
+./cks-loadtest
+```
+
+**Bind the private address, not `0.0.0.0`.** A cloud VM usually has a public
+interface too, and `0.0.0.0` puts a token-gated, TLS-free control port on it —
+one leaked token then adds clients to your fleet from anywhere. Naming the
+private address is one string and cannot be got wrong by a firewall edit.
+
+With a roster covering every client (`LT_ROSTER_FILE` + `LT_ROSTER_REQUIRED=1`)
+no password is required and **none should be given**: the generators then hold
+session tokens for their own slice and no credential that could mint more.
+
+**Stop the machine's package manager from restarting the generator.** The point
+of this mode is a process that lives for the whole test, which makes it the
+first thing an unattended upgrade will interrupt. On Ubuntu, a run was cut at
+176 s of a 180 s window by `apt-daily-upgrade` stopping and starting the
+service, and the rung was lost:
+
+```bash
+sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer
+sudo systemctl mask unattended-upgrades.service apt-daily-upgrade.service apt-daily.service
+```
+
+`Restart=no` in a unit file does not help. It governs what the supervisor does
+when the process exits by itself; a stop requested by *another* unit is not that,
+so the setting never applies. Keep it anyway — a crash should stay visible rather
+than silently restarting empty mid-rung — but do not mistake it for protection.
+
+**Sync the generators' clocks to the same source as the servers**, or read
+latency per host. See *Interpreting results* below: the one-way estimate is
+offset by each generator's own clock error, and merging several hosts' samples
+produces a fleet figure that is a mixture of their offsets.
+
+Mint the whole population **once** (indices `0 .. N*C-1`), copy the same
+roster to every VM:
+
+```bash
+LT_INDEX_BASE=0 LT_INDEX_WIDTH=8 LT_CLIENTS=$((N * C)) \
+  scripts/provision-roster.sh
+```
+
+The orchestrating agent talks HTTP (`Authorization: Bearer $LT_CONTROL_TOKEN`)
+or, easier, runs `cks-loadtest-ctl` against a hosts file (one `http://host:9109`
+per line):
+
+```bash
+cks-loadtest-ctl --hosts hosts.txt status
+cks-loadtest-ctl --hosts hosts.txt add --count 200
+cks-loadtest-ctl --hosts hosts.txt wait --active-delta 200 --timeout-sec 120
+# wait returns when each host has provisioned AND ramped the new clients
+cks-loadtest-ctl --hosts hosts.txt rung-open --id r3
+cks-loadtest-ctl --hosts hosts.txt wait --stable-sec 30
+cks-loadtest-ctl --hosts hosts.txt rung-close --id r3 --out r3.fleet.json
+# ... add again, never shutting the generators down ...
+```
+
+`rung-close` writes per-host JSON (and `{LT_STATS_DIR}/rung-<id>.json` on each
+generator) plus one **fleet** summary. Merge rule: **sum** counts and rates,
+**max** of max latency, **merge histograms then read p50/p95/p99**. Averages
+of averages are refused. The fleet window carries the **earliest** host's
+`open_epoch_sec` and the **longest** `duration_sec`, so it bounds the interval
+every host was inside — which is what lets a rung be read back out of a
+monitoring system over exactly its own window instead of a guess.
+
+**Ramp before `rung-open`, as above.** The window then contains steady state
+only, which is why a healthy rung shows *zero* first-contact `UNAUTHORIZED` in
+its window while the lifetime count stays at roughly one per client. Both are
+worth reading; either alone misleads.
+
+**`aggregate` merges hosts within ONE rung.** It exists to re-merge per-host
+blobs offline — the files under `{LT_STATS_DIR}` — not to summarise a ladder.
+Handed several rungs it sums them, which is meaningless: five rungs of 50, 100,
+200, 300 and 400 clients merge into a confident *1050 clients* labelled with the
+first rung's id. It refuses that now (it reports the `rung_id` disagreement and
+exits non-zero), but a ladder summary is a table of rungs and this tool does not
+build one.
+
+Control routes (all except `GET /health` require the bearer token):
+
+| Method | Role |
+|---|---|
+| `GET /health` | liveness |
+| `GET /v1/status` | instance id, index base/used/limit, active, busy, current rung |
+| `GET /v1/stats` | lifetime + open-window counters + last-interval rates |
+| `POST /v1/clients/add` | `{"count": N}` next unused indices (202; poll `status.busy`) |
+| `POST /v1/rung/open` | `{"id": "r3"}` mark a stats window (does not add clients) |
+| `POST /v1/rung/close` | persist the window summary |
+| `POST /v1/shutdown` | graceful stop |
+
+Put the control port on a private network. Binding anything other than
+loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
+
 ## Key options
 
 | Option / env | Default | Meaning |
@@ -207,13 +355,25 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 | `--password` / `LT_PASSWORD` | — | Password for base + derived accounts (min 8 chars). Prefer `LT_PASSWORD`: `--password` is visible in `ps(1)`. |
 | `--management-api-url` / `LT_MANAGEMENT_API_URL` | — | CK GraphQL origin (required) |
 | `--app-id` / `LT_APP_ID` | — | App to load test (required; a per-deployment snowflake, no default) |
-| `--clients` / `LT_CLIENTS` | 10 | Simulated clients |
+| `--clients` / `LT_CLIENTS` | 10 | Clients provisioned at start (0 = wait for HTTP add) |
+| `--index-base` / `LT_INDEX_BASE` | 0 | First global client index this process owns |
+| `--index-limit` / `LT_INDEX_LIMIT` | = clients | Max clients this process will ever hold |
+| `--index-width` / `LT_INDEX_WIDTH` | 4 | Zero-pad width for `{index}` (use 8 for a large fleet) |
+| `--instance-id` / `LT_INSTANCE_ID` | hostname | Id stamped on every stats blob |
+| `--control-bind` / `LT_CONTROL_BIND` | `127.0.0.1:9109` | HTTP control bind (`off` disables) |
+| `--control-token` / `LT_CONTROL_TOKEN` | — | Bearer token; required off-loopback |
+| `--stats-dir` / `LT_STATS_DIR` | — | Rung JSON + interval JSONL directory |
 | `--threads` / `LT_THREADS` | 1 | Worker threads |
 | `--update-hz` / `LT_UPDATE_HZ` | 10 | Actor updates per second per client |
-| `--walk-speed` / `LT_WALK_SPEED` | 150 | Walk speed (Unreal units/s) |
-| `--spawn-radius-chunks` / `LT_SPAWN_RADIUS_CHUNKS` | 8 | Spawn/bounce radius around origin |
+| `--walk-speed` / `LT_WALK_SPEED` | 150 (`ue5`) / 4 (`bwf`) | Movement speed in the pose's position units per second |
+| `--spawn-radius-chunks` / `LT_SPAWN_RADIUS_CHUNKS` | 8 | Spawn/bounce radius around origin (2D walk only) |
+| `--pose-format` / `LT_POSE_FORMAT` | `ue5` | Actor-state payload the clients write: `ue5` (88-byte float64 state v2, chunk-local Unreal units, Z up) or `bwf` (48-byte float32 pose Blocks With Friends decodes: world blocks, Y up). See *Pose profiles*. |
+| `--chunk-size-units` / `LT_CHUNK_SIZE_UNITS` | 1600 (`ue5`) / 16 (`bwf`) | Edge of one chunk in the pose's position units |
+| `--volume-chunks` / `LT_VOLUME_CHUNKS` | 0 | 0 = the 2D walk; N = an N x N x N chunk cube centred on the origin chunk horizontally, filled uniformly by global client index, every client drifting in 3D and bouncing off the faces. 8 is the 512-chunk geometry that exercises per-ring decay. |
+| `--volume-base-up` / `LT_VOLUME_BASE_UP` | 0 | Lowest vertical chunk of the cube |
 | `--ramp-batch-size` / `LT_RAMP_BATCH_SIZE` | 10 | Clients activated per ramp batch |
 | `--ramp-interval-ms` / `LT_RAMP_INTERVAL_MS` | 1000 | Delay between ramp batches |
+| `--rx-silent-reassign-sec` / `LT_RX_SILENT_REASSIGN_SEC` | 0 | Re-assign a client that has received nothing at all for this many seconds on its current assignment (a Buddy that restarted or dropped the session answers nothing; no other trigger sees it). 0 = off; a lone client in an empty chunk legitimately hears nothing, so set it on fleet runs (30 on the ladder). Counted as `rx_silent_reassigns`. |
 | `--provision-concurrency` / `LT_PROVISION_CONCURRENCY` | 4 | Parallel GraphQL provisioning |
 | `--duration-sec` / `LT_DURATION_SEC` | 0 | Run time (0 = until Ctrl-C) |
 | `--csv-out` / `LT_CSV_OUT` | — | Per-interval CSV stats file |
@@ -226,13 +386,32 @@ Add `--csv-out stats.csv` for a machine-readable per-interval log.
 ## Interpreting results
 
 - **tx pps** should equal `clients x update-hz` once the ramp completes. If it
-  lags, the load generator host is saturated — add threads or hosts.
+  lags, the load generator host is saturated — add threads, or add hosts and
+  partition `LT_INDEX_BASE` (see Progressive fleet).
 - **notif/s** measures replication fan-out: with all clients co-located it
   approaches `clients^2 x update-hz` (bounded by the server's interest
   management and your `--distance`).
 - **lat~** is a one-way estimate from the server's epoch-millis stamp vs the
   local clock; it includes clock skew between the hosts, so watch its *trend*
   under load rather than its absolute value.
+
+  **On a fleet, do not merge it into one number.** Skew is per generator and it
+  is a constant offset on every sample that host takes, so a merged percentile
+  is a mixture of the generators' clock errors weighted by how many clients each
+  holds — a figure that moves when you add a host and not when the servers
+  change. Measured on two VMs of the same image running the same rung against
+  the same servers, with their windows opened in the same second:
+
+  | | generator A | generator B |
+  |---|---|---|
+  | p50 | 8.0 ms | **0.8 ms** |
+  | p95 | 14.9 ms | 6.3 ms |
+  | p99 | 18.7 ms | 7.0 ms |
+
+  An order of magnitude at p50, from clocks alone. Report per-host percentiles
+  side by side, or sync every generator to the same time source the servers use.
+  Trends survive skew — p95 rose on *both* hosts as fan-out grew — but levels do
+  not, and neither do comparisons between hosts.
 - **errs / error codes** in the final summary map to the wire protocol error
   codes (e.g. `TOKEN_EXPIRED`, `UNAUTHORIZED`). Occasional `TOKEN_EXPIRED`
   around the ~30 min mark is normal — clients rotate tokens and resume.
@@ -342,7 +521,7 @@ traffic. Entitlement management stays with you (see Prerequisites).
 
 ```
 src/
-  main.cpp            wiring: provision -> ramp -> simulate -> report
+  main.cpp            wiring: harness + HTTP control + shutdown
   Config.*            CLI + env + config-file settings
   GraphQLClient.*     minimal libcurl GraphQL POST client
   Provisioner.*       login/register, mintAppToken, serverWithLeastClients
@@ -350,8 +529,11 @@ src/
   Hmac.hpp            HMAC-SHA256 sign/verify (OpenSSL)
   SimClient.hpp       per-client walk simulation + message template
   Worker.*            worker threads: epoll RX + tick TX
-  Stats.*             counters, latency histogram, console/CSV reporter
-tests/wire_test.cpp   wire vectors cross-checked against the reference impl
+  Stats.*             counters, windowed snapshots, fleet merge, reporter
+  Harness.*           long-lived generator: hot-add, rungs, workers
+  ControlServer.*     HTTP JSON control port
+  ctl.cpp             cks-loadtest-ctl (status/add/wait/rung/aggregate)
+tests/                wire, config, stats merge, hot-add, HTTP control
 ```
 
 ## Versioning

@@ -57,17 +57,26 @@ class Provisioner {
 public:
     explicit Provisioner(const Config& config);
 
-    /// Provision credentials for all configured clients, using
-    /// config.provisionConcurrency parallel threads. Fatal errors (bad
-    /// password, missing entitlement, unreachable API) print an actionable
-    /// message and abort the whole run by returning an empty vector.
+    /// Provision `count` clients starting at GLOBAL index `globalStart`
+    /// (inclusive), using config.provisionConcurrency parallel threads.
+    /// Fatal errors print an actionable message and return an empty vector.
     /// `stop` aborts provisioning early (e.g. on SIGINT).
-    std::vector<ClientCredentials> provisionAll(std::atomic<bool>& stop);
+    std::vector<ClientCredentials> provisionRange(int globalStart, int count,
+                                                  std::atomic<bool>& stop);
+
+    /// Provision the start-of-run slice: [indexBase, indexBase + clients).
+    std::vector<ClientCredentials> provisionAll(std::atomic<bool>& stop) {
+        if (config_.clients <= 0) return {};
+        return provisionRange(config_.indexBase, config_.clients, stop);
+    }
 
     /// Rotate the app token (refreshAppToken with the current app token as
     /// bearer) and install a session on a (possibly different) Buddy.
     /// Throws GraphQLError on failure.
-    void refreshToken(GraphQLClient& mgmt, ClientCredentials& c);
+    /// Returns true when the API authorized the new token on the client's current
+    /// Buddy (`authorizedServer` set): the caller keeps the session and must NOT
+    /// re-place. False means the new token has no session anywhere yet.
+    bool refreshToken(GraphQLClient& mgmt, ClientCredentials& c);
 
     /// Re-run serverWithLeastClients for this client's current token and
     /// update the assignment. Throws GraphQLError on failure.
@@ -85,6 +94,9 @@ public:
     int rosterSize() const { return static_cast<int>(roster_.size()); }
 
 private:
+    /// Set once a refresh is refused for naming `currentServer`: the API is older
+    /// than ck-api v1.83.7 and every refresh must re-place.
+    std::atomic<bool> legacyRefresh_{false};
     /// A roster session, if this index has one. Empty otherwise.
     std::string rosterSession(int index, const std::string& email) const;
     /// login -> register -> login. Returns the session token.

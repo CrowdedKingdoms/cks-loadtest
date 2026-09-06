@@ -84,8 +84,9 @@ public:
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
 
-    /// Take ownership of a provisioned client. Call before start().
-    /// `activateAt` implements the global ramp schedule.
+    /// Queue a provisioned client. Safe before or after start(): the worker
+    /// thread appends to its vector, so epoll indices stay stable.
+    /// `activateAt` implements the ramp schedule for this add.
     void addClient(ClientCredentials creds,
                    std::chrono::steady_clock::time_point activateAt);
 
@@ -97,9 +98,14 @@ public:
 
     int index() const { return index_; }
 
+    /// Clients currently on this worker (including WAITING/SUSPENDED).
+    /// Approximate across threads; exact on the worker thread.
+    int clientCount() const { return clientCount_.load(std::memory_order_relaxed); }
+
 private:
     void run();
     void applyPendingUpdates();
+    void applyPendingClients();
     void activateDueClients(std::chrono::steady_clock::time_point now, double nowSec);
     void drainSocket(int clientIndex);
     void handleDatagram(SimClient& client, const uint8_t* data, size_t len);
@@ -107,6 +113,7 @@ private:
     bool openSocket(SimClient& client);
     void closeSocket(SimClient& client);
     void suspendClient(SimClient& client, ControlRequest::Kind kind);
+    int slotOf(const SimClient& client) const;
 
     int index_;
     const Config& config_;
@@ -117,9 +124,17 @@ private:
     int epollFd_ = -1;
     std::thread thread_;
     std::atomic<bool> running_{false};
+    std::atomic<int> clientCount_{0};
 
     std::mutex inboxMutex_;
     std::vector<ClientUpdate> inbox_;
+
+    struct PendingAdd {
+        ClientCredentials creds;
+        std::chrono::steady_clock::time_point activateAt{};
+    };
+    std::mutex pendingMutex_;
+    std::vector<PendingAdd> pending_;
 };
 
 } // namespace lt

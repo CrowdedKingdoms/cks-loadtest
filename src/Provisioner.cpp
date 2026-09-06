@@ -25,7 +25,19 @@ mutation Mint($input: MintAppTokenInput!) {
   mintAppToken(input: $input) { token gameTokenId appId expiresAt gameApiUrl }
 })";
 
+// The refresh names the Buddy the client is on so the API authorizes the NEW token
+// there; `authorizedServer` set means "keep your session, switch tokens", null means
+// "re-place" (the node is gone, draining, Full or not local to the app).
 constexpr const char* REFRESH_MUTATION = R"(
+mutation Refresh($currentServer: CurrentServerInput) {
+  refreshAppToken(currentServer: $currentServer) {
+    token gameTokenId appId expiresAt gameApiUrl
+    authorizedServer { ip4 clientPort }
+  }
+})";
+
+// For an API older than ck-api v1.83.7, which has neither the argument nor the field.
+constexpr const char* LEGACY_REFRESH_MUTATION = R"(
 mutation Refresh {
   refreshAppToken { token gameTokenId appId expiresAt gameApiUrl }
 })";
@@ -273,44 +285,74 @@ void Provisioner::assignServer(ClientCredentials& c) {
                    std::chrono::milliseconds(config_.sessionSettleMs);
 }
 
-void Provisioner::refreshToken(GraphQLClient& mgmt, ClientCredentials& c) {
-    auto data = requestWithRetry(mgmt, REFRESH_MUTATION, nlohmann::json::object(),
-                                 c.appToken);
+bool Provisioner::refreshToken(GraphQLClient& mgmt, ClientCredentials& c) {
+    nlohmann::json data;
+    if (!legacyRefresh_.load(std::memory_order_relaxed) && !c.serverIp4.empty()) {
+        nlohmann::json vars = {{"currentServer",
+                                {{"ip4", c.serverIp4}, {"clientPort", c.serverPort}}}};
+        try {
+            data = requestWithRetry(mgmt, REFRESH_MUTATION, vars, c.appToken);
+        } catch (const GraphQLError& e) {
+            // An API that does not know `currentServer` rejects the DOCUMENT, not
+            // the call; remember that once and use the old shape from then on.
+            const std::string what = e.what();
+            if (e.isTransport() || what.find("currentServer") == std::string::npos) throw;
+            legacyRefresh_.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "[control] the API predates refreshAppToken(currentServer); "
+                                 "every refresh will re-place (reassignments == refreshes)\n");
+        }
+    }
+    if (data.is_null()) {
+        data = requestWithRetry(mgmt, LEGACY_REFRESH_MUTATION, nlohmann::json::object(),
+                                c.appToken);
+    }
     const auto& fresh = data["refreshAppToken"];
     c.appToken = fresh["token"].get<std::string>();
     c.gameTokenId = std::stoll(fresh["gameTokenId"].get<std::string>());
     c.tokenExpiresAt = parseIso8601Utc(fresh["expiresAt"].get<std::string>());
-    // The new gameTokenId has no Buddy session yet; the caller must reassign.
+    if (fresh.contains("authorizedServer") && !fresh["authorizedServer"].is_null()) {
+        // The NEW token is installed on the node the client is on. Keep the socket
+        // target; give the datagram the same settle the first placement gets.
+        const auto& srv = fresh["authorizedServer"];
+        c.serverIp4 = srv["ip4"].get<std::string>();
+        c.serverPort = static_cast<uint16_t>(srv["clientPort"].get<int>());
+        c.udpReadyAt = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(config_.sessionSettleMs);
+        return true;
+    }
+    // No session anywhere for the new gameTokenId; the caller must re-place.
+    return false;
 }
 
-std::vector<ClientCredentials> Provisioner::provisionAll(std::atomic<bool>& stop) {
-    const int total = config_.clients;
+std::vector<ClientCredentials> Provisioner::provisionRange(int globalStart,
+                                                           int count,
+                                                           std::atomic<bool>& stop) {
+    if (count <= 0) return {};
 
-    // Say what the roster covers BEFORE doing any work, and refuse a short one
-    // when asked to. A roster covering 40 of 100 clients is the dangerous
-    // middle: the run succeeds and sixty sign-ins disappear into the numbers.
+    // Roster keys are GLOBAL indices so one file can be copied to every VM.
     if (!config_.rosterFile.empty()) {
         int covered = 0;
-        for (int i = 0; i < total; ++i) {
-            if (roster_.count(i)) ++covered;
+        for (int i = 0; i < count; ++i) {
+            if (roster_.count(globalStart + i)) ++covered;
         }
-        std::printf("[provision] roster: %d of %d client(s) have a pre-minted "
-                    "session (%d entr%s in %s)\n",
-                    covered, total, rosterSize(), rosterSize() == 1 ? "y" : "ies",
-                    config_.rosterFile.c_str());
-        if (covered < total && config_.rosterRequired) {
+        std::printf("[provision] roster: %d of %d client(s) in [%d, %d) have a "
+                    "pre-minted session (%d entr%s in %s)\n",
+                    covered, count, globalStart, globalStart + count, rosterSize(),
+                    rosterSize() == 1 ? "y" : "ies", config_.rosterFile.c_str());
+        if (covered < count && config_.rosterRequired) {
             std::fprintf(stderr,
                          "[provision] FATAL: LT_ROSTER_REQUIRED is set and the "
-                         "roster covers %d of %d clients. The remaining %d would "
-                         "each cost a bcrypt sign-in inside the process you are "
-                         "timing. Re-provision the roster for %d clients, or "
-                         "unset LT_ROSTER_REQUIRED to accept the cost.\n",
-                         covered, total, total - covered, total);
+                         "roster covers %d of %d clients in [%d, %d). The remaining "
+                         "%d would each cost a bcrypt sign-in inside the process "
+                         "you are timing. Re-provision the roster for this range, "
+                         "or unset LT_ROSTER_REQUIRED to accept the cost.\n",
+                         covered, count, globalStart, globalStart + count,
+                         count - covered);
             return {};
         }
     }
-    std::vector<ClientCredentials> out(static_cast<size_t>(total));
-    std::atomic<int> nextIndex{0};
+    std::vector<ClientCredentials> out(static_cast<size_t>(count));
+    std::atomic<int> nextOffset{0};
     std::atomic<int> completed{0};
     std::atomic<bool> failed{false};
     std::mutex logMutex;
@@ -319,13 +361,14 @@ std::vector<ClientCredentials> Provisioner::provisionAll(std::atomic<bool>& stop
     auto workerFn = [&]() {
         GraphQLClient mgmt(config_.managementApiUrl, config_.tlsInsecure);
         for (;;) {
-            int i = nextIndex.fetch_add(1);
-            if (i >= total || failed.load() || stop.load()) return;
+            int off = nextOffset.fetch_add(1);
+            if (off >= count || failed.load() || stop.load()) return;
+            const int global = globalStart + off;
             ClientCredentials c;
-            c.index = i;
-            c.email = config_.derivedEmail(i);
+            c.index = global;
+            c.email = config_.derivedEmail(global);
             try {
-                c.sessionToken = rosterSession(i, c.email);
+                c.sessionToken = rosterSession(global, c.email);
                 if (!c.sessionToken.empty()) {
                     signIns_.reused.fetch_add(1, std::memory_order_relaxed);
                 } else {
@@ -348,17 +391,18 @@ std::vector<ClientCredentials> Provisioner::provisionAll(std::atomic<bool>& stop
                 if (!failed.exchange(true)) firstError = e.what();
                 return;
             }
-            out[static_cast<size_t>(i)] = std::move(c);
+            out[static_cast<size_t>(off)] = std::move(c);
             int done = completed.fetch_add(1) + 1;
-            if (done % 50 == 0 || done == total) {
+            if (done % 50 == 0 || done == count) {
                 std::lock_guard<std::mutex> lock(logMutex);
-                std::printf("[provision] %d/%d clients ready\n", done, total);
+                std::printf("[provision] %d/%d clients ready (global [%d, %d))\n",
+                            done, count, globalStart, globalStart + count);
                 std::fflush(stdout);
             }
         }
     };
 
-    int threadCount = std::min(config_.provisionConcurrency, total);
+    int threadCount = std::min(config_.provisionConcurrency, count);
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(threadCount));
     for (int t = 0; t < threadCount; ++t) threads.emplace_back(workerFn);
