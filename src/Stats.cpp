@@ -106,6 +106,7 @@ nlohmann::json countersJson(const CounterSnap& s) {
         {"rx_hmac_failures", s.rxHmacFailures},
         {"rx_malformed", s.rxMalformed},
         {"token_refreshes", s.tokenRefreshes},
+        {"refreshes_kept_server", s.refreshesKeptServer},
         {"reassignments", s.reassignments},
         {"control_failures", s.controlFailures},
         {"latency", latencyJson(s)},
@@ -175,6 +176,7 @@ CounterSnap CounterSnap::minus(const CounterSnap& now, const CounterSnap& origin
     d.rxHmacFailures = satSub(now.rxHmacFailures, origin.rxHmacFailures);
     d.rxMalformed = satSub(now.rxMalformed, origin.rxMalformed);
     d.tokenRefreshes = satSub(now.tokenRefreshes, origin.tokenRefreshes);
+    d.refreshesKeptServer = satSub(now.refreshesKeptServer, origin.refreshesKeptServer);
     d.reassignments = satSub(now.reassignments, origin.reassignments);
     d.controlFailures = satSub(now.controlFailures, origin.controlFailures);
     d.unauthorizedFirstContact =
@@ -216,6 +218,7 @@ CounterSnap CounterSnap::plus(const CounterSnap& a, const CounterSnap& b) {
     s.rxHmacFailures += b.rxHmacFailures;
     s.rxMalformed += b.rxMalformed;
     s.tokenRefreshes += b.tokenRefreshes;
+    s.refreshesKeptServer += b.refreshesKeptServer;
     s.reassignments += b.reassignments;
     s.controlFailures += b.controlFailures;
     s.unauthorizedFirstContact += b.unauthorizedFirstContact;
@@ -254,6 +257,7 @@ CounterSnap CounterSnap::fromJson(const nlohmann::json& j) {
     s.rxHmacFailures = jU64(j, "rx_hmac_failures");
     s.rxMalformed = jU64(j, "rx_malformed");
     s.tokenRefreshes = jU64(j, "token_refreshes");
+    s.refreshesKeptServer = jU64(j, "refreshes_kept_server");
     s.reassignments = jU64(j, "reassignments");
     s.controlFailures = jU64(j, "control_failures");
     if (j.contains("latency") && j["latency"].is_object()) {
@@ -430,6 +434,7 @@ CounterSnap Stats::loadLifetime() const {
     s.rxHmacFailures = rxHmacFailures.load(std::memory_order_relaxed);
     s.rxMalformed = rxMalformed.load(std::memory_order_relaxed);
     s.tokenRefreshes = tokenRefreshes.load(std::memory_order_relaxed);
+    s.refreshesKeptServer = refreshesKeptServer.load(std::memory_order_relaxed);
     s.reassignments = reassignments.load(std::memory_order_relaxed);
     s.controlFailures = controlFailures.load(std::memory_order_relaxed);
     s.unauthorizedFirstContact = unauthorizedFirstContact.load(std::memory_order_relaxed);
@@ -649,9 +654,11 @@ void StatsReporter::printFinalSummary(int permWindowRadiusChunks, int reused,
     std::printf("rx: %" PRIu64 " datagrams, %" PRIu64 " bytes, %" PRIu64
                 " bundles, %" PRIu64 " actor notifications\n",
                 s.rxDatagrams, s.rxBytes, s.rxBundles, s.rxActorNotifications);
-    std::printf("control: %" PRIu64 " token refreshes, %" PRIu64
-                " reassignments, %" PRIu64 " failures\n",
-                s.tokenRefreshes, s.reassignments, s.controlFailures);
+    std::printf("control: %" PRIu64 " token refreshes (%" PRIu64
+                " kept their server), %" PRIu64 " reassignments, %" PRIu64
+                " failures\n",
+                s.tokenRefreshes, s.refreshesKeptServer, s.reassignments,
+                s.controlFailures);
     if (s.rxHmacFailures) {
         std::printf("HMAC verification failures: %" PRIu64 "\n", s.rxHmacFailures);
     }

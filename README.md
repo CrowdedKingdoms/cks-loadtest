@@ -64,11 +64,18 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
    one-way latency estimate.
 5. **Lifecycle.** App tokens are rotated before expiry (`refreshAppToken`,
    sent to the app's own Game API URL from step 2 so every routed statement
-   stays in the app's datacenter) and the refreshed token is then placed with
-   `serverWithLeastClients` again -- the only call that installs a token on a
-   Buddy; a Buddy drops packets for a token it was never told about, silently.
-   The client stays put when placement returns the server it already had, and
-   only a real move counts as a `reassignment`. `COMMAND_RECONNECT` triggers
+   stays in the app's datacenter). The refresh names the Buddy the client is
+   on (`currentServer`), and the API authorizes the NEW token there -- a Buddy
+   drops packets for a token it was never told about, silently, so this is
+   what lets a client keep its session across a refresh. The response's
+   `authorizedServer` set means "keep the socket target, switch tokens"
+   (counted as `refreshes_kept_server`); null means that node can no longer
+   serve the app (gone, draining, Full, not local) and the client is placed
+   again with `serverWithLeastClients`. Against an API older than ck-api
+   `v1.83.7` the harness falls back to the old mutation and every refresh
+   re-places. Only a real move counts as a `reassignment`; on a healthy fleet
+   `reassignments` should stay near 0 through a refresh wave, where before
+   it equalled `token_refreshes`. `COMMAND_RECONNECT` triggers
    reassignment to another Buddy, and the run fails fast if traffic goes out
    but nothing ever comes back.
 
