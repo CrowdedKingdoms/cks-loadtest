@@ -1,0 +1,32 @@
+# Security gates. Added 2026-09-08 with the security-hardening program that
+# followed the `register` account-takeover (ck-api v1.87.2 / v1.88.0).
+#
+#   gitleaks    secrets in the working tree           BLOCKING
+#   npm audit   high/critical advisories              report-only until the baseline is clean
+#   CodeQL      static analysis                     blocking on alerts in the Security tab
+#
+# Runs on every PR and push to the tier branches, and weekly so a new advisory
+# against an unchanged tree is still seen.
+name: security
+on:
+  pull_request:
+  push:
+    branches: [dev, test, prod]
+  schedule:
+    - cron: '17 6 * * 1'
+permissions:
+  contents: read
+jobs:
+  gitleaks:
+    name: secrets (gitleaks, working tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: gitleaks
+        # The WORKING TREE at this commit, not the history: a historical leak is
+        # a rotation task for the operator, not a reason to block every PR. The
+        # tree scan is BLOCKING: a secret committed now fails the check.
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
