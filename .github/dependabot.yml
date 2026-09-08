@@ -2,15 +2,16 @@
 # with the security-hardening program (see the repo's security.yml). PRs land
 # against the default branch (prod); rebase or cherry-pick onto dev as usual.
 version: 2
-target-branch: dev
 updates:
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
       day: monday
+    target-branch: dev
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
       day: monday
+    target-branch: dev
