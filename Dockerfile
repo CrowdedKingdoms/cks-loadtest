@@ -1,6 +1,6 @@
 # cks-loadtest — UDP load tester for Crowded Kingdoms game servers.
 
-FROM ubuntu:24.04 AS build
+FROM ubuntu:26.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake libcurl4-openssl-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -13,7 +13,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)" \
     && ctest --test-dir build --output-on-failure
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libcurl4 libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
