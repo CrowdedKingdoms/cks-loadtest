@@ -1,0 +1,30 @@
+# gitleaks configuration: the default ruleset plus an allowlist for the classes
+# of string that are not secrets in this codebase. Added 2026-09-08 with the
+# security-hardening program. A NEW allowlist entry is a reviewed decision --
+# say in the PR why the string cannot be a live credential.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures, generated output, vendored checksums, and public browser keys"
+paths = [
+  # Specs and fixtures: fake tokens with the right shape are the point of them.
+  '''\.(spec|test)\.(ts|tsx|mts|mjs|js|cpp|sh)$''',
+  '''(^|/)(test|tests|__tests__|fixtures)/''',
+  # Generated / vendored output that is never a place a credential is written.
+  '''(^|/)dist/''',
+  '''(^|/)vendor/''',
+  '''\.cargo-checksum\.json$''',
+  # The credential-hygiene checker's own catalogue of example shapes.
+  '''check-no-committed-credentials(\.test\.sh|\.mjs)$''',
+  # Fixture generators that emit random-looking bytes.
+  '''generate-binary-wire-fixtures\.mjs$''',
+  # Documented placeholders.
+  '''(^|/)example\.env$''',
+]
+regexes = [
+  # New Relic BROWSER license keys are shipped to every visitor by design.
+  '''NRJS-[0-9a-f]{15,}''',
+  # Tailscale addresses are not secrets.
+  '''\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b''',
+]
