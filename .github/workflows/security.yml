@@ -21,7 +21,7 @@ jobs:
     name: secrets (gitleaks, working tree)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: gitleaks
         # The WORKING TREE at this commit, not the history: a historical leak is
         # a rotation task for the operator, not a reason to block every PR. The
