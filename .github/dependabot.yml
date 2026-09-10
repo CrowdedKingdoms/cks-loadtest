@@ -1,6 +1,9 @@
 # Dependabot: dependency and Actions updates, weekly, grouped. Added 2026-09-08
-# with the security-hardening program (see the repo's security.yml). PRs land
-# against the default branch (prod); rebase or cherry-pick onto dev as usual.
+# with the security-hardening program (see the repo's security.yml). Version
+# updates target `dev` (not the GitHub default `prod`). Merge green low-risk
+# PRs to `dev`, then promote `dev` → `test` → `prod`. Security-alert PRs still
+# open against `prod`; retarget or cherry-pick onto `dev` — do not merge them
+# into prod first unless the operator authorizes a hotfix.
 version: 2
 updates:
   - package-ecosystem: docker
