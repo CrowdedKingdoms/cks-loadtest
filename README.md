@@ -77,7 +77,14 @@ Management API (GraphQL)         Game API (GraphQL)            Buddy (UDP)
    `reassignments` should stay near 0 through a refresh wave, where before
    it equalled `token_refreshes`. `COMMAND_RECONNECT` triggers
    reassignment to another Buddy, and the run fails fast if traffic goes out
-   but nothing ever comes back.
+   but nothing ever comes back. **Known limitation:** a refresh that the API
+   refuses (an `UNAUTHENTICATED` answer, which the API also gives for some
+   infrastructure errors) marks the client failed; the harness then retries
+   placement with the old, soon-expired app token rather than retrying the
+   refresh with the session token it still holds, so that client stays in
+   `suspended` for the rest of the run. Read `suspended` in `status` next to
+   `active`; on 2026-09-17 a database connection cap on the target suspended
+   29 of 7 500 this way.
 
 ## Pose profiles: a load test you can see in the game
 
@@ -166,6 +173,23 @@ uses only `login` and `register` — the public mutations any tenant can call �
 and needs no operator or infrastructure access. For a large population prefer
 `LT_PASSWORD_HMAC_SEED` over a single shared `LT_PASSWORD`: passwords are then
 derived per account and recomputable without being stored.
+
+**Sign-in is rate-limited per client IP, so a large roster is minted from many
+hosts.** The API allows `login` a fixed number of attempts per source address per
+window (100 per 15 minutes at the time of writing) and `register` fewer still, and
+a failed attempt counts. From one host, ten thousand sessions is a day; from the
+generator VMs of a fleet, each with its own address, it is the slowest slice.
+`provision-roster.sh` takes `LT_INDEX_BASE` and `LT_CLIENTS`, so a slice per host
+is one invocation per host — pace each to the window, keep the seed out of argv
+and off disk (feed it through the environment of the process you start), and
+merge the slices with `jq` into one file: `{origin, mintedAt, sessions}` with
+`sessions` sorted by `index`. Then check what you merged — every index from 0 to
+N−1 exactly once, one origin — before you let `LT_ROSTER_REQUIRED=1` see it.
+
+**A credential reset on the target invalidates every roster minted before it.**
+The sessions are bearer tokens the server can revoke at once; when it does, a
+run started on the old roster fails every client's first request. Re-mint rather
+than diagnosing the tier.
 
 **The point is the reported number, not the speed.** Every run prints its
 sign-in tally, and the one that matters is the first figure:
