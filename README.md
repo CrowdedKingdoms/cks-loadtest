@@ -166,6 +166,14 @@ LT_ROSTER_FILE=roster.json \
   scripts/provision-roster.sh
 
 LT_ROSTER_FILE=roster.json LT_ROSTER_REQUIRED=1 ./build/cks-loadtest --clients 100
+
+A roster may also be an **app-token roster** (`"kind": "app-token"`, entries carrying
+`gameTokenId`, `token`, `expiresAt`, and a top-level `gameApiUrl`): the harness then skips
+`login` and `mintAppToken` and goes straight to `gameClientBootstrap` + `serverWithLeastClients`
+with the token. Such a roster is produced by privileged operator tooling outside this repository
+(it writes the tier's database); this tool never mints one and holds nothing that could. The
+email pattern check applies to both kinds.
+
 ```
 
 Sessions last 30 days, so one roster serves many runs. `provision-roster.sh`
@@ -404,6 +412,8 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 | `--email-pattern` / `LT_EMAIL_PATTERN` | `{local}+lt-{index}@{domain}` | Derived email pattern |
 | `--game-api-url` / `LT_GAME_API_URL` | from mint | Game API override |
 | `--verify-server-hmac` / `LT_VERIFY_SERVER_HMAC` | off | Verify signed server notifications |
+| `--sparse-range-chunks` / `LT_SPARSE_RANGE_CHUNKS` | 0 (off) | **Sparse population**: each client alone in a chunk drawn uniformly from ±N on both horizontal axes by a hash of its global index (reproducible, fleet-wide disjoint), walking inside that chunk only. Measures how many clients the fleet can *hold* rather than density. Exclusive with `LT_VOLUME_CHUNKS`. |
+| `--sparse-group` / `LT_SPARSE_GROUP` | 1 | Consecutive indices sharing one chunk in sparse mode (2 = one neighbour each, a latency sample per client). |
 | `--client-caps` / `LT_CLIENT_CAPS` | on | Advertise `BUNDLE_SIGNED` (`CLIENT_CAPABILITIES`, Buddy v0.30.0) on every (re)assignment and every `LT_CAPS_INTERVAL_SEC` (15); the server then sends `MESSAGE_BUNDLE_SIGNED`, which is always verified (`rx_signed_bundles`, `rx_signed_members`, `tx_capabilities`; a failure counts in `rx_hmac_failures`). `off` = a pre-v0.30.0 client. |
 | `--tls-insecure` / `LT_TLS_INSECURE` | off | Skip TLS verification (dev only) |
 | `--duration-sec 0` + `SIGINT`/`SIGTERM` | — | Graceful shutdown with final summary |
