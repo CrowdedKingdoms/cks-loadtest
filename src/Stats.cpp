@@ -446,6 +446,7 @@ CounterSnap Stats::loadLifetime() const {
     s.rxOtherSpatial = rxOtherSpatial.load(std::memory_order_relaxed);
     s.rxErrorMessages = rxErrorMessages.load(std::memory_order_relaxed);
     s.rxReconnectCommands = rxReconnectCommands.load(std::memory_order_relaxed);
+    s.rxSilentReassigns = rxSilentReassigns.load(std::memory_order_relaxed);
     s.rxHmacFailures = rxHmacFailures.load(std::memory_order_relaxed);
     s.rxMalformed = rxMalformed.load(std::memory_order_relaxed);
     s.tokenRefreshes = tokenRefreshes.load(std::memory_order_relaxed);
