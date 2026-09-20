@@ -311,6 +311,8 @@ Config Config::load(int argc, char** argv) {
     c.rosterFile = layers.get("LT_ROSTER_FILE", c.rosterFile);
     c.rosterRequired = layers.getBool("LT_ROSTER_REQUIRED", c.rosterRequired);
     c.verifyServerHmac = layers.getBool("LT_VERIFY_SERVER_HMAC", c.verifyServerHmac);
+    c.clientCaps = layers.getBool("LT_CLIENT_CAPS", c.clientCaps);
+    c.capsIntervalSec = layers.getInt("LT_CAPS_INTERVAL_SEC", c.capsIntervalSec);
     c.tlsInsecure = layers.getBool("LT_TLS_INSECURE", c.tlsInsecure);
     c.sessionSettleMs = layers.getInt("LT_SESSION_SETTLE_MS", c.sessionSettleMs);
     c.rxHealthTimeoutSec = layers.getInt("LT_RX_HEALTH_TIMEOUT_SEC", c.rxHealthTimeoutSec);
@@ -361,6 +363,7 @@ Config Config::load(int argc, char** argv) {
     cliStr("roster", c.rosterFile);
     cliBool("roster-required", c.rosterRequired);
     cliBool("verify-server-hmac", c.verifyServerHmac);
+    cliBool("client-caps", c.clientCaps);
     cliBool("tls-insecure", c.tlsInsecure);
     cliInt("session-settle-ms", c.sessionSettleMs);
     cliInt("rx-health-timeout-sec", c.rxHealthTimeoutSec);

@@ -21,6 +21,9 @@ struct CounterSnap {
     uint64_t rxDatagrams = 0;
     uint64_t rxBytes = 0;
     uint64_t rxBundles = 0;
+    uint64_t rxSignedBundles = 0;       // MESSAGE_BUNDLE_SIGNED datagrams (Buddy v0.30.0)
+    uint64_t rxSignedMembers = 0;
+    uint64_t txCapabilities = 0;        // CLIENT_CAPABILITIES sent
     uint64_t rxActorNotifications = 0;
     uint64_t rxOtherSpatial = 0;
     uint64_t rxErrorMessages = 0;
@@ -105,6 +108,9 @@ struct Stats {
     std::atomic<uint64_t> rxDatagrams{0};
     std::atomic<uint64_t> rxBytes{0};
     std::atomic<uint64_t> rxBundles{0};
+    std::atomic<uint64_t> rxSignedBundles{0};
+    std::atomic<uint64_t> rxSignedMembers{0};
+    std::atomic<uint64_t> txCapabilities{0};
     std::atomic<uint64_t> rxActorNotifications{0};
     std::atomic<uint64_t> rxOtherSpatial{0};
     std::atomic<uint64_t> rxErrorMessages{0};
