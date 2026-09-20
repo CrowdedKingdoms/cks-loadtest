@@ -404,6 +404,7 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 | `--email-pattern` / `LT_EMAIL_PATTERN` | `{local}+lt-{index}@{domain}` | Derived email pattern |
 | `--game-api-url` / `LT_GAME_API_URL` | from mint | Game API override |
 | `--verify-server-hmac` / `LT_VERIFY_SERVER_HMAC` | off | Verify signed server notifications |
+| `--client-caps` / `LT_CLIENT_CAPS` | on | Advertise `BUNDLE_SIGNED` (`CLIENT_CAPABILITIES`, Buddy v0.30.0) on every (re)assignment and every `LT_CAPS_INTERVAL_SEC` (15); the server then sends `MESSAGE_BUNDLE_SIGNED`, which is always verified (`rx_signed_bundles`, `rx_signed_members`, `tx_capabilities`; a failure counts in `rx_hmac_failures`). `off` = a pre-v0.30.0 client. |
 | `--tls-insecure` / `LT_TLS_INSECURE` | off | Skip TLS verification (dev only) |
 | `--duration-sec 0` + `SIGINT`/`SIGTERM` | — | Graceful shutdown with final summary |
 

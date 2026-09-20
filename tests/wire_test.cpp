@@ -181,6 +181,48 @@ void testHexRoundTrip() {
     check(toHex(bytes.data(), bytes.size()) == EXPECTED_HEX, "hex round trip");
 }
 
+
+// Buddy v0.30.0: CLIENT_CAPABILITIES layout, and MESSAGE_BUNDLE_SIGNED verify + walk.
+void testCapabilitiesAndSignedBundle() {
+    const auto* tok = reinterpret_cast<const uint8_t*>(TOKEN);
+    uint8_t caps[lt::wire::CAPABILITIES_SIZE];
+    check(lt::wire::buildCapabilities(caps, 7, 12345, lt::wire::CAP_BUNDLE_SIGNED, 9, tok),
+          "capabilities: builds");
+    check(caps[0] == lt::wire::CLIENT_CAPABILITIES, "capabilities: type 29");
+    check(caps[lt::wire::off::CONTAINS_AUTH] == 1, "capabilities: containsAuth");
+    uint32_t flags = 0;
+    std::memcpy(&flags, caps + lt::wire::HEADER_SIZE, 4);
+    check(flags == 1, "capabilities: flags word at offset 68");
+    check(sizeof(caps) == 68 + 4 + 32 + 8 + 1, "capabilities: 113 bytes");
+    check(caps[sizeof(caps) - 1] == 9, "capabilities: seq last");
+    // The HMAC is the client scheme over the prefix (header + flags).
+    uint8_t expected[lt::hmac::TAG_SIZE];
+    check(lt::hmac::spatialSign(caps, 72, tok, expected) &&
+              lt::hmac::tagEquals(expected, caps + 72),
+          "capabilities: HMAC(token, prefix || token)");
+
+    // A signed bundle: [30]{[len][member]}x2 [HMAC over all before].
+    std::vector<uint8_t> dg = {lt::wire::MESSAGE_BUNDLE_SIGNED};
+    const uint8_t a[] = {3, 5, 7};
+    const uint8_t b[] = {3, 6, 7};
+    for (const auto* m : {a, b}) {
+        dg.push_back(3); dg.push_back(0);
+        dg.insert(dg.end(), m, m + 3);
+    }
+    uint8_t mac[lt::hmac::TAG_SIZE];
+    check(lt::hmac::spatialSign(dg.data(), dg.size(), tok, mac), "signed bundle: sign body");
+    dg.insert(dg.end(), mac, mac + lt::hmac::TAG_SIZE);
+    check(lt::wire::verifySignedBundle(dg.data(), dg.size(), tok), "signed bundle: verifies");
+    dg[3] ^= 1;
+    check(!lt::wire::verifySignedBundle(dg.data(), dg.size(), tok), "signed bundle: a flipped byte fails");
+    dg[3] ^= 1;
+    int members = 0;
+    bool ok = lt::wire::forEachMessage(dg.data(), dg.size(), [&](const lt::wire::InboundView& m) {
+        if (m.type() == lt::wire::GENERIC_ERROR_MESSAGE && m.len == 3) ++members;
+    });
+    check(ok && members == 2, "signed bundle: walk yields the two members and not the tail");
+}
+
 } // namespace
 
 int main() {
@@ -189,6 +231,7 @@ int main() {
     testVerifyNotification();
     testBundleParsing();
     testEpochExtraction();
+    testCapabilitiesAndSignedBundle();
 
     if (g_failures) {
         std::fprintf(stderr, "%d test(s) FAILED\n", g_failures);

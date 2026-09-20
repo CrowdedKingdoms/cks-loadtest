@@ -119,6 +119,8 @@ struct Config {
 
     // Behavior toggles
     bool verifyServerHmac = false;     // LT_VERIFY_SERVER_HMAC
+    bool clientCaps = true;            // LT_CLIENT_CAPS: advertise BUNDLE_SIGNED (Buddy v0.30.0)
+    int capsIntervalSec = 15;          // LT_CAPS_INTERVAL_SEC: re-advertise period
     bool tlsInsecure = false;          // LT_TLS_INSECURE (dev/self-signed only)
     int sessionSettleMs = 1500;        // LT_SESSION_SETTLE_MS (wait after assign)
     int rxHealthTimeoutSec = 10;       // LT_RX_HEALTH_TIMEOUT_SEC (0 = disabled)
