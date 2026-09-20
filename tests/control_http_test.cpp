@@ -4,6 +4,10 @@
 #include "Harness.hpp"
 
 #include <curl/curl.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <vector>
 
 #include <atomic>
 #include <chrono>
@@ -89,6 +93,43 @@ int main() {
     auto stats = httpGet("http://127.0.0.1:19109/v1/stats", "test-token");
     check(stats.find("lifetime") != std::string::npos, "stats has lifetime");
     check(stats.find("window") != std::string::npos, "stats has window");
+
+    // A generator at 1 500 clients holds 1 500 UDP sockets, so the control port's
+    // accepted connections land on descriptors >= FD_SETSIZE (1 024). cpp-httplib's
+    // select() path refused those and closed them unread -- every host went dark at
+    // once on the 2026-09-20 sparse ladder. Hold 1 100 descriptors open and ask again.
+    {
+        std::vector<int> held;
+        struct rlimit rl{};
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 2048) {
+            rl.rlim_cur = rl.rlim_max < 2048 ? rl.rlim_max : 2048;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+        // Fill every descriptor below FD_SETSIZE (the gaps curl leaves when it closes
+        // a client connection are exactly where accept() would otherwise land), so
+        // the server's next accepted socket is >= 1 024.
+        auto fill = [&]() {
+            for (int i = 0; i < 4096; ++i) {
+                int fd = ::open("/dev/null", O_RDONLY);
+                if (fd < 0) break;
+                held.push_back(fd);
+                if (fd >= 1024 + 16) break;
+            }
+        };
+        // The server's own closed keep-alive sockets free low descriptors between
+        // requests; fill, ask, and fill again so the last request has none left.
+        std::string tall;
+        for (int round = 0; round < 3; ++round) {
+            fill();
+            tall = httpGet("http://127.0.0.1:19109/health", "");
+        }
+        const bool enough = !held.empty() && held.back() >= 1024 + 16;
+        std::printf("held %zu descriptors, highest %d (%s)\n", held.size(),
+                    held.empty() ? -1 : held.back(), enough ? "above FD_SETSIZE" : "rlimit too low; check skipped");
+        check(!enough || tall.find("\"ok\"") != std::string::npos,
+              "/health answers with >1 024 descriptors open (poll, not select)");
+        for (int fd : held) ::close(fd);
+    }
 
     stop.store(true);
     harness.requestShutdown();
