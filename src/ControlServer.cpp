@@ -1,5 +1,16 @@
 #include "ControlServer.hpp"
 
+// THE CONTROL PORT MUST NOT USE select(). cpp-httplib defaults to select() for
+// socket readiness and refuses any socket whose descriptor is >= FD_SETSIZE
+// (1 024): `if (sock >= FD_SETSIZE) return -1;`. A generator holds one UDP socket
+// per simulated client, so from ~1 000 clients per host every accepted control
+// connection lands on a descriptor above the limit and is closed unread -- the
+// listener accepts, a pool thread closes, the driver sees "Server returned
+// nothing" from every host at once and the ladder is blind (sparse ladder 2,
+// 2026-09-20, at the add to 1 500/host). poll() has no such limit.
+#ifndef CPPHTTPLIB_USE_POLL
+#define CPPHTTPLIB_USE_POLL
+#endif
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
