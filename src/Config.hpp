@@ -57,6 +57,17 @@ struct Config {
     // client drifting in 3D and bouncing off the faces. 8 is the 8x8x8 /
     // 512-chunk geometry that exercises per-ring decay.
     int volumeChunks = 0;              // LT_VOLUME_CHUNKS
+    // SPARSE population (2026-09-20): every client stands alone in a chunk drawn
+    // uniformly from [-range, range] on both horizontal axes, seeded by its GLOBAL
+    // index (reproducible across a fleet), and walks inside that chunk only. No
+    // fan-out, no neighbours: what this measures is how many clients the fleet can
+    // HOLD (sessions, presence, per-node fan-in of everybody's heartbeats), not
+    // density. > 0 enables it; exclusive with LT_VOLUME_CHUNKS. `sparseGroup` puts
+    // that many consecutive indices in one chunk (1 = solitary; 2 = one neighbour
+    // each, which gives every client a latency sample).
+    int64_t sparseRangeChunks = 0;     // LT_SPARSE_RANGE_CHUNKS
+    int sparseGroup = 1;               // LT_SPARSE_GROUP
+    bool isSparse() const { return sparseRangeChunks > 0; }
     int volumeBaseUp = 0;              // LT_VOLUME_BASE_UP (lowest vertical chunk)
     // The radius, in chunks, of the server's cached grid-permission box. Used
     // ONLY to classify UNAUTHORIZED refusals, never sent on the wire. The

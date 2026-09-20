@@ -165,6 +165,11 @@ std::string Config::validate() const {
     if (poseFormat != "ue5" && poseFormat != "bwf")
         return "LT_POSE_FORMAT must be 'ue5' or 'bwf'";
     if (volumeChunks < 0 || volumeChunks > 64) return "LT_VOLUME_CHUNKS must be in [0, 64]";
+    if (sparseRangeChunks < 0 || sparseRangeChunks > 1000000000LL)
+        return "LT_SPARSE_RANGE_CHUNKS must be in [0, 1e9]";
+    if (sparseRangeChunks > 0 && volumeChunks > 0)
+        return "LT_SPARSE_RANGE_CHUNKS and LT_VOLUME_CHUNKS are exclusive population shapes";
+    if (sparseGroup < 1) return "LT_SPARSE_GROUP must be >= 1";
     if (spawnRadiusChunks < 0) return "LT_SPAWN_RADIUS_CHUNKS must be >= 0";
     if (permWindowRadiusChunks < 0)
         return "LT_PERMISSION_WINDOW_RADIUS_CHUNKS must be >= 0";
@@ -215,6 +220,8 @@ Config Config::load(int argc, char** argv) {
         ("update-hz", "Actor updates per second per client", cxxopts::value<int>())
         ("walk-speed", "Walk speed in Unreal units/second", cxxopts::value<double>())
         ("spawn-radius-chunks", "Spawn radius around origin, in chunks", cxxopts::value<int>())
+        ("sparse-range-chunks", "Sparse population: each client alone in a random chunk within +-N (0 = off)", cxxopts::value<int>())
+        ("sparse-group", "Sparse population: consecutive indices sharing one chunk (default 1)", cxxopts::value<int>())
         ("distance", "Replication distance (chunks)", cxxopts::value<int>())
         ("pose-format",
          "Actor-state payload: ue5 (88-byte float64 state, the default) or bwf "
@@ -287,6 +294,8 @@ Config Config::load(int argc, char** argv) {
     c.poseFormat = layers.get("LT_POSE_FORMAT", c.poseFormat);
     c.chunkSizeUnits = layers.getDouble("LT_CHUNK_SIZE_UNITS", c.chunkSizeUnits);
     c.volumeChunks = layers.getInt("LT_VOLUME_CHUNKS", c.volumeChunks);
+    c.sparseRangeChunks = layers.getInt("LT_SPARSE_RANGE_CHUNKS", static_cast<int>(c.sparseRangeChunks));
+    c.sparseGroup = layers.getInt("LT_SPARSE_GROUP", c.sparseGroup);
     c.volumeBaseUp = layers.getInt("LT_VOLUME_BASE_UP", c.volumeBaseUp);
     c.permWindowRadiusChunks = layers.getInt("LT_PERMISSION_WINDOW_RADIUS_CHUNKS",
                                              c.permWindowRadiusChunks);
@@ -342,6 +351,8 @@ Config Config::load(int argc, char** argv) {
     if (cli.count("pose-format")) c.poseFormat = cli["pose-format"].as<std::string>();
     if (cli.count("chunk-size-units")) c.chunkSizeUnits = cli["chunk-size-units"].as<double>();
     cliInt("volume-chunks", c.volumeChunks);
+    if (cli.count("sparse-range-chunks")) c.sparseRangeChunks = cli["sparse-range-chunks"].as<int>();
+    cliInt("sparse-group", c.sparseGroup);
     cliInt("volume-base-up", c.volumeBaseUp);
     cliInt("permission-window-radius-chunks", c.permWindowRadiusChunks);
     cliInt("decay", c.decay);

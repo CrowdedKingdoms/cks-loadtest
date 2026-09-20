@@ -156,16 +156,54 @@ Provisioner::Provisioner(const Config& config) : config_(config) {
         }
     }
 
+    // Two roster kinds. The default holds identity SESSIONS (login output); an
+    // "app-token" roster holds the app token itself plus its gameTokenId, minted by
+    // a privileged tool outside this repo directly in the tier's database, and the
+    // game API origin the harness should dial (mintAppToken used to return it).
+    // This harness never mints such a roster and holds no credential that could;
+    // it only reads the file it is handed.
+    rosterKindAppToken_ = doc.value("kind", std::string("session")) == "app-token";
+    if (rosterKindAppToken_ && doc.contains("gameApiUrl") && doc["gameApiUrl"].is_string())
+        rosterGameApiUrl_ = trimSlash(doc["gameApiUrl"].get<std::string>());
+
     for (const auto& entry : doc.value("sessions", nlohmann::json::array())) {
         if (!entry.contains("index") || !entry.contains("token")) continue;
         int idx = entry["index"].get<int>();
         std::string token = entry["token"].get<std::string>();
         if (token.empty()) continue;
-        roster_[idx] = std::move(token);
         if (entry.contains("email") && entry["email"].is_string()) {
             rosterEmails_[idx] = entry["email"].get<std::string>();
         }
+        if (rosterKindAppToken_) {
+            RosterAppToken at;
+            at.token = std::move(token);
+            if (entry.contains("gameTokenId") && entry["gameTokenId"].is_string())
+                at.gameTokenId = std::stoll(entry["gameTokenId"].get<std::string>());
+            if (entry.contains("expiresAt") && entry["expiresAt"].is_string())
+                at.expiresAt = parseIso8601Utc(entry["expiresAt"].get<std::string>());
+            if (at.token.size() != 64 || at.gameTokenId == 0) continue;
+            rosterAppTokens_[idx] = std::move(at);
+            roster_[idx] = "app-token";  // presence marker for the coverage count
+            continue;
+        }
+        roster_[idx] = std::move(token);
     }
+}
+
+bool Provisioner::rosterAppToken(int index, const std::string& email, RosterAppToken& out) const {
+    auto it = rosterAppTokens_.find(index);
+    if (it == rosterAppTokens_.end()) return false;
+    auto e = rosterEmails_.find(index);
+    if (e != rosterEmails_.end() && e->second != email) {
+        throw GraphQLError(
+            "LT_ROSTER_FILE entry " + std::to_string(index) + " is for '" +
+                e->second + "' but this run derives '" + email +
+                "' from LT_EMAIL/LT_EMAIL_PATTERN. The roster belongs to a "
+                "different bot population; regenerate it or fix the pattern.",
+            "", false);
+    }
+    out = it->second;
+    return true;
 }
 
 std::string Provisioner::rosterSession(int index, const std::string& email) const {
@@ -368,6 +406,34 @@ std::vector<ClientCredentials> Provisioner::provisionRange(int globalStart,
             c.index = global;
             c.email = config_.derivedEmail(global);
             try {
+                RosterAppToken pre;
+                if (rosterKindAppToken_ && rosterAppToken(global, c.email, pre)) {
+                    // Pre-minted app token: no session, no login, no mintAppToken.
+                    // The remaining cost per client is the two game-API reads
+                    // (bootstrap mirror + placement), which is the point.
+                    c.appToken = pre.token;
+                    c.gameTokenId = pre.gameTokenId;
+                    c.tokenExpiresAt = pre.expiresAt;
+                    c.gameApiUrl = !config_.gameApiUrl.empty() ? config_.gameApiUrl : rosterGameApiUrl_;
+                    if (c.gameApiUrl.empty()) {
+                        throw GraphQLError(
+                            "an app-token roster names no gameApiUrl and LT_GAME_API_URL is not set; "
+                            "the harness needs the app's datacenter origin to place clients.",
+                            "", false);
+                    }
+                    signIns_.reused.fetch_add(1, std::memory_order_relaxed);
+                    bootstrapGameClient(c);
+                    assignServer(c);
+                    out[static_cast<size_t>(off)] = std::move(c);
+                    int doneNow = completed.fetch_add(1) + 1;
+                    if (doneNow % 50 == 0 || doneNow == count) {
+                        std::lock_guard<std::mutex> lock(logMutex);
+                        std::printf("[provision] %d/%d clients ready (global [%d, %d))\n",
+                                    doneNow, count, globalStart, globalStart + count);
+                        std::fflush(stdout);
+                    }
+                    continue;
+                }
                 c.sessionToken = rosterSession(global, c.email);
                 if (!c.sessionToken.empty()) {
                     signIns_.reused.fetch_add(1, std::memory_order_relaxed);
