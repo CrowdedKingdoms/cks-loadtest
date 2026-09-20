@@ -98,6 +98,9 @@ nlohmann::json countersJson(const CounterSnap& s) {
         {"rx_datagrams", s.rxDatagrams},
         {"rx_bytes", s.rxBytes},
         {"rx_bundles", s.rxBundles},
+        {"rx_signed_bundles", s.rxSignedBundles},
+        {"rx_signed_members", s.rxSignedMembers},
+        {"tx_capabilities", s.txCapabilities},
         {"rx_actor_notifications", s.rxActorNotifications},
         {"rx_other_spatial", s.rxOtherSpatial},
         {"rx_error_messages", s.rxErrorMessages},
@@ -168,6 +171,9 @@ CounterSnap CounterSnap::minus(const CounterSnap& now, const CounterSnap& origin
     d.rxDatagrams = satSub(now.rxDatagrams, origin.rxDatagrams);
     d.rxBytes = satSub(now.rxBytes, origin.rxBytes);
     d.rxBundles = satSub(now.rxBundles, origin.rxBundles);
+    d.rxSignedBundles = satSub(now.rxSignedBundles, origin.rxSignedBundles);
+    d.rxSignedMembers = satSub(now.rxSignedMembers, origin.rxSignedMembers);
+    d.txCapabilities = satSub(now.txCapabilities, origin.txCapabilities);
     d.rxActorNotifications = satSub(now.rxActorNotifications, origin.rxActorNotifications);
     d.rxOtherSpatial = satSub(now.rxOtherSpatial, origin.rxOtherSpatial);
     d.rxErrorMessages = satSub(now.rxErrorMessages, origin.rxErrorMessages);
@@ -210,6 +216,9 @@ CounterSnap CounterSnap::plus(const CounterSnap& a, const CounterSnap& b) {
     s.rxDatagrams += b.rxDatagrams;
     s.rxBytes += b.rxBytes;
     s.rxBundles += b.rxBundles;
+    s.rxSignedBundles += b.rxSignedBundles;
+    s.rxSignedMembers += b.rxSignedMembers;
+    s.txCapabilities += b.txCapabilities;
     s.rxActorNotifications += b.rxActorNotifications;
     s.rxOtherSpatial += b.rxOtherSpatial;
     s.rxErrorMessages += b.rxErrorMessages;
@@ -249,6 +258,9 @@ CounterSnap CounterSnap::fromJson(const nlohmann::json& j) {
     s.rxDatagrams = jU64(j, "rx_datagrams");
     s.rxBytes = jU64(j, "rx_bytes");
     s.rxBundles = jU64(j, "rx_bundles");
+    s.rxSignedBundles = jU64(j, "rx_signed_bundles");
+    s.rxSignedMembers = jU64(j, "rx_signed_members");
+    s.txCapabilities = jU64(j, "tx_capabilities");
     s.rxActorNotifications = jU64(j, "rx_actor_notifications");
     s.rxOtherSpatial = jU64(j, "rx_other_spatial");
     s.rxErrorMessages = jU64(j, "rx_error_messages");
@@ -427,6 +439,9 @@ CounterSnap Stats::loadLifetime() const {
     s.rxDatagrams = rxDatagrams.load(std::memory_order_relaxed);
     s.rxBytes = rxBytes.load(std::memory_order_relaxed);
     s.rxBundles = rxBundles.load(std::memory_order_relaxed);
+    s.rxSignedBundles = rxSignedBundles.load(std::memory_order_relaxed);
+    s.rxSignedMembers = rxSignedMembers.load(std::memory_order_relaxed);
+    s.txCapabilities = txCapabilities.load(std::memory_order_relaxed);
     s.rxActorNotifications = rxActorNotifications.load(std::memory_order_relaxed);
     s.rxOtherSpatial = rxOtherSpatial.load(std::memory_order_relaxed);
     s.rxErrorMessages = rxErrorMessages.load(std::memory_order_relaxed);

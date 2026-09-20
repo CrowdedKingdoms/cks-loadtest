@@ -51,6 +51,7 @@ struct SimClient {
     char uuid[32] = {};
     uint8_t sequence = 0;
     double lastSendTime = 0;
+    double lastCapsTime = -1e9;   // steady seconds of the last CLIENT_CAPABILITIES (v0.30.0)
     double lastMoveTime = 0;
     // When this client last received ANY datagram on its current assignment
     // (steady seconds). Reset on activation; see Config::rxSilentReassignSec.
@@ -223,6 +224,7 @@ struct SimClient {
     /// (Re)build the static message fields; needed at init and whenever the
     /// gameTokenId changes (token refresh).
     void rebuildTemplate(const Config& cfg) {
+        lastCapsTime = -1e9;  // a new token or assignment: advertise again at once
         wire::initActorUpdateTemplateFmt(message, poseFormat(cfg), uuid, cfg.appId,
                                          creds.gameTokenId,
                                          static_cast<uint8_t>(cfg.distance),
