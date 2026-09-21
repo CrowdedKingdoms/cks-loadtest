@@ -5,6 +5,7 @@
 #include "Wire.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <random>
@@ -41,6 +42,9 @@ struct SimClient {
     double worldX = 0, worldY = 0, worldZ = 0;
     double dirX = 1, dirY = 0, dirZ = 0;
     int64_t chunkX = 0, chunkY = 0, chunkZ = 0;
+    // Sparse population: the chunk this client owns on the two horizontal axes
+    // (see Config::isSparse); the walk bounces inside it.
+    int64_t sparseC1 = 0, sparseC2 = 0;
     double posX = 0, posY = 0, posZ = 0;
     double velX = 0, velY = 0, velZ = 0;
     double rotYawDeg = 0;
@@ -190,11 +194,42 @@ struct SimClient {
         a.up = (static_cast<double>(cfg.volumeBaseUp + iup) + jitter(rng())) * size;
     }
 
+    /// Sparse placement: a chunk drawn uniformly from [-range, range]^2 by a hash of
+    /// the GLOBAL index (divided by the group size, so a group shares a chunk). A
+    /// hash rather than the per-client RNG so two generators holding disjoint index
+    /// ranges land disjointly and a re-run reproduces the map. splitmix64.
+    static uint64_t mix64(uint64_t x) {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    }
+    static void sparseChunkFor(const Config& cfg, int index, int64_t& c1, int64_t& c2) {
+        const uint64_t span = static_cast<uint64_t>(2 * cfg.sparseRangeChunks + 1);
+        const uint64_t slot = static_cast<uint64_t>(index / std::max(1, cfg.sparseGroup));
+        const uint64_t h1 = mix64(slot * 2 + 1);
+        const uint64_t h2 = mix64(slot * 2 + 2);
+        c1 = static_cast<int64_t>(h1 % span) - cfg.sparseRangeChunks;
+        c2 = static_cast<int64_t>(h2 % span) - cfg.sparseRangeChunks;
+    }
+    void placeSparse(const Config& cfg) {
+        sparseChunkFor(cfg, creds.index, sparseC1, sparseC2);
+        std::uniform_real_distribution<double> jitter(0.1, 0.9);
+        const double size = cfg.effectiveChunkSize();
+        Axes a = axes(cfg);
+        a.h1 = (static_cast<double>(sparseC1) + jitter(rng())) * size;
+        a.h2 = (static_cast<double>(sparseC2) + jitter(rng())) * size;
+        a.up = cfg.isBwf() ? BWF_WALK_HEIGHT : 0.0;
+    }
+
     /// Initialize walk state and the message template. Called once when the
     /// client first activates (UUID is stable across reassignments).
     void initSimulation(const Config& cfg, double nowSec) {
         const double size = cfg.effectiveChunkSize();
-        if (cfg.volumeChunks > 0) {
+        if (cfg.isSparse()) {
+            placeSparse(cfg);
+            randomizeDirection(cfg);
+        } else if (cfg.volumeChunks > 0) {
             placeInCube(cfg);
             randomizeDirection3D();
             std::uniform_real_distribution<double> re(4.0, 12.0);
@@ -257,7 +292,26 @@ struct SimClient {
         const double speed = cfg.effectiveWalkSpeed();
         const double size = cfg.effectiveChunkSize();
 
-        if (cfg.volumeChunks > 0) {
+        if (cfg.isSparse()) {
+            // Stay inside the owned chunk: bounce at its four edges.
+            Axes a = axes(cfg);
+            a.h1 += a.d1 * dt * speed;
+            a.h2 += a.d2 * dt * speed;
+            const double lo1 = static_cast<double>(sparseC1) * size, hi1 = lo1 + size;
+            const double lo2 = static_cast<double>(sparseC2) * size, hi2 = lo2 + size;
+            auto bounceIn = [](double& v, double& d, double lo, double hi) {
+                if (v < lo) { v = lo + (lo - v); d = std::fabs(d); }
+                if (v > hi) { v = hi - (v - hi); d = -std::fabs(d); }
+                if (v < lo) v = lo;
+                if (v > hi) v = hi;
+            };
+            bounceIn(a.h1, a.d1, lo1, hi1);
+            bounceIn(a.h2, a.d2, lo2, hi2);
+            velX = dirX * speed;
+            velY = dirY * speed;
+            velZ = dirZ * speed;
+            rotYawDeg = std::atan2(a.d2, a.d1) * (180.0 / 3.14159265358979);
+        } else if (cfg.volumeChunks > 0) {
             // 3D drift inside the cube; bounce off each face; re-aim now and then.
             worldX += dirX * dt * speed;
             worldY += dirY * dt * speed;
