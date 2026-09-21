@@ -57,6 +57,17 @@ struct Config {
     // client drifting in 3D and bouncing off the faces. 8 is the 8x8x8 /
     // 512-chunk geometry that exercises per-ring decay.
     int volumeChunks = 0;              // LT_VOLUME_CHUNKS
+    // SPARSE population (2026-09-20): every client stands alone in a chunk drawn
+    // uniformly from [-range, range] on both horizontal axes, seeded by its GLOBAL
+    // index (reproducible across a fleet), and walks inside that chunk only. No
+    // fan-out, no neighbours: what this measures is how many clients the fleet can
+    // HOLD (sessions, presence, per-node fan-in of everybody's heartbeats), not
+    // density. > 0 enables it; exclusive with LT_VOLUME_CHUNKS. `sparseGroup` puts
+    // that many consecutive indices in one chunk (1 = solitary; 2 = one neighbour
+    // each, which gives every client a latency sample).
+    int64_t sparseRangeChunks = 0;     // LT_SPARSE_RANGE_CHUNKS
+    int sparseGroup = 1;               // LT_SPARSE_GROUP
+    bool isSparse() const { return sparseRangeChunks > 0; }
     int volumeBaseUp = 0;              // LT_VOLUME_BASE_UP (lowest vertical chunk)
     // The radius, in chunks, of the server's cached grid-permission box. Used
     // ONLY to classify UNAUTHORIZED refusals, never sent on the wire. The
@@ -119,6 +130,12 @@ struct Config {
 
     // Behavior toggles
     bool verifyServerHmac = false;     // LT_VERIFY_SERVER_HMAC
+    // SO_RCVBUF per client socket (bytes; 0 = the kernel default, net.core.rmem_default).
+    // At the cube density of ladder 5 a generator drained ~3.5 M notifications/s across
+    // 325 sockets and the kernel counted thousands of RcvbufErrors/s: the per-socket queue
+    // overflowed between two reads. A larger queue absorbs the burst a busy thread leaves
+    // behind; if RcvbufErrors persist with this raised, the thread is the limit, not the buffer.
+    int socketRcvbufBytes = 0;         // LT_SOCKET_RCVBUF_BYTES
     bool clientCaps = true;            // LT_CLIENT_CAPS: advertise BUNDLE_SIGNED (Buddy v0.30.0)
     int capsIntervalSec = 15;          // LT_CAPS_INTERVAL_SEC: re-advertise period
     bool tlsInsecure = false;          // LT_TLS_INSECURE (dev/self-signed only)

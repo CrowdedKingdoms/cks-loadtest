@@ -108,6 +108,16 @@ bool Worker::openSocket(SimClient& client) {
         close(fd);
         return false;
     }
+    if (config_.socketRcvbufBytes > 0) {
+        // Before connect(): the kernel sizes the queue at socket creation and clamps to
+        // net.core.rmem_max (the installer raises that to 16 MB). A refusal is not fatal --
+        // the socket works at the default size -- but it is counted once per socket so a
+        // ladder that asked for 8 MB and got 208 KB can see it.
+        int want = config_.socketRcvbufBytes;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want)) < 0) {
+            stats_.rcvbufSetFailures.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // connect() pins the peer: send() is cheap and recv() only returns
     // datagrams from this Buddy.
     if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {

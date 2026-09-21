@@ -106,6 +106,7 @@ nlohmann::json countersJson(const CounterSnap& s) {
         {"rx_error_messages", s.rxErrorMessages},
         {"rx_reconnect_commands", s.rxReconnectCommands},
         {"rx_silent_reassigns", s.rxSilentReassigns},
+        {"rcvbuf_set_failures", s.rcvbufSetFailures},
         {"rx_hmac_failures", s.rxHmacFailures},
         {"rx_malformed", s.rxMalformed},
         {"token_refreshes", s.tokenRefreshes},
@@ -179,6 +180,7 @@ CounterSnap CounterSnap::minus(const CounterSnap& now, const CounterSnap& origin
     d.rxErrorMessages = satSub(now.rxErrorMessages, origin.rxErrorMessages);
     d.rxReconnectCommands = satSub(now.rxReconnectCommands, origin.rxReconnectCommands);
     d.rxSilentReassigns = satSub(now.rxSilentReassigns, origin.rxSilentReassigns);
+    d.rcvbufSetFailures = satSub(now.rcvbufSetFailures, origin.rcvbufSetFailures);
     d.rxHmacFailures = satSub(now.rxHmacFailures, origin.rxHmacFailures);
     d.rxMalformed = satSub(now.rxMalformed, origin.rxMalformed);
     d.tokenRefreshes = satSub(now.tokenRefreshes, origin.tokenRefreshes);
@@ -224,6 +226,7 @@ CounterSnap CounterSnap::plus(const CounterSnap& a, const CounterSnap& b) {
     s.rxErrorMessages += b.rxErrorMessages;
     s.rxReconnectCommands += b.rxReconnectCommands;
     s.rxSilentReassigns += b.rxSilentReassigns;
+    s.rcvbufSetFailures += b.rcvbufSetFailures;
     s.rxHmacFailures += b.rxHmacFailures;
     s.rxMalformed += b.rxMalformed;
     s.tokenRefreshes += b.tokenRefreshes;
@@ -266,6 +269,7 @@ CounterSnap CounterSnap::fromJson(const nlohmann::json& j) {
     s.rxErrorMessages = jU64(j, "rx_error_messages");
     s.rxReconnectCommands = jU64(j, "rx_reconnect_commands");
     s.rxSilentReassigns = jU64(j, "rx_silent_reassigns");
+    s.rcvbufSetFailures = jU64(j, "rcvbuf_set_failures");
     s.rxHmacFailures = jU64(j, "rx_hmac_failures");
     s.rxMalformed = jU64(j, "rx_malformed");
     s.tokenRefreshes = jU64(j, "token_refreshes");
@@ -446,6 +450,8 @@ CounterSnap Stats::loadLifetime() const {
     s.rxOtherSpatial = rxOtherSpatial.load(std::memory_order_relaxed);
     s.rxErrorMessages = rxErrorMessages.load(std::memory_order_relaxed);
     s.rxReconnectCommands = rxReconnectCommands.load(std::memory_order_relaxed);
+    s.rxSilentReassigns = rxSilentReassigns.load(std::memory_order_relaxed);
+    s.rcvbufSetFailures = rcvbufSetFailures.load(std::memory_order_relaxed);
     s.rxHmacFailures = rxHmacFailures.load(std::memory_order_relaxed);
     s.rxMalformed = rxMalformed.load(std::memory_order_relaxed);
     s.tokenRefreshes = tokenRefreshes.load(std::memory_order_relaxed);

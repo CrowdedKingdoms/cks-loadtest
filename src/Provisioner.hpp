@@ -99,6 +99,14 @@ private:
     std::atomic<bool> legacyRefresh_{false};
     /// A roster session, if this index has one. Empty otherwise.
     std::string rosterSession(int index, const std::string& email) const;
+    /// An app-token roster entry (kind "app-token"): the token + gameTokenId that a
+    /// privileged tool minted straight into the tier's database, so provisioning
+    /// skips `login` and `mintAppToken`. Returns false when the index has none.
+    struct RosterAppToken { std::string token; int64_t gameTokenId = 0;
+                            std::chrono::system_clock::time_point expiresAt{}; };
+    bool rosterAppToken(int index, const std::string& email, RosterAppToken& out) const;
+    /// True when the roster file declared `"kind": "app-token"`.
+    bool rosterIsAppTokens() const { return rosterKindAppToken_; }
     /// login -> register -> login. Returns the session token.
     std::string signIn(GraphQLClient& mgmt, const std::string& email);
     void mintAppToken(GraphQLClient& mgmt, ClientCredentials& c);
@@ -112,6 +120,11 @@ private:
     /// Emails the roster names, so a roster minted for a different population
     /// is a refusal rather than a silent re-sign-in.
     std::unordered_map<int, std::string> rosterEmails_;
+    /// kind "app-token" (see rosterAppToken): per-index token + id, and the game API
+    /// origin the roster names (what `mintAppToken` used to return).
+    bool rosterKindAppToken_ = false;
+    std::unordered_map<int, RosterAppToken> rosterAppTokens_;
+    std::string rosterGameApiUrl_;
     SignInTally signIns_;
     std::atomic<bool> runStarted_{false};
 };

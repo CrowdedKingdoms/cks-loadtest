@@ -210,6 +210,45 @@ int main() {
         check(c.chunkZ >= 0 && c.chunkZ < 2, "ue5 cube stands on z (up) 0..1");
     }
 
+
+    // --- sparse population (2026-09-20): alone in a random chunk, by index ------
+    {
+        Config cfg = bwfConfig();
+        cfg.sparseRangeChunks = 1000000;
+        cfg.sparseGroup = 1;
+        std::set<std::pair<int64_t, int64_t>> chunks;
+        bool inRange = true, deterministic = true, projectedOk = true, staysIn = true;
+        for (int i = 0; i < 2000; ++i) {
+            SimClient c = clientAt(i);
+            c.initSimulation(cfg, 100.0);
+            int64_t c1 = 0, c2 = 0;
+            SimClient::sparseChunkFor(cfg, i, c1, c2);
+            if (c.sparseC1 != c1 || c.sparseC2 != c2) deterministic = false;
+            if (std::llabs(c1) > 1000000 || std::llabs(c2) > 1000000) inRange = false;
+            chunks.insert({c1, c2});
+            // The projected chunk of the pose is the owned chunk.
+            if (c.chunkX != c1 || c.chunkZ != c2) projectedOk = false;
+            // Walk for a while: the client never leaves its chunk.
+            for (int t = 1; t <= 200; ++t) {
+                c.updateWalk(cfg, 100.0 + t * 0.1);
+                c.projectPose(cfg);
+                if (c.chunkX != c1 || c.chunkZ != c2) staysIn = false;
+            }
+        }
+        check(inRange, "sparse: every chunk within +-range");
+        check(deterministic, "sparse: chunk is a function of the global index");
+        check(chunks.size() == 2000, "sparse: 2000 clients land in 2000 distinct chunks");
+        check(projectedOk, "sparse: the pose projects into the owned chunk");
+        check(staysIn, "sparse: the walk stays inside the owned chunk");
+
+        cfg.sparseGroup = 2;
+        int64_t a1, a2, b1, b2, d1, d2;
+        SimClient::sparseChunkFor(cfg, 10, a1, a2);
+        SimClient::sparseChunkFor(cfg, 11, b1, b2);
+        SimClient::sparseChunkFor(cfg, 12, d1, d2);
+        check(a1 == b1 && a2 == b2 && (a1 != d1 || a2 != d2), "sparse: group 2 pairs consecutive indices");
+    }
+
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
