@@ -61,6 +61,16 @@ int main() {
     check(win.txPackets == 300, "markWindow then tx diff");
     check(win.latencySamples == 50, "window only counts post-open samples");
     check(stats.rungId() == "r1", "rung id");
+    // Every control counter reaches the snapshot. rxSilentReassigns did not until
+    // 2026-09-20: the sparse ladder reported 167 940 reassignments and 0 silent-RX
+    // reassigns, and they were all silent-RX reassigns.
+    stats.rxSilentReassigns.store(7);
+    stats.rxReconnectCommands.store(3);
+    stats.reassignments.store(11);
+    auto life = stats.loadWindow();
+    check(life.rxSilentReassigns == 7, "snapshot carries rx_silent_reassigns");
+    check(life.rxReconnectCommands == 3, "snapshot carries rx_reconnect_commands");
+    check(life.reassignments == 11, "snapshot carries reassignments");
 
     lt::SnapshotMeta m1;
     m1.instanceId = "a";
