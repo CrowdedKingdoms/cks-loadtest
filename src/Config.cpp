@@ -178,6 +178,7 @@ std::string Config::validate() const {
     if (provisionConcurrency < 1) return "LT_PROVISION_CONCURRENCY must be >= 1";
     if (rampBatchSize < 1) return "LT_RAMP_BATCH_SIZE must be >= 1";
     if (rxSilentReassignSec < 0) return "LT_RX_SILENT_REASSIGN_SEC must be >= 0";
+    if (socketRcvbufBytes < 0) return "LT_SOCKET_RCVBUF_BYTES must be >= 0";
     if (indexBase < 0) return "LT_INDEX_BASE must be >= 0";
     if (indexWidth < 1 || indexWidth > 16) return "LT_INDEX_WIDTH must be in [1, 16]";
     if (indexLimit < 0) return "LT_INDEX_LIMIT must be >= 0";
@@ -220,6 +221,7 @@ Config Config::load(int argc, char** argv) {
         ("update-hz", "Actor updates per second per client", cxxopts::value<int>())
         ("walk-speed", "Walk speed in Unreal units/second", cxxopts::value<double>())
         ("spawn-radius-chunks", "Spawn radius around origin, in chunks", cxxopts::value<int>())
+        ("socket-rcvbuf-bytes", "SO_RCVBUF per client socket in bytes (0 = kernel default)", cxxopts::value<int>())
         ("sparse-range-chunks", "Sparse population: each client alone in a random chunk within +-N (0 = off)", cxxopts::value<int>())
         ("sparse-group", "Sparse population: consecutive indices sharing one chunk (default 1)", cxxopts::value<int>())
         ("distance", "Replication distance (chunks)", cxxopts::value<int>())
@@ -320,6 +322,7 @@ Config Config::load(int argc, char** argv) {
     c.rosterFile = layers.get("LT_ROSTER_FILE", c.rosterFile);
     c.rosterRequired = layers.getBool("LT_ROSTER_REQUIRED", c.rosterRequired);
     c.verifyServerHmac = layers.getBool("LT_VERIFY_SERVER_HMAC", c.verifyServerHmac);
+    c.socketRcvbufBytes = layers.getInt("LT_SOCKET_RCVBUF_BYTES", c.socketRcvbufBytes);
     c.clientCaps = layers.getBool("LT_CLIENT_CAPS", c.clientCaps);
     c.capsIntervalSec = layers.getInt("LT_CAPS_INTERVAL_SEC", c.capsIntervalSec);
     c.tlsInsecure = layers.getBool("LT_TLS_INSECURE", c.tlsInsecure);
@@ -374,6 +377,7 @@ Config Config::load(int argc, char** argv) {
     cliStr("roster", c.rosterFile);
     cliBool("roster-required", c.rosterRequired);
     cliBool("verify-server-hmac", c.verifyServerHmac);
+    cliInt("socket-rcvbuf-bytes", c.socketRcvbufBytes);
     cliBool("client-caps", c.clientCaps);
     cliBool("tls-insecure", c.tlsInsecure);
     cliInt("session-settle-ms", c.sessionSettleMs);
