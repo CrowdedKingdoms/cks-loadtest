@@ -70,6 +70,14 @@ int main() {
     c.clients = 0;
     check(!c.validate().empty(), "zero clients and no control is refused");
 
+    // SO_RCVBUF knob: 0 (default) validates, a negative size is refused.
+    check(c.socketRcvbufBytes == 0, "socket rcvbuf defaults to the kernel size");
+    c.socketRcvbufBytes = 8 << 20;
+    check(c.validate().empty(), "8 MB socket rcvbuf validates");
+    c.socketRcvbufBytes = -1;
+    check(!c.validate().empty(), "negative LT_SOCKET_RCVBUF_BYTES is refused");
+    c.socketRcvbufBytes = 0;
+
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

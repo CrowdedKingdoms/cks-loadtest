@@ -130,6 +130,12 @@ struct Config {
 
     // Behavior toggles
     bool verifyServerHmac = false;     // LT_VERIFY_SERVER_HMAC
+    // SO_RCVBUF per client socket (bytes; 0 = the kernel default, net.core.rmem_default).
+    // At the cube density of ladder 5 a generator drained ~3.5 M notifications/s across
+    // 325 sockets and the kernel counted thousands of RcvbufErrors/s: the per-socket queue
+    // overflowed between two reads. A larger queue absorbs the burst a busy thread leaves
+    // behind; if RcvbufErrors persist with this raised, the thread is the limit, not the buffer.
+    int socketRcvbufBytes = 0;         // LT_SOCKET_RCVBUF_BYTES
     bool clientCaps = true;            // LT_CLIENT_CAPS: advertise BUNDLE_SIGNED (Buddy v0.30.0)
     int capsIntervalSec = 15;          // LT_CAPS_INTERVAL_SEC: re-advertise period
     bool tlsInsecure = false;          // LT_TLS_INSECURE (dev/self-signed only)

@@ -29,6 +29,7 @@ struct CounterSnap {
     uint64_t rxErrorMessages = 0;
     uint64_t rxReconnectCommands = 0;
     uint64_t rxSilentReassigns = 0;
+    uint64_t rcvbufSetFailures = 0;
     uint64_t rxHmacFailures = 0;
     uint64_t rxMalformed = 0;
     uint64_t tokenRefreshes = 0;
@@ -116,6 +117,7 @@ struct Stats {
     std::atomic<uint64_t> rxErrorMessages{0};
     std::atomic<uint64_t> rxReconnectCommands{0};
     std::atomic<uint64_t> rxSilentReassigns{0};
+    std::atomic<uint64_t> rcvbufSetFailures{0};
     std::atomic<uint64_t> rxHmacFailures{0};
     std::atomic<uint64_t> rxMalformed{0};
 
