@@ -108,6 +108,16 @@ bool Worker::openSocket(SimClient& client) {
         close(fd);
         return false;
     }
+    if (config_.socketRcvbufBytes > 0) {
+        // Before connect(): the kernel sizes the queue at socket creation and clamps to
+        // net.core.rmem_max (the installer raises that to 16 MB). A refusal is not fatal --
+        // the socket works at the default size -- but it is counted once per socket so a
+        // ladder that asked for 8 MB and got 208 KB can see it.
+        int want = config_.socketRcvbufBytes;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want)) < 0) {
+            stats_.rcvbufSetFailures.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // connect() pins the peer: send() is cheap and recv() only returns
     // datagrams from this Buddy.
     if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
@@ -199,6 +209,7 @@ void Worker::activateDueClients(std::chrono::steady_clock::time_point now,
             // UUID, just resume timing.
             client.lastMoveTime = nowSec;
             client.lastSendTime = nowSec;
+            client.lastCapsTime = -1e9;  // a new Buddy knows nothing about us
         }
         client.lastRxTime = nowSec;
         // The first-contact grace window is per ASSIGNMENT, not per client: a
@@ -232,11 +243,23 @@ void Worker::handleDatagram(SimClient& client, const uint8_t* data, size_t len) 
 
     if (data[0] == wire::MESSAGE_BUNDLE) {
         stats_.rxBundles.fetch_add(1, std::memory_order_relaxed);
+    } else if (data[0] == wire::MESSAGE_BUNDLE_SIGNED) {
+        // Buddy v0.30.0, only to a client that advertised BUNDLE_SIGNED: one HMAC
+        // over the datagram (verified always -- it is one per datagram), members
+        // without per-member HMACs. forEachMessage strips the tail.
+        stats_.rxSignedBundles.fetch_add(1, std::memory_order_relaxed);
+        if (!wire::verifySignedBundle(
+                data, len, reinterpret_cast<const uint8_t*>(client.creds.appToken.data()))) {
+            stats_.rxHmacFailures.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
     }
+    const bool signedBundle = data[0] == wire::MESSAGE_BUNDLE_SIGNED;
 
     const int64_t nowMs = epochMillis();
     bool ok = wire::forEachMessage(data, len, [&](const wire::InboundView& m) {
         const uint8_t type = m.type();
+        if (signedBundle) stats_.rxSignedMembers.fetch_add(1, std::memory_order_relaxed);
         if (type == wire::GENERIC_ERROR_MESSAGE) {
             stats_.rxErrorMessages.fetch_add(1, std::memory_order_relaxed);
             if (m.len >= 3) {
@@ -408,6 +431,21 @@ void Worker::sendDueUpdates(double nowSec) {
             req.creds = client.creds;
             control_.push(std::move(req));
             // Keep sending with the current token until the update arrives.
+        }
+
+        // CLIENT_CAPABILITIES (Buddy v0.30.0): on activation and every
+        // capsIntervalSec, so a reassigned, refreshed or migrated session is
+        // re-advertised without the harness having to know it happened.
+        if (config_.clientCaps &&
+            nowSec - client.lastCapsTime >= static_cast<double>(config_.capsIntervalSec)) {
+            client.lastCapsTime = nowSec;
+            uint8_t caps[wire::CAPABILITIES_SIZE];
+            if (wire::buildCapabilities(caps, config_.appId, client.creds.gameTokenId,
+                                        wire::CAP_BUNDLE_SIGNED, client.sequence++,
+                                        reinterpret_cast<const uint8_t*>(client.creds.appToken.data())) &&
+                send(client.fd, caps, sizeof(caps), 0) == static_cast<ssize_t>(sizeof(caps))) {
+                stats_.txCapabilities.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         client.updateWalk(config_, nowSec);

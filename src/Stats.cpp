@@ -98,11 +98,15 @@ nlohmann::json countersJson(const CounterSnap& s) {
         {"rx_datagrams", s.rxDatagrams},
         {"rx_bytes", s.rxBytes},
         {"rx_bundles", s.rxBundles},
+        {"rx_signed_bundles", s.rxSignedBundles},
+        {"rx_signed_members", s.rxSignedMembers},
+        {"tx_capabilities", s.txCapabilities},
         {"rx_actor_notifications", s.rxActorNotifications},
         {"rx_other_spatial", s.rxOtherSpatial},
         {"rx_error_messages", s.rxErrorMessages},
         {"rx_reconnect_commands", s.rxReconnectCommands},
         {"rx_silent_reassigns", s.rxSilentReassigns},
+        {"rcvbuf_set_failures", s.rcvbufSetFailures},
         {"rx_hmac_failures", s.rxHmacFailures},
         {"rx_malformed", s.rxMalformed},
         {"token_refreshes", s.tokenRefreshes},
@@ -168,11 +172,15 @@ CounterSnap CounterSnap::minus(const CounterSnap& now, const CounterSnap& origin
     d.rxDatagrams = satSub(now.rxDatagrams, origin.rxDatagrams);
     d.rxBytes = satSub(now.rxBytes, origin.rxBytes);
     d.rxBundles = satSub(now.rxBundles, origin.rxBundles);
+    d.rxSignedBundles = satSub(now.rxSignedBundles, origin.rxSignedBundles);
+    d.rxSignedMembers = satSub(now.rxSignedMembers, origin.rxSignedMembers);
+    d.txCapabilities = satSub(now.txCapabilities, origin.txCapabilities);
     d.rxActorNotifications = satSub(now.rxActorNotifications, origin.rxActorNotifications);
     d.rxOtherSpatial = satSub(now.rxOtherSpatial, origin.rxOtherSpatial);
     d.rxErrorMessages = satSub(now.rxErrorMessages, origin.rxErrorMessages);
     d.rxReconnectCommands = satSub(now.rxReconnectCommands, origin.rxReconnectCommands);
     d.rxSilentReassigns = satSub(now.rxSilentReassigns, origin.rxSilentReassigns);
+    d.rcvbufSetFailures = satSub(now.rcvbufSetFailures, origin.rcvbufSetFailures);
     d.rxHmacFailures = satSub(now.rxHmacFailures, origin.rxHmacFailures);
     d.rxMalformed = satSub(now.rxMalformed, origin.rxMalformed);
     d.tokenRefreshes = satSub(now.tokenRefreshes, origin.tokenRefreshes);
@@ -210,11 +218,15 @@ CounterSnap CounterSnap::plus(const CounterSnap& a, const CounterSnap& b) {
     s.rxDatagrams += b.rxDatagrams;
     s.rxBytes += b.rxBytes;
     s.rxBundles += b.rxBundles;
+    s.rxSignedBundles += b.rxSignedBundles;
+    s.rxSignedMembers += b.rxSignedMembers;
+    s.txCapabilities += b.txCapabilities;
     s.rxActorNotifications += b.rxActorNotifications;
     s.rxOtherSpatial += b.rxOtherSpatial;
     s.rxErrorMessages += b.rxErrorMessages;
     s.rxReconnectCommands += b.rxReconnectCommands;
     s.rxSilentReassigns += b.rxSilentReassigns;
+    s.rcvbufSetFailures += b.rcvbufSetFailures;
     s.rxHmacFailures += b.rxHmacFailures;
     s.rxMalformed += b.rxMalformed;
     s.tokenRefreshes += b.tokenRefreshes;
@@ -249,11 +261,15 @@ CounterSnap CounterSnap::fromJson(const nlohmann::json& j) {
     s.rxDatagrams = jU64(j, "rx_datagrams");
     s.rxBytes = jU64(j, "rx_bytes");
     s.rxBundles = jU64(j, "rx_bundles");
+    s.rxSignedBundles = jU64(j, "rx_signed_bundles");
+    s.rxSignedMembers = jU64(j, "rx_signed_members");
+    s.txCapabilities = jU64(j, "tx_capabilities");
     s.rxActorNotifications = jU64(j, "rx_actor_notifications");
     s.rxOtherSpatial = jU64(j, "rx_other_spatial");
     s.rxErrorMessages = jU64(j, "rx_error_messages");
     s.rxReconnectCommands = jU64(j, "rx_reconnect_commands");
     s.rxSilentReassigns = jU64(j, "rx_silent_reassigns");
+    s.rcvbufSetFailures = jU64(j, "rcvbuf_set_failures");
     s.rxHmacFailures = jU64(j, "rx_hmac_failures");
     s.rxMalformed = jU64(j, "rx_malformed");
     s.tokenRefreshes = jU64(j, "token_refreshes");
@@ -427,10 +443,15 @@ CounterSnap Stats::loadLifetime() const {
     s.rxDatagrams = rxDatagrams.load(std::memory_order_relaxed);
     s.rxBytes = rxBytes.load(std::memory_order_relaxed);
     s.rxBundles = rxBundles.load(std::memory_order_relaxed);
+    s.rxSignedBundles = rxSignedBundles.load(std::memory_order_relaxed);
+    s.rxSignedMembers = rxSignedMembers.load(std::memory_order_relaxed);
+    s.txCapabilities = txCapabilities.load(std::memory_order_relaxed);
     s.rxActorNotifications = rxActorNotifications.load(std::memory_order_relaxed);
     s.rxOtherSpatial = rxOtherSpatial.load(std::memory_order_relaxed);
     s.rxErrorMessages = rxErrorMessages.load(std::memory_order_relaxed);
     s.rxReconnectCommands = rxReconnectCommands.load(std::memory_order_relaxed);
+    s.rxSilentReassigns = rxSilentReassigns.load(std::memory_order_relaxed);
+    s.rcvbufSetFailures = rcvbufSetFailures.load(std::memory_order_relaxed);
     s.rxHmacFailures = rxHmacFailures.load(std::memory_order_relaxed);
     s.rxMalformed = rxMalformed.load(std::memory_order_relaxed);
     s.tokenRefreshes = tokenRefreshes.load(std::memory_order_relaxed);

@@ -28,6 +28,8 @@ enum : uint8_t {
     GENERIC_ERROR_MESSAGE = 3,
     COMMAND_RECONNECT = 22,
     CLIENT_ACTOR_HEARTBEAT = 26,
+    CLIENT_CAPABILITIES = 29,      // Buddy v0.30.0: client -> server, flags u32 at offset 68
+    MESSAGE_BUNDLE_SIGNED = 30,    // Buddy v0.30.0: bundle with ONE trailing HMAC, unsigned members
     ACTOR_UPDATE_REQUEST_2 = 128,
     ACTOR_UPDATE_NOTIFICATION_2 = 130,
     VOXEL_UPDATE_NOTIFICATION_2 = 133,
@@ -282,6 +284,38 @@ inline bool finalizeActorUpdate(uint8_t* buf, int64_t chunkX, int64_t chunkY,
                              buf + ACTOR_UPDATE_HMAC_OFFSET);
 }
 
+/// CLIENT_CAPABILITIES flags (Buddy v0.30.0).
+constexpr uint32_t CAP_BUNDLE_SIGNED = 1u << 0;
+/// [68B header][4B flags][32B HMAC][8B gameTokenId][1B seq]
+constexpr size_t CAPABILITIES_SIZE = HEADER_SIZE + 4 + TAIL_WITH_HMAC;
+
+/// Build a CLIENT_CAPABILITIES datagram: the long-spatial layout (so the session
+/// and HMAC gates apply), chunk (0,0,0), distance 0, no uuid, a LE u32 of flags as
+/// the app payload, signed like every client request. Buddy binds the flags to
+/// the router serving this flow and clears them when the slot goes, so a client
+/// sends this after every (re)assignment and again every few seconds.
+inline bool buildCapabilities(uint8_t* buf, int64_t appId, int64_t gameTokenId,
+                              uint32_t flags, uint8_t seq, const uint8_t* token64) {
+    std::memset(buf, 0, CAPABILITIES_SIZE);
+    buf[off::TYPE] = CLIENT_CAPABILITIES;
+    writeI64(buf + off::APP_ID, appId);
+    buf[off::CONTAINS_AUTH] = 1;
+    std::memcpy(buf + HEADER_SIZE, &flags, 4);
+    const size_t hmacOff = HEADER_SIZE + 4;
+    writeI64(buf + hmacOff + hmac::TAG_SIZE, gameTokenId);
+    buf[CAPABILITIES_SIZE - 1] = seq;
+    return hmac::spatialSign(buf, hmacOff, token64, buf + hmacOff);
+}
+
+/// Verify a MESSAGE_BUNDLE_SIGNED: the last 32 bytes are HMAC(token, body || token)
+/// over everything before them -- the client-message scheme, at the tail.
+inline bool verifySignedBundle(const uint8_t* data, size_t len, const uint8_t* token64) {
+    if (len <= hmac::TAG_SIZE + 1 || data[0] != MESSAGE_BUNDLE_SIGNED) return false;
+    uint8_t expected[hmac::TAG_SIZE];
+    if (!hmac::spatialSign(data, len - hmac::TAG_SIZE, token64, expected)) return false;
+    return hmac::tagEquals(expected, data + len - hmac::TAG_SIZE);
+}
+
 /// One parsed inbound message (a whole datagram, or one bundle member).
 struct InboundView {
     const uint8_t* data;
@@ -318,7 +352,11 @@ inline bool verifyNotification(const InboundView& m, const uint8_t* token64) {
 inline bool forEachMessage(const uint8_t* data, size_t len,
                            const std::function<void(const InboundView&)>& fn) {
     if (len == 0) return false;
-    if (data[0] != MESSAGE_BUNDLE) {
+    if (data[0] == MESSAGE_BUNDLE_SIGNED) {
+        // Caller has verified the tail (verifySignedBundle); walk what is before it.
+        if (len <= hmac::TAG_SIZE + 1) return false;
+        len -= hmac::TAG_SIZE;
+    } else if (data[0] != MESSAGE_BUNDLE) {
         fn(InboundView{data, len});
         return true;
     }
