@@ -71,6 +71,8 @@ int main() {
     check(!c.validate().empty(), "zero clients and no control is refused");
 
     // SO_RCVBUF knob: 0 (default) validates, a negative size is refused.
+    c.controlBind = "127.0.0.1:9109";  // back to a configuration that validates
+    check(c.validate().empty(), "control back on: validates again");
     check(c.socketRcvbufBytes == 0, "socket rcvbuf defaults to the kernel size");
     c.socketRcvbufBytes = 8 << 20;
     check(c.validate().empty(), "8 MB socket rcvbuf validates");
