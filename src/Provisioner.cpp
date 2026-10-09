@@ -25,6 +25,13 @@ mutation Mint($input: MintAppTokenInput!) {
   mintAppToken(input: $input) { token gameTokenId appId expiresAt gameApiUrl }
 })";
 
+// ck-api v2.35.0+ refuses a gameplay token (LEGAL_ACCEPTANCE_REQUIRED) until the account
+// has the current terms and the age-of-majority attestation stored.
+constexpr const char* CONSENTS_MUTATION = R"(
+mutation Consents {
+  recordPlayerConsents(acceptLegal: true, attestAgeOfMajority: true)
+})";
+
 // The refresh names the Buddy the client is on so the API authorizes the NEW token
 // there; `authorizedServer` set means "keep your session, switch tokens", null means
 // "re-place" (the node is gone, draining, Full or not local to the app).
@@ -268,7 +275,17 @@ void Provisioner::mintAppToken(GraphQLClient& mgmt, ClientCredentials& c) {
     nlohmann::json vars = {{"input", {{"appId", std::to_string(config_.appId)}}}};
     nlohmann::json data;
     try {
-        data = requestWithRetry(mgmt, MINT_MUTATION, vars, c.sessionToken);
+        try {
+            data = requestWithRetry(mgmt, MINT_MUTATION, vars, c.sessionToken);
+        } catch (const GraphQLError& e) {
+            if (e.isTransport() || e.code() != "LEGAL_ACCEPTANCE_REQUIRED") throw;
+            // The derived accounts are this tool's own, so it stores their consents and
+            // mints again. Asked only on the refusal: an account that has them already
+            // pays nothing, and an API older than the gate never refuses this way.
+            requestWithRetry(mgmt, CONSENTS_MUTATION, nlohmann::json::object(),
+                             c.sessionToken);
+            data = requestWithRetry(mgmt, MINT_MUTATION, vars, c.sessionToken);
+        }
     } catch (const GraphQLError& e) {
         if (!e.isTransport() && e.code() == "FORBIDDEN") {
             throw GraphQLError(

@@ -49,6 +49,7 @@ struct SignInTally {
 /// Provisioning against the public GraphQL APIs:
 ///   1. a roster session, or login (register on first run) -> session token
 ///   2. mintAppToken(appId)                                -> app token
+///      (on LEGAL_ACCEPTANCE_REQUIRED: recordPlayerConsents, then mint again)
 ///   3. serverWithLeastClients on the Game API             -> Buddy address
 ///
 /// Also provides the runtime operations (token refresh, server reassignment)
