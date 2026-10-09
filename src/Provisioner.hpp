@@ -83,6 +83,11 @@ public:
     /// update the assignment. Throws GraphQLError on failure.
     void assignServer(ClientCredentials& c);
 
+    /// Set the app's replay logging (App.replayLoggingEnabled) as the BASE account, which
+    /// must hold manage_apps on the app. Logs in only: it never registers the base account.
+    /// Throws GraphQLError with an actionable message when the API refuses.
+    void setReplayLogging(bool on);
+
     const Config& config() const { return config_; }
 
     const SignInTally& signIns() const { return signIns_; }

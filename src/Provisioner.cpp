@@ -60,6 +60,11 @@ query Assign {
 // mirrors this user's app entitlements into the game database and grants the
 // app's open-by-default grid access — without it Buddy rejects spatial
 // traffic with UNAUTHORIZED even for entitled users.
+constexpr const char* SET_REPLAY_LOGGING_MUTATION = R"(
+mutation SetReplayLogging($appId: BigInt!, $on: Boolean!) {
+  updateApp(appId: $appId, input: { replayLoggingEnabled: $on }) { appId replayLoggingEnabled }
+})";
+
 constexpr const char* BOOTSTRAP_QUERY = R"(
 query Bootstrap($appId: BigInt!) {
   gameClientBootstrap(appId: $appId) { appId maxReplicationDistance }
@@ -275,6 +280,44 @@ std::string Provisioner::signIn(GraphQLClient& mgmt, const std::string& email) {
                 "by this tool; pick a different LT_EMAIL_PATTERN or fix "
                 "LT_PASSWORD.",
             e.code(), false);
+    }
+}
+
+void Provisioner::setReplayLogging(bool on) {
+    GraphQLClient mgmt(config_.managementApiUrl, config_.tlsInsecure);
+    std::string session;
+    try {
+        auto data = requestWithRetry(
+            mgmt, LOGIN_MUTATION,
+            {{"input", {{"email", config_.email}, {"password", config_.password}}}}, "");
+        session = data["login"]["token"].get<std::string>();
+    } catch (const GraphQLError& e) {
+        if (e.isTransport()) throw;
+        throw GraphQLError("cannot sign in as the base account '" + config_.email +
+                               "' to set replay logging (" + e.what() + ")",
+                           e.code(), false);
+    }
+    try {
+        auto data = requestWithRetry(
+            mgmt, SET_REPLAY_LOGGING_MUTATION,
+            {{"appId", std::to_string(config_.appId)}, {"on", on}}, session);
+        if (data["updateApp"]["replayLoggingEnabled"].get<bool>() != on) {
+            throw GraphQLError("updateApp answered replayLoggingEnabled=" +
+                                   std::string(on ? "false" : "true") + " after setting it " +
+                                   (on ? "on" : "off"),
+                               "", false);
+        }
+    } catch (const GraphQLError& e) {
+        if (e.isTransport()) throw;
+        std::string hint;
+        if (e.code() == "INPUT_LOG_FUNDS_NEEDED")
+            hint = ": fund the app's organization wallet, or run with LT_REPLAY_LOGGING=leave";
+        else if (e.code() == "FORBIDDEN" || e.code() == "SCOPE_MISSING")
+            hint = ": the base account needs manage_apps on the app";
+        throw GraphQLError(std::string("cannot set replay logging ") + (on ? "on" : "off") +
+                               " for app " + std::to_string(config_.appId) + " (" + e.what() +
+                               ")" + hint,
+                           e.code(), false);
     }
 }
 

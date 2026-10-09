@@ -133,6 +133,16 @@ bool Harness::start(std::atomic<bool>& stop) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return false;
     }
+    if (config_.replayLogging != "leave") {
+        try {
+            provisioner_->setReplayLogging(config_.replayLogging == "on");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "error: %s\n", e.what());
+            return false;
+        }
+        std::printf("[app] replay logging %s for app %lld\n", config_.replayLogging.c_str(),
+                    static_cast<long long>(config_.appId));
+    }
 
     workers_.reserve(static_cast<size_t>(config_.threads));
     for (int w = 0; w < config_.threads; ++w) {
@@ -258,6 +268,7 @@ nlohmann::json Harness::statusJson() const {
         {"rung_id", stats_.rungId()},
         {"threads", config_.threads},
         {"update_hz", config_.updateHz},
+        {"replay_logging", config_.replayLogging},
     };
 }
 
@@ -272,6 +283,7 @@ nlohmann::json Harness::statsJson() const {
         m.busy = busy_;
         m.addError = addError_;
     }
+    m.replayLogging = config_.replayLogging;
     m.rungId = stats_.rungId();
     m.windowOpenEpochSec = stats_.windowOpenEpochSec();
     m.windowDurationSec = stats_.windowDurationSec();
