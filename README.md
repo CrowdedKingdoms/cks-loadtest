@@ -178,7 +178,10 @@ email pattern check applies to both kinds.
 
 Sessions last 30 days, so one roster serves many runs. `provision-roster.sh`
 uses only `login` and `register` — the public mutations any tenant can call —
-and needs no operator or infrastructure access. For a large population prefer
+and needs no operator or infrastructure access. **On dev and test**, which are
+staff-only, `register` also needs `LT_PROVISIONING_TOKEN`: a token an operator mints
+for the roster's email pattern (for example `cks-lt+*@loadtest.invalid`). The harness
+and the script send it on `register` only. For a large population prefer
 `LT_PASSWORD_HMAC_SEED` over a single shared `LT_PASSWORD`: passwords are then
 derived per account and recomputable without being stored.
 
@@ -385,6 +388,7 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 |---|---|---|
 | `--email` / `LT_EMAIL` | — | Base account email (required) |
 | `--password` / `LT_PASSWORD` | — | Password for base + derived accounts (min 8 chars). Prefer `LT_PASSWORD`: `--password` is visible in `ps(1)`. |
+| `LT_PROVISIONING_TOKEN` | — | Dev and test are staff-only: a NEW account there is refused unless `register` carries a provisioning token covering its address (sent as `X-CK-Provisioning-Token`; env only, never a flag). Existing accounts just `login`. Other tiers ignore it. |
 | `--management-api-url` / `LT_MANAGEMENT_API_URL` | — | CK GraphQL origin (required) |
 | `--app-id` / `LT_APP_ID` | — | App to load test (required; a per-deployment snowflake, no default) |
 | `--clients` / `LT_CLIENTS` | 10 | Clients provisioned at start (0 = wait for HTTP add) |

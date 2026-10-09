@@ -70,11 +70,12 @@ query Bootstrap($appId: BigInt!) {
 nlohmann::json requestWithRetry(GraphQLClient& client, const std::string& query,
                                 const nlohmann::json& variables,
                                 const std::string& bearer,
-                                std::atomic<bool>* stop = nullptr) {
+                                std::atomic<bool>* stop = nullptr,
+                                const std::vector<std::string>& extraHeaders = {}) {
     int attempts = 0;
     for (;;) {
         try {
-            return client.request(query, variables, bearer);
+            return client.request(query, variables, bearer, extraHeaders);
         } catch (const GraphQLError& e) {
             if (!e.isTransport() || ++attempts >= 3 ||
                 (stop && stop->load())) {
@@ -244,9 +245,15 @@ std::string Provisioner::signIn(GraphQLClient& mgmt, const std::string& email) {
     }
 
     // 2. First run: register (a fresh password-only account gets a session
-    //    immediately, no email confirmation required).
+    //    immediately, no email confirmation required). Dev and test are
+    //    staff-only: there a new account needs the provisioning token.
+    std::vector<std::string> registerHeaders;
+    if (!config_.provisioningToken.empty()) {
+        registerHeaders.push_back("X-CK-Provisioning-Token: " + config_.provisioningToken);
+    }
     try {
-        auto data = requestWithRetry(mgmt, REGISTER_MUTATION, {{"input", creds}}, "");
+        auto data = requestWithRetry(mgmt, REGISTER_MUTATION, {{"input", creds}}, "",
+                                     nullptr, registerHeaders);
         return data["register"]["token"].get<std::string>();
     } catch (const GraphQLError& e) {
         if (e.isTransport()) throw;
