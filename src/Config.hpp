@@ -23,6 +23,9 @@ struct Config {
     // Credentials / endpoints
     std::string email;                 // LT_EMAIL (required)
     std::string password;              // LT_PASSWORD (required unless roster covers)
+    std::string provisioningToken;     // LT_PROVISIONING_TOKEN: dev/test are staff-only,
+                                       //   so `register` needs it there (sent as
+                                       //   X-CK-Provisioning-Token; other tiers ignore it)
     std::string managementApiUrl;      // LT_MANAGEMENT_API_URL (required)
     std::string gameApiUrl;            // LT_GAME_API_URL (optional override;
                                        //   default: from mintAppToken response)

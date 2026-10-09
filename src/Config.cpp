@@ -284,6 +284,7 @@ Config Config::load(int argc, char** argv) {
     Config c;
     c.email = layers.get("LT_EMAIL", c.email);
     c.password = layers.get("LT_PASSWORD", c.password);
+    c.provisioningToken = layers.get("LT_PROVISIONING_TOKEN", c.provisioningToken);
     c.managementApiUrl = layers.get("LT_MANAGEMENT_API_URL", c.managementApiUrl);
     c.gameApiUrl = layers.get("LT_GAME_API_URL", c.gameApiUrl);
     c.appId = layers.getI64("LT_APP_ID", c.appId);
