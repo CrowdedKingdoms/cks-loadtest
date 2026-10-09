@@ -88,6 +88,7 @@ struct SnapshotMeta {
     double windowDurationSec = 0;
     int activeClients = 0;
     int suspendedClients = 0;
+    std::string replayLogging;
 };
 
 nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifetime,

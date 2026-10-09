@@ -318,6 +318,7 @@ nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifet
         {"busy", meta.busy},
         {"add_error", meta.addError},
         {"rung_id", meta.rungId},
+        {"replay_logging", meta.replayLogging},
         {"gauges",
          {{"active", meta.activeClients}, {"suspended", meta.suspendedClients}}},
         {"lifetime", lifetime.toJson()},

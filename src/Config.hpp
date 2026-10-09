@@ -57,6 +57,12 @@ struct Config {
     // client drifting in 3D and bouncing off the faces. 8 is the 8x8x8 /
     // 512-chunk geometry that exercises per-ring decay.
     int volumeChunks = 0;              // LT_VOLUME_CHUNKS
+    // The app's replay logging (App.replayLoggingEnabled) for the run: "on" records every
+    // input the clients send, "off" records none, "leave" (the default) touches nothing.
+    // Set once, before provisioning, with the base account's session (it needs manage_apps
+    // on the app), and it stays set after the run. Overhead ladders run the same rungs once
+    // with each, and every rung file says which (`replay_logging`).
+    std::string replayLogging = "leave"; // LT_REPLAY_LOGGING
     // SPARSE population (2026-09-20): every client stands alone in a chunk drawn
     // uniformly from [-range, range] on both horizontal axes, seeded by its GLOBAL
     // index (reproducible across a fleet), and walks inside that chunk only. No

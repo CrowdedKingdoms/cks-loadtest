@@ -165,6 +165,8 @@ std::string Config::validate() const {
     if (poseFormat != "ue5" && poseFormat != "bwf")
         return "LT_POSE_FORMAT must be 'ue5' or 'bwf'";
     if (volumeChunks < 0 || volumeChunks > 64) return "LT_VOLUME_CHUNKS must be in [0, 64]";
+    if (replayLogging != "on" && replayLogging != "off" && replayLogging != "leave")
+        return "LT_REPLAY_LOGGING must be 'on', 'off' or 'leave'";
     if (sparseRangeChunks < 0 || sparseRangeChunks > 1000000000LL)
         return "LT_SPARSE_RANGE_CHUNKS must be in [0, 1e9]";
     if (sparseRangeChunks > 0 && volumeChunks > 0)
@@ -232,6 +234,10 @@ Config Config::load(int argc, char** argv) {
         ("chunk-size-units",
          "Chunk edge in position units (default: 1600 for ue5, 16 for bwf)",
          cxxopts::value<double>())
+        ("replay-logging",
+         "Set the app's replay logging before the run: on, off, or leave (the default). "
+         "The base account needs manage_apps on the app",
+         cxxopts::value<std::string>())
         ("volume-chunks",
          "0 = 2D walk within the spawn radius; N = an N x N x N chunk cube with 3D drift",
          cxxopts::value<int>())
@@ -296,6 +302,7 @@ Config Config::load(int argc, char** argv) {
     c.poseFormat = layers.get("LT_POSE_FORMAT", c.poseFormat);
     c.chunkSizeUnits = layers.getDouble("LT_CHUNK_SIZE_UNITS", c.chunkSizeUnits);
     c.volumeChunks = layers.getInt("LT_VOLUME_CHUNKS", c.volumeChunks);
+    c.replayLogging = layers.get("LT_REPLAY_LOGGING", c.replayLogging);
     c.sparseRangeChunks = layers.getInt("LT_SPARSE_RANGE_CHUNKS", static_cast<int>(c.sparseRangeChunks));
     c.sparseGroup = layers.getInt("LT_SPARSE_GROUP", c.sparseGroup);
     c.volumeBaseUp = layers.getInt("LT_VOLUME_BASE_UP", c.volumeBaseUp);
@@ -354,6 +361,7 @@ Config Config::load(int argc, char** argv) {
     if (cli.count("pose-format")) c.poseFormat = cli["pose-format"].as<std::string>();
     if (cli.count("chunk-size-units")) c.chunkSizeUnits = cli["chunk-size-units"].as<double>();
     cliInt("volume-chunks", c.volumeChunks);
+    cliStr("replay-logging", c.replayLogging);
     if (cli.count("sparse-range-chunks")) c.sparseRangeChunks = cli["sparse-range-chunks"].as<int>();
     cliInt("sparse-group", c.sparseGroup);
     cliInt("volume-base-up", c.volumeBaseUp);
