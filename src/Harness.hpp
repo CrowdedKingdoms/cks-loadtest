@@ -68,6 +68,13 @@ private:
     std::thread addThread_;
 
     mutable std::mutex mu_;
+    /// The app's replay logging as READ from the API, not as requested: at the start of the
+    /// run (after setting it, for on / off) and at its end. "unknown" when it could not be
+    /// read; the end is empty until the run has stopped.
+    std::string replayLoggingObserved_ = "unknown";
+    std::string replayLoggingAtEnd_;
+    /// Read it now, report it, and warn when it records under `leave`. Returns the label.
+    std::string observeReplayLogging(const char* when);
     int used_ = 0;
     bool busy_ = false;
     std::string addError_;

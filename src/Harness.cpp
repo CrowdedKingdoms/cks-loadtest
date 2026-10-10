@@ -143,6 +143,14 @@ bool Harness::start(std::atomic<bool>& stop) {
         std::printf("[app] replay logging %s for app %lld\n", config_.replayLogging.c_str(),
                     static_cast<long long>(config_.appId));
     }
+    // Read back in every mode: `leave` inherits whatever an earlier run left, and a ladder
+    // that ended on `on` would otherwise go on recording, and billing, while every rung file
+    // said "leave".
+    {
+        std::string observed = observeReplayLogging("at the start of the run");
+        std::lock_guard<std::mutex> lock(mu_);
+        replayLoggingObserved_ = observed;
+    }
 
     workers_.reserve(static_cast<size_t>(config_.threads));
     for (int w = 0; w < config_.threads; ++w) {
@@ -268,7 +276,9 @@ nlohmann::json Harness::statusJson() const {
         {"rung_id", stats_.rungId()},
         {"threads", config_.threads},
         {"update_hz", config_.updateHz},
-        {"replay_logging", config_.replayLogging},
+        {"replay_logging", replayLoggingObserved_},
+        {"replay_logging_requested", config_.replayLogging},
+        {"replay_logging_at_end", replayLoggingAtEnd_},
     };
 }
 
@@ -282,8 +292,10 @@ nlohmann::json Harness::statsJson() const {
         m.limit = config_.indexLimit;
         m.busy = busy_;
         m.addError = addError_;
+        m.replayLogging = replayLoggingObserved_;
+        m.replayLoggingAtEnd = replayLoggingAtEnd_;
     }
-    m.replayLogging = config_.replayLogging;
+    m.replayLoggingRequested = config_.replayLogging;
     m.rungId = stats_.rungId();
     m.windowOpenEpochSec = stats_.windowOpenEpochSec();
     m.windowDurationSec = stats_.windowDurationSec();
@@ -309,6 +321,11 @@ void Harness::stop() {
     controlQueue_.shutdown();
     if (graphqlThread_.joinable()) graphqlThread_.join();
     if (addThread_.joinable()) addThread_.join();
+    if (provisioner_) {
+        std::string atEnd = observeReplayLogging("at the end of the run");
+        std::lock_guard<std::mutex> lock(mu_);
+        replayLoggingAtEnd_ = atEnd;
+    }
     if (reporter_) {
         reporter_->stop();
         int reused = 0, before = 0, during = 0;
@@ -316,6 +333,21 @@ void Harness::stop() {
         reporter_->printFinalSummary(config_.permWindowRadiusChunks, reused, before,
                                      during);
     }
+}
+
+std::string Harness::observeReplayLogging(const char* when) {
+    std::optional<bool> on = provisioner_->readReplayLogging();
+    const std::string label = replayLoggingLabel(on);
+    std::printf("[app] replay logging %s: %s (app %lld)\n", when, label.c_str(),
+                static_cast<long long>(config_.appId));
+    if (on.value_or(false) && config_.replayLogging == "leave") {
+        std::fprintf(stderr,
+                     "warning: replay logging is ON for app %lld and LT_REPLAY_LOGGING=leave keeps "
+                     "it so: this run's inputs are recorded and billed as stored input logs. Set "
+                     "LT_REPLAY_LOGGING=off to turn it off.\n",
+                     static_cast<long long>(config_.appId));
+    }
+    return label;
 }
 
 void Harness::ensureStatsDir() const {

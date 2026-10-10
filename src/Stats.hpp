@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -88,8 +89,15 @@ struct SnapshotMeta {
     double windowDurationSec = 0;
     int activeClients = 0;
     int suspendedClients = 0;
+    /// The app's replay logging as observed ("on" / "off" / "unknown"; "mixed" across hosts
+    /// that disagree), what LT_REPLAY_LOGGING asked for, and what it was when the run stopped.
     std::string replayLogging;
+    std::string replayLoggingRequested;
+    std::string replayLoggingAtEnd;
 };
+
+/// "on" / "off" for a value read from the API, "unknown" when it could not be read.
+std::string replayLoggingLabel(std::optional<bool> on);
 
 nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifetime,
                               const CounterSnap& window, const IntervalRates& interval);
