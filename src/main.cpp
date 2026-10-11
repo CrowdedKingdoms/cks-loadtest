@@ -82,6 +82,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The end reading first, while `status` can still be read: a multi-host merge reads it.
+    harness.observeEndOfRun();
     http.stop();
     harness.stop();
     lt::GraphQLClient::globalCleanup();

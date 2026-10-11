@@ -41,6 +41,10 @@ public:
     /// summary, and written into the last rung file, which was written before it was known.
     void recordReplayLoggingAtEnd(const std::string& atEnd);
 
+    /// Takes the end-of-run reading, once (stop() takes it if this was not called). Call it
+    /// while the control server still answers, so `status` and a multi-host merge carry it.
+    void observeEndOfRun();
+
     void requestShutdown();
     bool shuttingDown() const { return shutdown_.load(std::memory_order_relaxed); }
 
@@ -87,6 +91,7 @@ private:
     std::string addError_;
     std::atomic<bool> shutdown_{false};
     std::atomic<bool> started_{false};
+    std::atomic<bool> endObserved_{false};
     std::atomic<bool>* externalStop_ = nullptr;
 };
 

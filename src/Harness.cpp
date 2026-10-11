@@ -324,6 +324,11 @@ nlohmann::json Harness::statsJson() const {
                           stats_.interval());
 }
 
+void Harness::observeEndOfRun() {
+    if (!provisioner_ || endObserved_.exchange(true)) return;
+    recordReplayLoggingAtEnd(observeReplayLogging("at the end of the run"));
+}
+
 void Harness::requestShutdown() {
     shutdown_.store(true, std::memory_order_release);
     if (externalStop_) externalStop_->store(true);
@@ -340,7 +345,7 @@ void Harness::stop() {
     controlQueue_.shutdown();
     if (graphqlThread_.joinable()) graphqlThread_.join();
     if (addThread_.joinable()) addThread_.join();
-    if (provisioner_) recordReplayLoggingAtEnd(observeReplayLogging("at the end of the run"));
+    observeEndOfRun();
     if (reporter_) {
         reporter_->stop();
         int reused = 0, before = 0, during = 0;
