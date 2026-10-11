@@ -37,6 +37,10 @@ public:
     std::string openRung(std::string id);
     nlohmann::json closeRung();
 
+    /// The app's replay logging as read at the end of the run: kept for `status` and the
+    /// summary, and written into the last rung file, which was written before it was known.
+    void recordReplayLoggingAtEnd(const std::string& atEnd);
+
     void requestShutdown();
     bool shuttingDown() const { return shutdown_.load(std::memory_order_relaxed); }
 
@@ -73,6 +77,9 @@ private:
     /// read; the end is empty until the run has stopped.
     std::string replayLoggingObserved_ = "unknown";
     std::string replayLoggingAtEnd_;
+    /// The last rung file written, so the end reading can be added to it.
+    std::string lastRungId_;
+    nlohmann::json lastRungBody_;
     /// Read it now, report it, and warn when it records under `leave`. Returns the label.
     std::string observeReplayLogging(const char* when);
     int used_ = 0;

@@ -253,8 +253,27 @@ std::string Harness::openRung(std::string id) {
 nlohmann::json Harness::closeRung() {
     auto body = statsJson();
     std::string id = body.value("rung_id", std::string());
-    if (!id.empty()) writeRungFile(id, body);
+    if (!id.empty()) {
+        writeRungFile(id, body);
+        std::lock_guard<std::mutex> lock(mu_);
+        lastRungId_ = id;
+        lastRungBody_ = body;
+    }
     return body;
+}
+
+void Harness::recordReplayLoggingAtEnd(const std::string& atEnd) {
+    std::string id;
+    nlohmann::json body;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        replayLoggingAtEnd_ = atEnd;
+        id = lastRungId_;
+        body = lastRungBody_;
+    }
+    if (id.empty()) return;
+    body["replay_logging_at_end"] = atEnd;
+    writeRungFile(id, body);
 }
 
 nlohmann::json Harness::statusJson() const {
@@ -321,17 +340,21 @@ void Harness::stop() {
     controlQueue_.shutdown();
     if (graphqlThread_.joinable()) graphqlThread_.join();
     if (addThread_.joinable()) addThread_.join();
-    if (provisioner_) {
-        std::string atEnd = observeReplayLogging("at the end of the run");
-        std::lock_guard<std::mutex> lock(mu_);
-        replayLoggingAtEnd_ = atEnd;
-    }
+    if (provisioner_) recordReplayLoggingAtEnd(observeReplayLogging("at the end of the run"));
     if (reporter_) {
         reporter_->stop();
         int reused = 0, before = 0, during = 0;
         stats_.loadSignIn(reused, before, during);
-        reporter_->printFinalSummary(config_.permWindowRadiusChunks, reused, before,
-                                     during);
+        std::string atStart, atEnd;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            atStart = replayLoggingObserved_;
+            atEnd = replayLoggingAtEnd_;
+        }
+        reporter_->printFinalSummary(
+            config_.permWindowRadiusChunks, reused, before, during,
+            provisioner_ ? replayLoggingSummary(config_.replayLogging, atStart, atEnd)
+                         : std::string());
     }
 }
 
