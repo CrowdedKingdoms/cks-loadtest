@@ -65,6 +65,11 @@ mutation SetReplayLogging($appId: BigInt!, $on: Boolean!) {
   updateApp(appId: $appId, input: { replayLoggingEnabled: $on }) { appId replayLoggingEnabled }
 })";
 
+constexpr const char* READ_REPLAY_LOGGING_QUERY = R"(
+query ReplayLogging($appId: BigInt!) {
+  app(appId: $appId) { appId replayLoggingEnabled }
+})";
+
 constexpr const char* BOOTSTRAP_QUERY = R"(
 query Bootstrap($appId: BigInt!) {
   gameClientBootstrap(appId: $appId) { appId maxReplicationDistance }
@@ -319,6 +324,27 @@ void Provisioner::setReplayLogging(bool on) {
                                ")" + hint,
                            e.code(), false);
     }
+}
+
+std::optional<bool> Provisioner::readReplayLogging() {
+    GraphQLClient mgmt(config_.managementApiUrl, config_.tlsInsecure);
+    try {
+        auto login = requestWithRetry(
+            mgmt, LOGIN_MUTATION,
+            {{"input", {{"email", config_.email}, {"password", config_.password}}}}, "");
+        auto data = requestWithRetry(mgmt, READ_REPLAY_LOGGING_QUERY,
+                                     {{"appId", std::to_string(config_.appId)}},
+                                     login["login"]["token"].get<std::string>());
+        const auto& app = data["app"];
+        if (app.is_object() && app["replayLoggingEnabled"].is_boolean())
+            return app["replayLoggingEnabled"].get<bool>();
+        std::fprintf(stderr, "warning: app %lld answered no replayLoggingEnabled\n",
+                     static_cast<long long>(config_.appId));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "warning: cannot read app %lld's replay logging as '%s' (%s)\n",
+                     static_cast<long long>(config_.appId), config_.email.c_str(), e.what());
+    }
+    return std::nullopt;
 }
 
 void Provisioner::mintAppToken(GraphQLClient& mgmt, ClientCredentials& c) {
