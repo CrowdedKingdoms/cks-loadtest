@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -88,7 +89,21 @@ struct SnapshotMeta {
     double windowDurationSec = 0;
     int activeClients = 0;
     int suspendedClients = 0;
+    /// The app's replay logging as observed ("on" / "off" / "unknown"; "mixed" across hosts
+    /// that disagree), what LT_REPLAY_LOGGING asked for, and what it was when the run stopped.
+    std::string replayLogging;
+    std::string replayLoggingRequested;
+    std::string replayLoggingAtEnd;
 };
+
+/// "on" / "off" for a value read from the API, "unknown" when it could not be read.
+std::string replayLoggingLabel(std::optional<bool> on);
+
+/// The summary's replay-logging lines: what the run asked for and what was read at its start
+/// and end, with a warning when the two readings differ. The rung files carry the start
+/// reading, so a run that changed mid-way mixes recorded and unrecorded rungs.
+std::string replayLoggingSummary(const std::string& requested, const std::string& atStart,
+                                 const std::string& atEnd);
 
 nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifetime,
                               const CounterSnap& window, const IntervalRates& interval);
@@ -178,9 +193,11 @@ public:
     void start();
     void stop();
 
-    /// Print the end-of-run summary (totals, latency histogram, error codes).
+    /// Print the end-of-run summary (totals, latency histogram, error codes, and
+    /// `replayLogging`, replayLoggingSummary's lines, when given).
     void printFinalSummary(int permWindowRadiusChunks, int reused = -1,
-                           int mintedBefore = -1, int mintedDuring = -1) const;
+                           int mintedBefore = -1, int mintedDuring = -1,
+                           const std::string& replayLogging = std::string()) const;
 
 private:
     void run();

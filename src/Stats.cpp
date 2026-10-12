@@ -318,6 +318,9 @@ nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifet
         {"busy", meta.busy},
         {"add_error", meta.addError},
         {"rung_id", meta.rungId},
+        {"replay_logging", meta.replayLogging},
+        {"replay_logging_requested", meta.replayLoggingRequested},
+        {"replay_logging_at_end", meta.replayLoggingAtEnd},
         {"gauges",
          {{"active", meta.activeClients}, {"suspended", meta.suspendedClients}}},
         {"lifetime", lifetime.toJson()},
@@ -336,6 +339,24 @@ nlohmann::json buildStatsJson(const SnapshotMeta& meta, const CounterSnap& lifet
           {"rx_notif_ps", interval.rxNotifPs},
           {"avg_latency_ms", interval.avgLatencyMs}}},
     };
+}
+
+std::string replayLoggingLabel(std::optional<bool> on) {
+    if (!on) return "unknown";
+    return *on ? "on" : "off";
+}
+
+std::string replayLoggingSummary(const std::string& requested, const std::string& atStart,
+                                 const std::string& atEnd) {
+    const std::string end = atEnd.empty() ? "unknown" : atEnd;
+    std::string out = "replay logging: requested " + requested + "; " + atStart +
+                      " at the start, " + end + " at the end\n";
+    if (atStart != end) {
+        out += "  WARNING: replay logging was not the same at both ends of the run, so the "
+               "rungs (which carry the start reading) may mix recorded and unrecorded "
+               "traffic.\n";
+    }
+    return out;
 }
 
 nlohmann::json mergeFleetStats(const std::vector<nlohmann::json>& hosts) {
@@ -400,6 +421,15 @@ nlohmann::json mergeFleetStats(const std::vector<nlohmann::json>& hosts) {
             // Do not average avg_latency_ms. Fleet latency is the merged hist.
         }
         if (h.value("busy", false)) meta.busy = true;
+        // One app, so every host should agree; a disagreement is reported, not averaged away.
+        auto agree = [&](std::string& field, const char* key) {
+            std::string value = h.value(key, std::string());
+            if (first) field = value;
+            else if (value != field) field = "mixed";
+        };
+        agree(meta.replayLogging, "replay_logging");
+        agree(meta.replayLoggingRequested, "replay_logging_requested");
+        agree(meta.replayLoggingAtEnd, "replay_logging_at_end");
         first = false;
     }
     meta.instanceId = "fleet";
@@ -657,9 +687,11 @@ void StatsReporter::run() {
 }
 
 void StatsReporter::printFinalSummary(int permWindowRadiusChunks, int reused,
-                                      int mintedBefore, int mintedDuring) const {
+                                      int mintedBefore, int mintedDuring,
+                                      const std::string& replayLogging) const {
     CounterSnap s = stats_.loadLifetime();
     std::printf("\n===== load test summary =====\n");
+    if (!replayLogging.empty()) std::printf("%s", replayLogging.c_str());
     if (mintedDuring >= 0) {
         std::printf("sign-in: %d session(s) minted DURING the run, "
                     "%d before the ramp, %d reused from the roster\n",

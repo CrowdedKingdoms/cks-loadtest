@@ -114,6 +114,27 @@ int main() {
     check(fleet3["window"]["open_epoch_sec"] == 1756770000,
           "a host with no window does not zero the fleet's window start");
 
+    // Replay logging: what was observed, what was asked for, and what it was at the end.
+    check(lt::replayLoggingLabel(true) == "on", "replay logging read on");
+    check(lt::replayLoggingLabel(false) == "off", "replay logging read off");
+    check(lt::replayLoggingLabel(std::nullopt) == "unknown", "replay logging unreadable");
+    lt::SnapshotMeta r1 = m1;
+    r1.replayLogging = "on";
+    r1.replayLoggingRequested = "leave";
+    r1.replayLoggingAtEnd = "on";
+    auto jr1 = lt::buildStatsJson(r1, a, d, iv);
+    check(jr1["replay_logging"] == "on" && jr1["replay_logging_requested"] == "leave" &&
+              jr1["replay_logging_at_end"] == "on",
+          "a host reports the observed setting, not only the request");
+    lt::SnapshotMeta r2 = r1;
+    r2.instanceId = "b";
+    auto agreed = lt::mergeFleetStats({jr1, lt::buildStatsJson(r2, a, d, iv)});
+    check(agreed["replay_logging"] == "on" && agreed["replay_logging_requested"] == "leave",
+          "hosts that agree merge to their setting");
+    r2.replayLogging = "off";
+    auto mixed = lt::mergeFleetStats({jr1, lt::buildStatsJson(r2, a, d, iv)});
+    check(mixed["replay_logging"] == "mixed", "hosts that disagree merge to mixed");
+
     // round-trip JSON
     auto back = lt::CounterSnap::fromJson(a.toJson());
     check(back.txPackets == 100, "fromJson tx");

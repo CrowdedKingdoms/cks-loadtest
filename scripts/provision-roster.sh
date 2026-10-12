@@ -44,6 +44,13 @@
 #                          is a leak of the whole roster, and the seed lets a
 #                          password be recomputed without being stored.
 #
+# Dev and test are staff-only (2026-10-09): a NEW account there is refused unless the
+# request carries a provisioning token that covers its address:
+#   LT_PROVISIONING_TOKEN  sent as X-CK-Provisioning-Token on `register` only (never on
+#                          argv). Mint one for the roster's pattern with the control
+#                          plane's scripts/ops/tier-access.mjs; existing accounts sign in
+#                          with `login` and need nothing new. Other tiers ignore it.
+#
 # The roster records the ORIGIN it was minted against and the harness refuses a
 # roster from a different one. A session minted on one tier is a syntactically
 # valid bearer token that means nothing on another, so a file carried between
@@ -107,11 +114,22 @@ derived_password() {
   printf 'Aa1!%s' "$mac"
 }
 
-gql() { # query variables-json
+gql() { # query variables-json [extra curl args...]
+  local q="$1" v="$2"; shift 2
   curl -sS --max-time 60 --max-redirs 0 --proto '=https,http' "$API/graphql" \
-    -H 'Content-Type: application/json' \
-    --data-binary "$(jq -cn --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}')"
+    -H 'Content-Type: application/json' "$@" \
+    --data-binary "$(jq -cn --arg q "$q" --argjson v "$v" '{query:$q,variables:$v}')"
 }
+
+# Dev and test are staff-only: a new account there needs the provisioning token,
+# which only `register` reads (other tiers ignore it). Passed through a header file
+# rather than argv, so it is not visible in ps(1).
+PROVISIONING_HEADER=()
+if [ -n "${LT_PROVISIONING_TOKEN:-}" ]; then
+  header_file=$(mktemp); chmod 600 "$header_file"
+  printf 'X-CK-Provisioning-Token: %s\n' "$LT_PROVISIONING_TOKEN" > "$header_file"
+  PROVISIONING_HEADER=(-H "@$header_file")
+fi
 
 Q_LOGIN='mutation L($e:String!,$p:String!){ login(loginUserInput:{email:$e,password:$p}){ token user { userId } } }'
 # `register` returns an AuthResponse with a usable `token`, so a brand-new
@@ -124,7 +142,7 @@ Q_REGISTER='mutation R($e:String!,$p:String!){ register(registerUserInput:{email
 echo "roster: $CLIENTS account(s) starting at index $BASE (width $WIDTH) against $API"
 echo "  password source: $([ -n "$SEED" ] && echo 'HMAC-derived per account' || echo 'one shared LT_PASSWORD')"
 
-tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+tmp=$(mktemp); trap 'rm -f "$tmp" "${header_file:-}"' EXIT
 : > "$tmp"
 
 minted=0; registered=0; failed=0
@@ -141,7 +159,7 @@ for i in $(seq "$BASE" $((BASE + CLIENTS - 1))); do
   if [ -z "$token" ]; then
     # Unregistered is the expected first-run state, and `register` hands back a
     # session, so there is no second login to do.
-    reg=$(gql "$Q_REGISTER" "$vars")
+    reg=$(gql "$Q_REGISTER" "$vars" "${PROVISIONING_HEADER[@]}")
     token=$(printf '%s' "$reg" | jq -r '.data.register.token // empty')
     if [ -n "$token" ]; then
       registered=$((registered + 1))

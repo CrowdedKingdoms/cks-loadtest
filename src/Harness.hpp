@@ -37,6 +37,14 @@ public:
     std::string openRung(std::string id);
     nlohmann::json closeRung();
 
+    /// The app's replay logging as read at the end of the run: kept for `status` and the
+    /// summary, and written into the last rung file, which was written before it was known.
+    void recordReplayLoggingAtEnd(const std::string& atEnd);
+
+    /// Takes the end-of-run reading, once (stop() takes it if this was not called). Call it
+    /// while the control server still answers, so `status` and a multi-host merge carry it.
+    void observeEndOfRun();
+
     void requestShutdown();
     bool shuttingDown() const { return shutdown_.load(std::memory_order_relaxed); }
 
@@ -68,11 +76,22 @@ private:
     std::thread addThread_;
 
     mutable std::mutex mu_;
+    /// The app's replay logging as READ from the API, not as requested: at the start of the
+    /// run (after setting it, for on / off) and at its end. "unknown" when it could not be
+    /// read; the end is empty until the run has stopped.
+    std::string replayLoggingObserved_ = "unknown";
+    std::string replayLoggingAtEnd_;
+    /// The last rung file written, so the end reading can be added to it.
+    std::string lastRungId_;
+    nlohmann::json lastRungBody_;
+    /// Read it now, report it, and warn when it records under `leave`. Returns the label.
+    std::string observeReplayLogging(const char* when);
     int used_ = 0;
     bool busy_ = false;
     std::string addError_;
     std::atomic<bool> shutdown_{false};
     std::atomic<bool> started_{false};
+    std::atomic<bool> endObserved_{false};
     std::atomic<bool>* externalStop_ = nullptr;
 };
 

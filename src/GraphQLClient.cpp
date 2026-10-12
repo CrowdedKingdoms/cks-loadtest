@@ -36,7 +36,8 @@ GraphQLClient::~GraphQLClient() {
 
 nlohmann::json GraphQLClient::request(const std::string& query,
                                       const nlohmann::json& variables,
-                                      const std::string& bearer) {
+                                      const std::string& bearer,
+                                      const std::vector<std::string>& extraHeaders) {
     CURL* curl = static_cast<CURL*>(curl_);
     curl_easy_reset(curl);
 
@@ -50,6 +51,9 @@ nlohmann::json GraphQLClient::request(const std::string& query,
     if (!bearer.empty()) {
         authHeader = "Authorization: Bearer " + bearer;
         headers = curl_slist_append(headers, authHeader.c_str());
+    }
+    for (const auto& header : extraHeaders) {
+        headers = curl_slist_append(headers, header.c_str());
     }
 
     curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());

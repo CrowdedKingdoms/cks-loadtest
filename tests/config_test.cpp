@@ -57,6 +57,16 @@ int main() {
     c.controlToken = "secret";
     check(c.validate().empty(), "wildcard with token is ok");
 
+    // Replay logging: leave (the default) touches nothing; on and off set it; nothing else.
+    check(c.replayLogging == "leave", "replay logging defaults to leave");
+    for (const char* v : {"on", "off", "leave"}) {
+        c.replayLogging = v;
+        check(c.validate().empty(), "replay logging on/off/leave validate");
+    }
+    c.replayLogging = "true";
+    check(!c.validate().empty(), "replay logging refuses anything but on/off/leave");
+    c.replayLogging = "leave";
+
     // The orphan window is off by default (a lone client legitimately hears
     // nothing) and refuses a negative value; 30 is what the fleet ladder sets.
     check(c.rxSilentReassignSec == 0, "rx-silent reassign is off by default");

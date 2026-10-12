@@ -55,6 +55,10 @@ add_executable(stats_test tests/stats_test.cpp)
 target_link_libraries(stats_test PRIVATE loadtest_core)
 add_test(NAME stats_test COMMAND stats_test)
 
+add_executable(harness_rung_test tests/harness_rung_test.cpp)
+target_link_libraries(harness_rung_test PRIVATE loadtest_core)
+add_test(NAME harness_rung_test COMMAND harness_rung_test)
+
 add_executable(worker_add_test tests/worker_add_test.cpp)
 target_link_libraries(worker_add_test PRIVATE loadtest_core)
 add_test(NAME worker_add_test COMMAND worker_add_test)
