@@ -4,6 +4,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace lt {
 
@@ -36,11 +37,13 @@ public:
     GraphQLClient(const GraphQLClient&) = delete;
     GraphQLClient& operator=(const GraphQLClient&) = delete;
 
-    /// POST {query, variables}; optional `Authorization: Bearer <bearer>`.
-    /// Returns the `data` object. Throws GraphQLError on any failure.
+    /// POST {query, variables}; optional `Authorization: Bearer <bearer>` and
+    /// extra `Name: value` header lines. Returns the `data` object. Throws
+    /// GraphQLError on any failure.
     nlohmann::json request(const std::string& query,
                            const nlohmann::json& variables,
-                           const std::string& bearer = "");
+                           const std::string& bearer = "",
+                           const std::vector<std::string>& extraHeaders = {});
 
     const std::string& url() const { return url_; }
 

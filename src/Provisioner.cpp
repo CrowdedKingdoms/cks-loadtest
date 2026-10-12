@@ -60,6 +60,16 @@ query Assign {
 // mirrors this user's app entitlements into the game database and grants the
 // app's open-by-default grid access — without it Buddy rejects spatial
 // traffic with UNAUTHORIZED even for entitled users.
+constexpr const char* SET_REPLAY_LOGGING_MUTATION = R"(
+mutation SetReplayLogging($appId: BigInt!, $on: Boolean!) {
+  updateApp(appId: $appId, input: { replayLoggingEnabled: $on }) { appId replayLoggingEnabled }
+})";
+
+constexpr const char* READ_REPLAY_LOGGING_QUERY = R"(
+query ReplayLogging($appId: BigInt!) {
+  app(appId: $appId) { appId replayLoggingEnabled }
+})";
+
 constexpr const char* BOOTSTRAP_QUERY = R"(
 query Bootstrap($appId: BigInt!) {
   gameClientBootstrap(appId: $appId) { appId maxReplicationDistance }
@@ -70,11 +80,12 @@ query Bootstrap($appId: BigInt!) {
 nlohmann::json requestWithRetry(GraphQLClient& client, const std::string& query,
                                 const nlohmann::json& variables,
                                 const std::string& bearer,
-                                std::atomic<bool>* stop = nullptr) {
+                                std::atomic<bool>* stop = nullptr,
+                                const std::vector<std::string>& extraHeaders = {}) {
     int attempts = 0;
     for (;;) {
         try {
-            return client.request(query, variables, bearer);
+            return client.request(query, variables, bearer, extraHeaders);
         } catch (const GraphQLError& e) {
             if (!e.isTransport() || ++attempts >= 3 ||
                 (stop && stop->load())) {
@@ -244,9 +255,15 @@ std::string Provisioner::signIn(GraphQLClient& mgmt, const std::string& email) {
     }
 
     // 2. First run: register (a fresh password-only account gets a session
-    //    immediately, no email confirmation required).
+    //    immediately, no email confirmation required). Dev and test are
+    //    staff-only: there a new account needs the provisioning token.
+    std::vector<std::string> registerHeaders;
+    if (!config_.provisioningToken.empty()) {
+        registerHeaders.push_back("X-CK-Provisioning-Token: " + config_.provisioningToken);
+    }
     try {
-        auto data = requestWithRetry(mgmt, REGISTER_MUTATION, {{"input", creds}}, "");
+        auto data = requestWithRetry(mgmt, REGISTER_MUTATION, {{"input", creds}}, "",
+                                     nullptr, registerHeaders);
         return data["register"]["token"].get<std::string>();
     } catch (const GraphQLError& e) {
         if (e.isTransport()) throw;
@@ -269,6 +286,65 @@ std::string Provisioner::signIn(GraphQLClient& mgmt, const std::string& email) {
                 "LT_PASSWORD.",
             e.code(), false);
     }
+}
+
+void Provisioner::setReplayLogging(bool on) {
+    GraphQLClient mgmt(config_.managementApiUrl, config_.tlsInsecure);
+    std::string session;
+    try {
+        auto data = requestWithRetry(
+            mgmt, LOGIN_MUTATION,
+            {{"input", {{"email", config_.email}, {"password", config_.password}}}}, "");
+        session = data["login"]["token"].get<std::string>();
+    } catch (const GraphQLError& e) {
+        if (e.isTransport()) throw;
+        throw GraphQLError("cannot sign in as the base account '" + config_.email +
+                               "' to set replay logging (" + e.what() + ")",
+                           e.code(), false);
+    }
+    try {
+        auto data = requestWithRetry(
+            mgmt, SET_REPLAY_LOGGING_MUTATION,
+            {{"appId", std::to_string(config_.appId)}, {"on", on}}, session);
+        if (data["updateApp"]["replayLoggingEnabled"].get<bool>() != on) {
+            throw GraphQLError("updateApp answered replayLoggingEnabled=" +
+                                   std::string(on ? "false" : "true") + " after setting it " +
+                                   (on ? "on" : "off"),
+                               "", false);
+        }
+    } catch (const GraphQLError& e) {
+        if (e.isTransport()) throw;
+        std::string hint;
+        if (e.code() == "INPUT_LOG_FUNDS_NEEDED")
+            hint = ": fund the app's organization wallet, or run with LT_REPLAY_LOGGING=leave";
+        else if (e.code() == "FORBIDDEN" || e.code() == "SCOPE_MISSING")
+            hint = ": the base account needs manage_apps on the app";
+        throw GraphQLError(std::string("cannot set replay logging ") + (on ? "on" : "off") +
+                               " for app " + std::to_string(config_.appId) + " (" + e.what() +
+                               ")" + hint,
+                           e.code(), false);
+    }
+}
+
+std::optional<bool> Provisioner::readReplayLogging() {
+    GraphQLClient mgmt(config_.managementApiUrl, config_.tlsInsecure);
+    try {
+        auto login = requestWithRetry(
+            mgmt, LOGIN_MUTATION,
+            {{"input", {{"email", config_.email}, {"password", config_.password}}}}, "");
+        auto data = requestWithRetry(mgmt, READ_REPLAY_LOGGING_QUERY,
+                                     {{"appId", std::to_string(config_.appId)}},
+                                     login["login"]["token"].get<std::string>());
+        const auto& app = data["app"];
+        if (app.is_object() && app["replayLoggingEnabled"].is_boolean())
+            return app["replayLoggingEnabled"].get<bool>();
+        std::fprintf(stderr, "warning: app %lld answered no replayLoggingEnabled\n",
+                     static_cast<long long>(config_.appId));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "warning: cannot read app %lld's replay logging as '%s' (%s)\n",
+                     static_cast<long long>(config_.appId), config_.email.c_str(), e.what());
+    }
+    return std::nullopt;
 }
 
 void Provisioner::mintAppToken(GraphQLClient& mgmt, ClientCredentials& c) {

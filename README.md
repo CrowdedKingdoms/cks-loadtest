@@ -178,7 +178,10 @@ email pattern check applies to both kinds.
 
 Sessions last 30 days, so one roster serves many runs. `provision-roster.sh`
 uses only `login` and `register` — the public mutations any tenant can call —
-and needs no operator or infrastructure access. For a large population prefer
+and needs no operator or infrastructure access. **On dev and test**, which are
+staff-only, `register` also needs `LT_PROVISIONING_TOKEN`: a token an operator mints
+for the roster's email pattern (for example `cks-lt+*@loadtest.invalid`). The harness
+and the script send it on `register` only. For a large population prefer
 `LT_PASSWORD_HMAC_SEED` over a single shared `LT_PASSWORD`: passwords are then
 derived per account and recomputable without being stored.
 
@@ -385,6 +388,7 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 |---|---|---|
 | `--email` / `LT_EMAIL` | — | Base account email (required) |
 | `--password` / `LT_PASSWORD` | — | Password for base + derived accounts (min 8 chars). Prefer `LT_PASSWORD`: `--password` is visible in `ps(1)`. |
+| `LT_PROVISIONING_TOKEN` | — | Dev and test are staff-only: a NEW account there is refused unless `register` carries a provisioning token covering its address (sent as `X-CK-Provisioning-Token`; env only, never a flag). Existing accounts just `login`. Other tiers ignore it. |
 | `--management-api-url` / `LT_MANAGEMENT_API_URL` | — | CK GraphQL origin (required) |
 | `--app-id` / `LT_APP_ID` | — | App to load test (required; a per-deployment snowflake, no default) |
 | `--clients` / `LT_CLIENTS` | 10 | Clients provisioned at start (0 = wait for HTTP add) |
@@ -416,6 +420,7 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 | `--sparse-group` / `LT_SPARSE_GROUP` | 1 | Consecutive indices sharing one chunk in sparse mode (2 = one neighbour each, a latency sample per client). |
 | `--socket-rcvbuf-bytes` / `LT_SOCKET_RCVBUF_BYTES` | 0 (kernel default) | `SO_RCVBUF` per client socket. Dense ladders drain millions of notifications per second per host and overflow the default queue between two reads (`RcvbufErrors`); 8 MB absorbs the burst a busy thread leaves behind. Clamped by `net.core.rmem_max`; refusals are counted (`rcvbuf_set_failures`). |
 | `--client-caps` / `LT_CLIENT_CAPS` | on | Advertise `BUNDLE_SIGNED` (`CLIENT_CAPABILITIES`, Buddy v0.30.0) on every (re)assignment and every `LT_CAPS_INTERVAL_SEC` (15); the server then sends `MESSAGE_BUNDLE_SIGNED`, which is always verified (`rx_signed_bundles`, `rx_signed_members`, `tx_capabilities`; a failure counts in `rx_hmac_failures`). `off` = a pre-v0.30.0 client. |
+| `--replay-logging` / `LT_REPLAY_LOGGING` | `leave` | Set the app's replay logging before the run: `on` records every input the clients send (the input log, billed as stored input logs), `off` records none, `leave` touches nothing. Set once with the **base** account's session, which needs `manage_apps` on the app; turning it on is refused (`INPUT_LOG_FUNDS_NEEDED`) without a funded org wallet. It stays set after the run, so `leave` inherits what an earlier run left: the harness reads `App.replayLoggingEnabled` back at the start and at the end of every run, prints it, and warns when it is on under `leave`. Every rung file and `status` carry what was **observed** at the start of the run as `replay_logging` (`on` / `off`, `unknown` when the base account cannot read the app; `mixed` across hosts that disagree) and the request as `replay_logging_requested`, so an overhead ladder runs the same rungs once with `on` and once with `off` and compares them. A rung file is written when its rung closes, before the run ends, so it carries the **start** reading: the reading at the end, `replay_logging_at_end`, is taken when the run stops, before the control server does, so it is in `status` (and a multi-host merge) as well as the summary, which warns when the two readings differ (a toggle during the run), and it is written into the last rung's file. |
 | `--tls-insecure` / `LT_TLS_INSECURE` | off | Skip TLS verification (dev only) |
 | `--duration-sec 0` + `SIGINT`/`SIGTERM` | — | Graceful shutdown with final summary |
 

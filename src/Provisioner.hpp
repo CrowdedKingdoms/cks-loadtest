@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -82,6 +83,15 @@ public:
     /// Re-run serverWithLeastClients for this client's current token and
     /// update the assignment. Throws GraphQLError on failure.
     void assignServer(ClientCredentials& c);
+
+    /// Set the app's replay logging (App.replayLoggingEnabled) as the BASE account, which
+    /// must hold manage_apps on the app. Logs in only: it never registers the base account.
+    /// Throws GraphQLError with an actionable message when the API refuses.
+    void setReplayLogging(bool on);
+
+    /// The app's replay logging as the API reports it now (App.replayLoggingEnabled, read as the
+    /// BASE account). Empty, with a warning, when it cannot be read.
+    std::optional<bool> readReplayLogging();
 
     const Config& config() const { return config_; }
 
