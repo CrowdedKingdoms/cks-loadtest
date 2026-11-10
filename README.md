@@ -426,6 +426,12 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 
 ## Interpreting results
 
+- **A standing-still run is released after the app's idle timeout.** Since 2026-11-10 the
+  realtime servers end a session that sends no gameplay input for the app's idle timeout (15
+  minutes unless the app sets `idleTimeoutSeconds`), and an actor update that repeats an
+  unchanged state does not count. This client ignores the release, so a long run at walk speed 0,
+  or any run meant to measure idle clients, keeps sending into released sessions after 15 minutes.
+  Set the test app's `idleTimeoutSeconds` to 0 with `updateApp` first, and back afterwards.
 - **tx pps** should equal `clients x update-hz` once the ramp completes. If it
   lags, the load generator host is saturated — add threads, or add hosts and
   partition `LT_INDEX_BASE` (see Progressive fleet).
