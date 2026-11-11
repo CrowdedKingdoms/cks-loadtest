@@ -132,8 +132,12 @@ visible and moving, dots distributed, no straight line.
   `grantAppAccess` (run `cks-loadtest` once first so the accounts exist).
 - **Email note.** Registration sends one confirmation email per new account.
   With the default plus-addressing pattern they all land in the `LT_EMAIL`
-  inbox on the first run. Confirmation is *not* required for the load test to
-  run.
+  inbox on the first run. On dev and test, where the accounts register with the
+  provisioning token, confirmation is *not* required. Elsewhere, since ck-api
+  v2.65.0 (2026-11-11), a password account made from that date gets no app
+  token until it confirms its email: `mintAppToken` answers
+  `EMAIL_CONFIRMATION_REQUIRED`. Run there with accounts made earlier, or open
+  the links in the `LT_EMAIL` inbox first.
 - **The organization owning the app must be funded, or exempt from billing.**
   This is a precondition, not a step the harness performs, and it is worth
   stating plainly because an unfunded org does not fail cleanly — usage is

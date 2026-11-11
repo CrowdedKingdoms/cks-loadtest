@@ -255,8 +255,9 @@ std::string Provisioner::signIn(GraphQLClient& mgmt, const std::string& email) {
     }
 
     // 2. First run: register (a fresh password-only account gets a session
-    //    immediately, no email confirmation required). Dev and test are
-    //    staff-only: there a new account needs the provisioning token.
+    //    immediately). Dev and test are staff-only: there a new account needs
+    //    the provisioning token, which also spares it the email confirmation
+    //    that ck-api v2.65.0 asks of a new account before its first app token.
     std::vector<std::string> registerHeaders;
     if (!config_.provisioningToken.empty()) {
         registerHeaders.push_back("X-CK-Provisioning-Token: " + config_.provisioningToken);
