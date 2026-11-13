@@ -12,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import {
   writeSeamPose,
   seamTargetForIndex,
+  nearSeam,
+  looksLikeWorldSpawn,
   formatErrorDetail,
   isTransientNetworkError,
 } from "./seam-pose.mjs";
@@ -24,9 +26,22 @@ function env(name, fallback = "") {
 
 const SEAM_POSE_ATTEMPTS = Math.max(1, Number(env("LT_SEAM_POSE_ATTEMPTS", "3")));
 const SEAM_POSE_RETRY_MS = Math.max(0, Number(env("LT_SEAM_POSE_RETRY_MS", "1500")));
+/** Pause after a successful hub Pos write before starting the JVM (lets claim/save settle). */
+const SEAM_POSE_SETTLE_MS = Math.max(0, Number(env("LT_SEAM_POSE_SETTLE_MS", "750")));
+/**
+ * How long the walker must stay off-seam after first `phase=play` before we call it a
+ * spawn-miss (Load6-8: hub Pos wrote OK, in-game stayed at world spawn with lane/block).
+ */
+const PLACEMENT_CONFIRM_MS = Math.max(500, Number(env("LT_PLACEMENT_CONFIRM_MS", "3000")));
 
 function ts() {
   return new Date().toISOString();
+}
+
+function seamPoseBackoffMs(attempt) {
+  // attempt 1 → base, 2 → 2x, 3 → 4x (capped)
+  const mult = 2 ** Math.max(0, attempt - 1);
+  return Math.min(SEAM_POSE_RETRY_MS * mult, 15_000);
 }
 
 async function writeSeamPoseWithRetries(name, index, opts = {}) {
@@ -34,12 +49,17 @@ async function writeSeamPoseWithRetries(name, index, opts = {}) {
   for (let attempt = 1; attempt <= SEAM_POSE_ATTEMPTS; attempt++) {
     try {
       if (attempt > 1) {
+        const wait = seamPoseBackoffMs(attempt - 1);
         console.error(
-          `${ts()} mc-harness: seam pose retry ${attempt}/${SEAM_POSE_ATTEMPTS} for ${name} after ${SEAM_POSE_RETRY_MS}ms`,
+          `${ts()} mc-harness: seam pose retry ${attempt}/${SEAM_POSE_ATTEMPTS} for ${name} after ${wait}ms backoff`,
         );
-        await new Promise((r) => setTimeout(r, SEAM_POSE_RETRY_MS));
+        await new Promise((r) => setTimeout(r, wait));
       }
-      return await writeSeamPose(name, index, opts);
+      const result = await writeSeamPose(name, index, opts);
+      if (SEAM_POSE_SETTLE_MS > 0) {
+        await new Promise((r) => setTimeout(r, SEAM_POSE_SETTLE_MS));
+      }
+      return result;
     } catch (e) {
       lastErr = e;
       const detail = formatErrorDetail(e, {
@@ -48,9 +68,15 @@ async function writeSeamPoseWithRetries(name, index, opts = {}) {
         attempts: SEAM_POSE_ATTEMPTS,
         url: process.env.CROWDY_API_ORIGIN || "(default ck.test)",
       });
-      const retry = attempt < SEAM_POSE_ATTEMPTS && isTransientNetworkError(e);
+      // Retry any write failure (network, Pos did not stick, claim/save races) with backoff.
+      const retry = attempt < SEAM_POSE_ATTEMPTS;
+      const kind = isTransientNetworkError(e)
+        ? "transient"
+        : /Pos did not stick/i.test(String(e?.message || e))
+          ? "pos-not-stuck"
+          : "error";
       console.error(
-        `${ts()} mc-harness: seam pose failed for ${name}: ${detail}${retry ? " (will retry)" : ""}`,
+        `${ts()} mc-harness: seam pose failed for ${name} (${kind}): ${detail}${retry ? " (will retry)" : ""}`,
       );
       if (!retry) break;
     }
@@ -261,6 +287,13 @@ function spawnWalker(globalIndex, endpoint) {
   });
   fs.closeSync(logFd);
 
+  let logMark = 0;
+  try {
+    logMark = fs.statSync(logPath).size;
+  } catch {
+    logMark = 0;
+  }
+
   const state = {
     proc,
     name,
@@ -268,6 +301,8 @@ function spawnWalker(globalIndex, endpoint) {
     host,
     port,
     logPath,
+    /** Byte offset when this spawn started — ignore prior sessions in the append-only log. */
+    logMark,
     transfers: 0,
     east: 0,
     west: 0,
@@ -303,12 +338,7 @@ function spawnWalker(globalIndex, endpoint) {
       }
     }
   };
-  let pos = 0;
-  try {
-    pos = fs.statSync(logPath).size;
-  } catch {
-    pos = 0;
-  }
+  let pos = logMark;
   const watch = setInterval(() => {
     try {
       const st = fs.statSync(logPath);
@@ -339,21 +369,53 @@ function spawnWalker(globalIndex, endpoint) {
   return state;
 }
 
+/** Session-only slice of the append-only walker log (bytes after this spawn's logMark). */
+function readSessionLog(state, globalIndex) {
+  const logPath = state?.logPath || walkerLogPath(botName(globalIndex));
+  try {
+    const fd = fs.openSync(logPath, "r");
+    try {
+      const st = fs.fstatSync(fd);
+      const start = Math.min(state?.logMark ?? 0, st.size);
+      const len = st.size - start;
+      if (len <= 0) return "";
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      return buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+/** Last `phase=play … x= y= z=` from LoadWalker stdout. */
+function parseLatestPlayPose(logText) {
+  const re =
+    /phase=play\b[^\n]*\bx=([-\d.]+)\s+y=([-\d.]+)\s+z=([-\d.]+)/g;
+  let m;
+  let last = null;
+  while ((m = re.exec(logText)) !== null) {
+    last = { x: Number(m[1]), y: Number(m[2]), z: Number(m[3]) };
+  }
+  return last;
+}
+
 /**
  * Watch a freshly spawned walker. Early death (esp. TRANSFER FAILURE) is retriable.
- * Resolves { ok:true } if still alive after the window, else { ok:false, transferTo?, reason }.
+ * Also fails when the bot is alive but stranded at world spawn (pose write did not stick
+ * in-game) — that used to be counted as "stable" and left Load6-8 invisible at the seam.
+ * Resolves { ok:true } if still alive near the seam after the window, else
+ * { ok:false, transferTo?, reason, pos? }.
  */
-async function waitEarlyOutcome(globalIndex, timeoutMs) {
+async function waitEarlyOutcome(globalIndex, timeoutMs, target) {
   const deadline = Date.now() + timeoutMs;
+  let offSeamSince = 0;
   while (Date.now() < deadline) {
     const state = clients.get(globalIndex);
     if (!state || !state.alive) {
-      let text = "";
-      try {
-        text = fs.readFileSync(state?.logPath || walkerLogPath(botName(globalIndex)), "utf8");
-      } catch {
-        /* ignore */
-      }
+      const text = readSessionLog(state, globalIndex);
       const dest = parseTransferDest(text);
       return {
         ok: false,
@@ -361,16 +423,43 @@ async function waitEarlyOutcome(globalIndex, timeoutMs) {
         transferTo: dest,
       };
     }
+
+    const text = readSessionLog(state, globalIndex);
+    const pose = parseLatestPlayPose(text);
+    if (pose && target) {
+      if (nearSeam(pose, target)) {
+        offSeamSince = 0;
+      } else {
+        const stranded =
+          looksLikeWorldSpawn(pose) ||
+          /\bblocked at\b/i.test(text) ||
+          /\blane\b/i.test(text);
+        if (!offSeamSince) offSeamSince = Date.now();
+        const held = Date.now() - offSeamSince;
+        // Fast-path: clearly at spawn / lane-blocked. Else wait PLACEMENT_CONFIRM_MS.
+        if (stranded || held >= PLACEMENT_CONFIRM_MS) {
+          return {
+            ok: false,
+            reason: "spawn-miss",
+            pos: pose,
+          };
+        }
+      }
+    }
+
     await sleep(400);
   }
   const state = clients.get(globalIndex);
-  if (state?.alive) return { ok: true };
-  let text = "";
-  try {
-    text = fs.readFileSync(state?.logPath || walkerLogPath(botName(globalIndex)), "utf8");
-  } catch {
-    /* ignore */
+  if (state?.alive) {
+    // Still alive: require near-seam placement when we have a pose sample.
+    const text = readSessionLog(state, globalIndex);
+    const pose = parseLatestPlayPose(text);
+    if (pose && target && !nearSeam(pose, target)) {
+      return { ok: false, reason: "spawn-miss", pos: pose };
+    }
+    return { ok: true, pos: pose || undefined };
   }
+  const text = readSessionLog(state, globalIndex);
   const dest = parseTransferDest(text);
   return {
     ok: false,
@@ -382,35 +471,51 @@ async function waitEarlyOutcome(globalIndex, timeoutMs) {
 /**
  * Pose + spawn one index with retries. Transfer-to-west (east join "belongs on west")
  * is retried against the transfer destination rather than stalling the ramp.
+ * Spawn-miss (hub pose wrote but in-game still at world spawn) rewrites the pose with
+ * backoff and respawns — does not silently leave the bot stranded.
  */
 async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
   const name = botName(globalIndex);
   let endpoint = { ...initialEndpoint };
   let lastReason = "unknown";
   const maxAttempts = ADD_RETRIES + 1;
+  const target = seamTargetForIndex(globalIndex);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     stopWalker(globalIndex);
     await sleep(300);
 
-    const target = seamTargetForIndex(globalIndex);
+    if (attempt > 1) {
+      const wait = seamPoseBackoffMs(attempt - 1);
+      console.error(
+        `${ts()} mc-harness: ${name} pre-spawn backoff ${wait}ms before pose rewrite (attempt ${attempt}/${maxAttempts})`,
+      );
+      await sleep(wait);
+    }
+
     console.log(
       `${ts()} mc-harness: seam pose ${name} attempt=${attempt}/${maxAttempts} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
     );
     await writeSeamPoseWithRetries(name, globalIndex, { server: endpoint.ckServer });
     spawnWalker(globalIndex, endpoint);
 
-    const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS);
+    const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS, target);
     if (outcome.ok) {
       console.log(
-        `${ts()} mc-harness: ${name} stable on ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
+        `${ts()} mc-harness: ${name} stable on ${endpoint.side} ${endpoint.host}:${endpoint.port}` +
+          (outcome.pos
+            ? ` at ${outcome.pos.x.toFixed(1)},${outcome.pos.y.toFixed(1)},${outcome.pos.z.toFixed(1)}`
+            : ""),
       );
       return { ok: true, endpoint };
     }
 
     lastReason = outcome.reason || "early-exit";
+    const posNote = outcome.pos
+      ? ` pos=${outcome.pos.x.toFixed(1)},${outcome.pos.y.toFixed(1)},${outcome.pos.z.toFixed(1)} (want ~${target.x},${target.y},${target.z})`
+      : "";
     console.error(
-      `${ts()} mc-harness: ${name} early failure reason=${lastReason} attempt=${attempt}/${maxAttempts}`,
+      `${ts()} mc-harness: ${name} early failure reason=${lastReason} attempt=${attempt}/${maxAttempts}${posNote}`,
     );
 
     if (attempt >= maxAttempts) break;
@@ -424,6 +529,21 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
         `${ts()} mc-harness: ${name} transfer failure → retry on ${redirected.side} ${redirected.host}:${redirected.port} (retriable add)`,
       );
       endpoint = redirected;
+    } else if (lastReason === "spawn-miss") {
+      // Pose did not stick in-game: kill, rewrite hub Pos with backoff, try again.
+      // Prefer west for a seam rewrite when the miss was on east (east join often
+      // transfer-bounces; west is the seam-side home for these load bots).
+      if (endpoint.side === "east" && (MC_HOST_WEST || MC_HOST)) {
+        const west = endpointForIndex(0); // even → west shape
+        console.error(
+          `${ts()} mc-harness: ${name} spawn-miss → rewrite pose and retry on west ${west.host}:${west.port}`,
+        );
+        endpoint = west;
+      } else {
+        console.error(
+          `${ts()} mc-harness: ${name} spawn-miss → rewrite pose and retry on ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
+        );
+      }
     } else {
       console.error(
         `${ts()} mc-harness: ${name} retrying same endpoint ${endpoint.side} ${endpoint.host}:${endpoint.port}`,

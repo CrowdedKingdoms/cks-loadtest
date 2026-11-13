@@ -28,8 +28,12 @@ export LT_MC_HOST_WEST=40.160.15.239
 export LT_MC_HOST_EAST=40.160.99.136    # odd indices 1,3,5…; enables alternation
 export LT_MC_PORT=25565                 # or LT_MC_PORT_WEST / LT_MC_PORT_EAST
 export LT_LOGIN_STAGGER_MS=5000         # delay between each bot pose+login (default 5s)
-export LT_EARLY_STABLE_MS=20000         # watch window; early exit/transfer → retry
+export LT_EARLY_STABLE_MS=20000         # watch window; early exit/transfer/spawn-miss → retry
 export LT_ADD_RETRIES=2                 # extra attempts per slot after first
+export LT_SEAM_POSE_ATTEMPTS=3          # hub Pos write attempts (backoff between)
+export LT_SEAM_POSE_RETRY_MS=1500       # base backoff for pose rewrite (doubles each try)
+export LT_SEAM_POSE_SETTLE_MS=750       # pause after successful hub Pos before JVM start
+export LT_PLACEMENT_CONFIRM_MS=3000     # off-seam play time before spawn-miss retry
 # Optional: LT_MC_ALTERNATE=0 to force west-only even when EAST is set
 export LT_MC_DIST=/opt/ck-mc-loadwalker # loadwalker-dist tree
 export LT_INDEX_BASE=0
@@ -56,9 +60,13 @@ locked east/west seam choreography toward/past each other.
 
 If a bot dies in the early window (e.g. east join gets `ClientboundTransferPacket`
 because the cluster says they belong on west), the harness **retries that slot**
-(up to `LT_ADD_RETRIES`) and redirects to the transfer destination. A permanent
-failure advances to the next index so the ramp does not deadlock waiting for
-`active` to recover.
+(up to `LT_ADD_RETRIES`) and redirects to the transfer destination. If the hub
+Pos write succeeds but the walker stays at **world spawn** (far from the seam,
+often with `blocked` / `lane` in the log — the Load6–8 failure mode), that is a
+**spawn-miss**: the harness kills the JVM, rewrites the seam pose with backoff,
+and retries (preferring west after an east miss). A permanent failure advances
+to the next index so the ramp does not deadlock waiting for `active` to recover,
+and does **not** leave a stranded spawn bot counted as stable.
 
 ## Metrics
 

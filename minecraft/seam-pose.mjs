@@ -195,6 +195,33 @@ export function seamTargetForIndex(index) {
 }
 
 /**
+ * In-game placement check for LoadWalker logs. Seam walk band is ~1986–2013;
+ * world-spawn stranding is near (0, ~100, 0) — hundreds of blocks away.
+ * @param {{ x: number, y: number, z: number } | null | undefined} pos
+ * @param {{ x: number, y: number, z: number }} target
+ * @param {{ maxHoriz?: number, maxY?: number }} [opts]
+ */
+export function nearSeam(pos, target, opts = {}) {
+  if (!pos || !target) return false;
+  const maxHoriz = opts.maxHoriz ?? 80;
+  const maxY = opts.maxY ?? 25;
+  const dx = Number(pos.x) - Number(target.x);
+  const dz = Number(pos.z) - Number(target.z);
+  const dy = Number(pos.y) - Number(target.y);
+  return Math.hypot(dx, dz) <= maxHoriz && Math.abs(dy) <= maxY;
+}
+
+/** True when the bot looks stuck at overworld spawn instead of the seam. */
+export function looksLikeWorldSpawn(pos) {
+  if (!pos) return false;
+  const x = Number(pos.x);
+  const y = Number(pos.y);
+  const z = Number(pos.z);
+  // Spawn island / default join: |x|,|z| small; y often rooftop ~100+, not walkY 63.
+  return Math.abs(x) < 64 && Math.abs(z) < 64 && (y < 50 || y > 80 || Math.hypot(x, z) < 48);
+}
+
+/**
  * Overwrite the bot's CK hub Pos to the seam so the next Fabric join places them there
  * (even if a prior leave saved world-spawn coords).
  * @param {string} name
