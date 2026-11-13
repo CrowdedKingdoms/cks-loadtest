@@ -195,13 +195,16 @@ export function seamTargetForIndex(index) {
 }
 
 /**
- * Overwrite the bot's CK hub Pos to the west seam so the next Fabric join places them there
+ * Overwrite the bot's CK hub Pos to the seam so the next Fabric join places them there
  * (even if a prior leave saved world-spawn coords).
+ * @param {string} name
+ * @param {number} index
+ * @param {{ server?: string }} [opts] — Fabric server id for claim/save (`west` / `east`).
  */
-export async function writeSeamPose(name, index) {
+export async function writeSeamPose(name, index, opts = {}) {
   const origin = process.env.CROWDY_API_ORIGIN || DEFAULT_ORIGIN;
   const appId = process.env.CROWDY_APP_ID || DEFAULT_APP_ID;
-  const serverId = process.env.CROWDY_MC_SERVER || DEFAULT_SERVER;
+  const serverId = opts.server || process.env.CROWDY_MC_SERVER || DEFAULT_SERVER;
   const orgToken = mustEnv("CROWDY_ORG_TOKEN");
   const pepper = mustEnv("CROWDY_ID_PEPPER");
   const clusterSecret = mustEnv("CROWDY_CLUSTER_SECRET");

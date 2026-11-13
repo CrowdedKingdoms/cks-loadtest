@@ -29,7 +29,7 @@ function ts() {
   return new Date().toISOString();
 }
 
-async function writeSeamPoseWithRetries(name, index) {
+async function writeSeamPoseWithRetries(name, index, opts = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= SEAM_POSE_ATTEMPTS; attempt++) {
     try {
@@ -39,7 +39,7 @@ async function writeSeamPoseWithRetries(name, index) {
         );
         await new Promise((r) => setTimeout(r, SEAM_POSE_RETRY_MS));
       }
-      return await writeSeamPose(name, index);
+      return await writeSeamPose(name, index, opts);
     } catch (e) {
       lastErr = e;
       const detail = formatErrorDetail(e, {
@@ -69,8 +69,20 @@ function requireEnv(name) {
 
 const CONTROL_BIND = env("LT_CONTROL_BIND", "127.0.0.1:9109");
 const CONTROL_TOKEN = env("LT_CONTROL_TOKEN", "");
-const MC_HOST = requireEnv("LT_MC_HOST");
+/** Single-host fallback (west). Prefer LT_MC_HOST_WEST / LT_MC_HOST_EAST when alternating. */
+const MC_HOST = env("LT_MC_HOST", "");
 const MC_PORT = env("LT_MC_PORT", "25565");
+const MC_HOST_WEST = env("LT_MC_HOST_WEST", MC_HOST);
+const MC_HOST_EAST = env("LT_MC_HOST_EAST", "");
+const MC_PORT_WEST = env("LT_MC_PORT_WEST", MC_PORT);
+const MC_PORT_EAST = env("LT_MC_PORT_EAST", MC_PORT);
+/** When east host is set, even global indices → west, odd → east (same seam Pos). */
+const MC_ALTERNATE =
+  env("LT_MC_ALTERNATE", "") === "1" ||
+  env("LT_MC_ALTERNATE", "").toLowerCase() === "true" ||
+  (MC_HOST_EAST !== "" && env("LT_MC_ALTERNATE", "auto") !== "0");
+/** Delay after each bot's spawn before the next pose+login (ms). Default 5s. */
+const LOGIN_STAGGER_MS = Math.max(0, Number(env("LT_LOGIN_STAGGER_MS", "5000")));
 const MC_DIST = requireEnv("LT_MC_DIST");
 const INDEX_BASE = Number(env("LT_INDEX_BASE", "0"));
 const INDEX_LIMIT = Number(env("LT_INDEX_LIMIT", "8"));
@@ -79,6 +91,43 @@ const STATS_DIR = env("LT_STATS_DIR", "");
 const NAME_PREFIX = env("LT_MC_NAME_PREFIX", "Load");
 const JAVA = env("LT_MC_JAVA", "java");
 const START_CLIENTS = Number(env("LT_CLIENTS", "0"));
+
+if (!MC_HOST_WEST && !MC_HOST) {
+  console.error("mc-harness: LT_MC_HOST or LT_MC_HOST_WEST is required");
+  process.exit(2);
+}
+if (MC_ALTERNATE && !MC_HOST_EAST) {
+  console.error("mc-harness: LT_MC_ALTERNATE needs LT_MC_HOST_EAST");
+  process.exit(2);
+}
+
+/** @returns {{ side: string, host: string, port: number, ckServer: string }} */
+function endpointForIndex(globalIndex) {
+  const westHost = MC_HOST_WEST || MC_HOST;
+  if (!MC_ALTERNATE || !MC_HOST_EAST) {
+    return {
+      side: "west",
+      host: westHost,
+      port: Number(MC_PORT_WEST || MC_PORT),
+      ckServer: "west",
+    };
+  }
+  // even → west, odd → east
+  if ((globalIndex & 1) === 1) {
+    return {
+      side: "east",
+      host: MC_HOST_EAST,
+      port: Number(MC_PORT_EAST || MC_PORT),
+      ckServer: "east",
+    };
+  }
+  return {
+    side: "west",
+    host: westHost,
+    port: Number(MC_PORT_WEST || MC_PORT),
+    ckServer: "west",
+  };
+}
 
 if (CONTROL_BIND !== "off") {
   const host = CONTROL_BIND.split(":")[0];
@@ -94,7 +143,7 @@ if (!fs.existsSync(runSh)) {
   process.exit(2);
 }
 
-/** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, transfers: number, east: number, west: number, alive: boolean }>} */
+/** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, side: string, host: string, port: number, transfers: number, east: number, west: number, alive: boolean }>} */
 const clients = new Map();
 let used = 0;
 let busy = false;
@@ -148,13 +197,14 @@ function json(res, code, body) {
   res.end(data);
 }
 
-function spawnWalker(globalIndex) {
+function spawnWalker(globalIndex, endpoint) {
   const name = botName(globalIndex);
+  const { host, port, side } = endpoint;
   const logDir = STATS_DIR ? path.join(STATS_DIR, "walkers") : path.join(os.tmpdir(), "ck-mc-walkers");
   fs.mkdirSync(logDir, { recursive: true });
   const logPath = path.join(logDir, `${name}.log`);
   const logFd = fs.openSync(logPath, "a");
-  const proc = spawn(runSh, [name, MC_HOST, String(MC_PORT)], {
+  const proc = spawn(runSh, [name, host, String(port)], {
     cwd: MC_DIST,
     env: process.env,
     stdio: ["ignore", logFd, logFd],
@@ -162,7 +212,7 @@ function spawnWalker(globalIndex) {
   });
   fs.closeSync(logFd);
 
-  const state = { proc, name, transfers: 0, east: 0, west: 0, alive: true };
+  const state = { proc, name, side, host, port, transfers: 0, east: 0, west: 0, alive: true };
   clients.set(globalIndex, state);
   lifetime.starts++;
 
@@ -224,7 +274,9 @@ function spawnWalker(globalIndex) {
   });
 
   stream.destroy();
-  console.log(`mc-harness: started ${name} -> ${MC_HOST}:${MC_PORT} log=${logPath}`);
+  console.log(
+    `${ts()} mc-harness: started ${name} -> ${side} ${host}:${port} log=${logPath}`,
+  );
   return state;
 }
 
@@ -237,20 +289,28 @@ function requestAdd(count) {
   busy = true;
   addError = "";
   // Pose must land in CK before the JVM joins — every add, so a prior leave that
-  // saved world-spawn Pos cannot stick into the next start.
+  // saved world-spawn Pos cannot stick into the next start. Logins are staggered
+  // one-at-a-time so west/east player-lists are not burst-filled.
   setImmediate(() => {
     (async () => {
       try {
         for (let i = 0; i < count; i++) {
           const gi = INDEX_BASE + used;
           const name = botName(gi);
+          const endpoint = endpointForIndex(gi);
           const target = seamTargetForIndex(gi);
           console.log(
-            `${ts()} mc-harness: seam pose ${name} -> ${target.x},${target.y},${target.z}`,
+            `${ts()} mc-harness: seam pose ${name} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
           );
-          await writeSeamPoseWithRetries(name, gi);
-          spawnWalker(gi);
+          await writeSeamPoseWithRetries(name, gi, { server: endpoint.ckServer });
+          spawnWalker(gi, endpoint);
           used++;
+          if (i + 1 < count && LOGIN_STAGGER_MS > 0) {
+            console.log(
+              `${ts()} mc-harness: login stagger ${LOGIN_STAGGER_MS}ms before next bot`,
+            );
+            await new Promise((r) => setTimeout(r, LOGIN_STAGGER_MS));
+          }
         }
       } catch (e) {
         const detail = formatErrorDetail(e, {
@@ -281,7 +341,11 @@ function statusJson() {
     add_error: addError || undefined,
     current_rung: currentRung,
     mode: "minecraft-loadwalker",
-    mc_host: MC_HOST,
+    mc_host: MC_HOST_WEST || MC_HOST,
+    mc_host_west: MC_HOST_WEST || MC_HOST || undefined,
+    mc_host_east: MC_HOST_EAST || undefined,
+    mc_alternate: MC_ALTERNATE,
+    login_stagger_ms: LOGIN_STAGGER_MS,
     mc_port: Number(MC_PORT),
   };
 }

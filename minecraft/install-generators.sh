@@ -82,9 +82,10 @@ LT_CONTROL_BIND=$ip:$PORT
 LT_CONTROL_TOKEN=$TOKEN
 LT_MC_DIST=/opt/ck-mc-loadwalker
 LT_STATS_DIR=/var/lib/ck-mc-lt/stats
+# LT_MC_HOST / LT_MC_HOST_WEST / LT_MC_HOST_EAST / LT_LOGIN_STAGGER_MS come from $RUN/lt.env
 EOF
   } > "$env_file"
-  # CROWDY_* for seam-pose on every /v1/clients/add must already be in $RUN/lt.env
+  # CROWDY_* and LT_MC_HOST_* for seam-pose + west/east alternation must already be in $RUN/lt.env
   cat "$env_file" | tailscale ssh "ubuntu@$ip" -- 'cat > /opt/ck-mc-harness/lt.env && chmod 600 /opt/ck-mc-harness/lt.env'
   rm -f "$env_file"
   unit="$(mktemp)"

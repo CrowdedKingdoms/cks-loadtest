@@ -23,15 +23,19 @@ That choreography lives in CrowdedKingdoms `cks-minecraft-mod` as
 ```bash
 export LT_CONTROL_BIND=100.x.y.z:9109   # tailnet address, never 0.0.0.0 without token
 export LT_CONTROL_TOKEN=...
-export LT_MC_HOST=40.160.15.239         # west Fabric game VM
-export LT_MC_PORT=25565
+# West (even indices 0,2,4…). LT_MC_HOST alone still works as west-only.
+export LT_MC_HOST_WEST=40.160.15.239
+export LT_MC_HOST_EAST=40.160.99.136    # odd indices 1,3,5…; enables alternation
+export LT_MC_PORT=25565                 # or LT_MC_PORT_WEST / LT_MC_PORT_EAST
+export LT_LOGIN_STAGGER_MS=5000         # delay between each bot pose+login (default 5s)
+# Optional: LT_MC_ALTERNATE=0 to force west-only even when EAST is set
 export LT_MC_DIST=/opt/ck-mc-loadwalker # loadwalker-dist tree
 export LT_INDEX_BASE=0
 export LT_INDEX_LIMIT=8
 export LT_CLIENTS=0                     # wait for /v1/clients/add
 export LT_STATS_DIR=/var/lib/ck-mc-lt/stats
 export LT_INSTANCE_ID=test-mc-loadgen-1
-# Required so every /v1/clients/add writes the bot's CK hub Pos to the west seam
+# Required so every /v1/clients/add writes the bot's CK hub Pos to the seam
 # before LoadWalker starts (otherwise Fabric places them at world spawn):
 export CROWDY_ORG_TOKEN=...
 export CROWDY_ID_PEPPER=...
@@ -41,8 +45,12 @@ cd minecraft && npm install && cd ..
 node minecraft/mc-harness.mjs
 ```
 
-Drive with the existing `cks-loadtest-ctl` against `hosts.txt`. Each add calls
-`seam-pose.mjs` so a previous leave that saved spawn coords cannot stick.
+Drive with the existing `cks-loadtest-ctl` against `hosts.txt`. Each add:
+poses the bot at the **same seam** (`seamTargetForIndex`), claims/saves on the
+side it will join (`west` or `east`), then starts one LoadWalker against that
+Fabric host. Bots are started **one at a time** with `LT_LOGIN_STAGGER_MS`
+between them. Even global indices join west; odd join east — both walk the
+locked east/west seam choreography toward/past each other.
 
 ## Metrics
 
