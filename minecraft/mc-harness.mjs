@@ -173,8 +173,10 @@ if (!fs.existsSync(runSh)) {
   process.exit(2);
 }
 
-/** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, side: string, host: string, port: number, transfers: number, east: number, west: number, alive: boolean }>} */
+/** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, side: string, host: string, port: number, transfers: number, east: number, west: number, alive: boolean, stable?: boolean, suppressExitRetry?: boolean, endpoint?: { side: string, host: string, port: number, ckServer: string } }>} */
 const clients = new Map();
+/** Indices currently in a post-stable transfer respawn (avoid double-schedule). */
+const postStableRetrying = new Set();
 let used = 0;
 let busy = false;
 let addError = "";
@@ -267,6 +269,8 @@ function endpointFromHostPort(host, port) {
 function stopWalker(globalIndex) {
   const state = clients.get(globalIndex);
   if (!state) return;
+  // Harness-initiated kills must not trigger post-stable transfer retries.
+  state.suppressExitRetry = true;
   try {
     if (state.alive) state.proc.kill("SIGTERM");
   } catch {
@@ -307,6 +311,11 @@ function spawnWalker(globalIndex, endpoint) {
     east: 0,
     west: 0,
     alive: true,
+    /** Set true after the early-stable window passes near the seam. */
+    stable: false,
+    /** When true, exit handler must not schedule a post-stable transfer retry. */
+    suppressExitRetry: false,
+    endpoint: { ...endpoint },
     earlyExitReason: "",
   };
   clients.set(globalIndex, state);
@@ -361,12 +370,62 @@ function spawnWalker(globalIndex, endpoint) {
     state.alive = false;
     lifetime.exits++;
     console.error(`mc-harness: ${name} exited code=${code} signal=${signal}`);
+    maybeSchedulePostStableTransferRetry(globalIndex, state);
   });
 
   console.log(
     `${ts()} mc-harness: started ${name} -> ${side} ${host}:${port} log=${logPath}`,
   );
   return state;
+}
+
+/**
+ * After a bot has passed the early-stable window, a ClientboundTransferPacket still
+ * kills LoadWalker (same-TCP choreography). Retry that slot with the same backoff /
+ * attempt budget as early transfer failures — do not leave active permanently down.
+ */
+function maybeSchedulePostStableTransferRetry(globalIndex, state) {
+  if (!state || state.suppressExitRetry || !state.stable) return;
+  if (postStableRetrying.has(globalIndex)) return;
+
+  const text = readSessionLog(state, globalIndex);
+  const dest = parseTransferDest(text);
+  const isTransfer = Boolean(dest) || state.earlyExitReason === "transfer";
+  if (!isTransfer) return; // max-runtime / other clean exits — do not respawn
+
+  const name = botName(globalIndex);
+  let endpoint = state.endpoint ? { ...state.endpoint } : endpointForIndex(globalIndex);
+  if (dest) {
+    endpoint = endpointFromHostPort(dest.host, dest.port);
+  }
+
+  postStableRetrying.add(globalIndex);
+  console.error(
+    `${ts()} mc-harness: ${name} post-stable transfer death → retry on ${endpoint.side} ${endpoint.host}:${endpoint.port} (up to ${ADD_RETRIES + 1} attempts)`,
+  );
+
+  setImmediate(() => {
+    (async () => {
+      try {
+        const result = await spawnSlotWithRetries(globalIndex, endpoint);
+        if (result.ok) {
+          console.log(
+            `${ts()} mc-harness: ${name} post-stable transfer retry recovered on ${result.endpoint.side}`,
+          );
+        } else {
+          console.error(
+            `${ts()} mc-harness: ${name} post-stable transfer retry gave up (${result.reason})`,
+          );
+        }
+      } catch (e) {
+        console.error(
+          `${ts()} mc-harness: ${name} post-stable transfer retry error: ${formatErrorDetail(e, { op: "post-stable-transfer-retry" })}`,
+        );
+      } finally {
+        postStableRetrying.delete(globalIndex);
+      }
+    })();
+  });
 }
 
 /** Session-only slice of the append-only walker log (bytes after this spawn's logMark). */
@@ -501,6 +560,12 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
 
     const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS, target);
     if (outcome.ok) {
+      const live = clients.get(globalIndex);
+      if (live) {
+        live.stable = true;
+        live.suppressExitRetry = false;
+        live.endpoint = { ...endpoint };
+      }
       console.log(
         `${ts()} mc-harness: ${name} stable on ${endpoint.side} ${endpoint.host}:${endpoint.port}` +
           (outcome.pos
