@@ -82,7 +82,67 @@ respawned.
 - `east_pauses` / `west_pauses` — completed deep targets
 - `relays` — east_pauses + west_pauses (same-socket crossings observed)
 
-## Install on OVH loadgen VMs
+## SoftMax multi-VM fleet (preferred)
 
-See `minecraft/install-generators.sh` (SoftMax pattern: fleet from
-`loadgen-fleet.mjs`, then ship dist + harness over Tailscale SSH).
+Crewrift SoftMax did **not** run bots as containers or as many JVMs on one small
+box. It used **N bare Ubuntu 24.04 OVH VMs** (typically **b3-16**), Tailscale
+`--ssh`, one harness process per VM with **disjoint** `LT_INDEX_BASE` /
+`LT_INDEX_LIMIT`, and `cks-loadtest-ctl` (here: `fleet-ctl.mjs`) fanning
+`POST /v1/clients/add` so each host adds the same per-host count.
+
+The one-box shortcut `test-mc-loadgen-1` (b3-8) OOMed around ~25 Java walkers.
+Keep it if useful; new capacity runs use a SoftMax-shaped prefix
+(`test-mc-lg-*` by default) on **b3-16**.
+
+### 1. Provision (test OVH project only)
+
+```bash
+RUN=$HOME/.local/state/cks-mc-loadtest-run
+export LOADGEN_STATE=$RUN/loadgen-fleet-softmax.json
+export LOADGEN_PREFIX=test-mc-lg          # SoftMax-shaped; leave test-mc-loadgen-1 alone
+export LOADGEN_SECRETS_ENV=…/credentials.test.env
+# up N [flavor] — SoftMax used 10× b3-16; start with 2–3 to prove sharding
+node minecraft/loadgen-fleet.mjs up 3 b3-16
+node minecraft/loadgen-fleet.mjs status
+```
+
+VMs stay up after every rung. Tear down **only** when Benjamin orders it:
+
+```bash
+node minecraft/loadgen-fleet.mjs down --confirm-benjamin-teardown
+```
+
+### 2. Install harness (disjoint index ranges)
+
+```bash
+# lt.env + control-token already in $RUN (same as one-box). Point LOADGEN_STATE
+# at the SoftMax inventory when installing.
+LOADGEN_STATE=$RUN/loadgen-fleet-softmax.json \
+  minecraft/install-generators.sh install \
+    --run $RUN --dist /path/to/loadwalker-dist --clients-per-host 25
+minecraft/install-generators.sh verify --run $RUN
+# hosts.txt now lists every generator; each owns [i*CPH, (i+1)*CPH)
+```
+
+### 3. Ramp (fan-out = SoftMax ctl)
+
+`add --count N` means **N per host** (fleet total = N × hosts), same as
+`cks-loadtest-ctl`:
+
+```bash
+CTL="node minecraft/fleet-ctl.mjs --run $RUN"
+$CTL status
+$CTL rung-open --id r-softmax-1
+$CTL add --count 4
+$CTL wait --active-delta 4 --timeout-sec 600
+$CTL stats --out $RUN/r-softmax-1.stats.json
+$CTL rung-close --id r-softmax-1 --out $RUN/r-softmax-1.fleet.json
+```
+
+You can also point a built `cks-loadtest-ctl --hosts $RUN/hosts.txt` at the
+same control API.
+
+## Install on OVH loadgen VMs (detail)
+
+See `minecraft/install-generators.sh` and `minecraft/loadgen-fleet.mjs`.
+Game VMs under test stay west `40.160.15.239` / east `40.160.99.136` — not loadgen.
