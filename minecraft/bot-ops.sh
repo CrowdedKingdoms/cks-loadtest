@@ -33,7 +33,7 @@ done
 prepare_host() {
   local ip="$1" side="$2" # west|east
   local wl="/opt/mc/${side}/whitelist.json"
-  "${SSH[@]}" "ubuntu@$ip" "NAMES_CSV='$NAMES_CSV' WL='$wl' SIDE='$side' python3 -" <<'PY'
+  "${SSH[@]}" "ubuntu@$ip" "sudo NAMES_CSV='$NAMES_CSV' WL='$wl' SIDE='$side' python3 -" <<'PY'
 import json, hashlib, uuid, os
 names = os.environ["NAMES_CSV"].split(",")
 path = os.environ["WL"]
@@ -72,8 +72,8 @@ PY
 prepare_host "$WEST" west
 prepare_host "$EAST" east
 
-# West playerdata at seam
-"${SSH[@]}" "ubuntu@$WEST" "NAMES_CSV='$NAMES_CSV' python3 -" <<'PY' || echo "bot-ops: playerdata step skipped"
+# West playerdata at seam (local NBT; CK hub pose is authoritative — see fix-load-poses.mjs)
+"${SSH[@]}" "ubuntu@$WEST" "sudo NAMES_CSV='$NAMES_CSV' python3 -" <<'PY' || echo "bot-ops: playerdata step skipped"
 import hashlib, uuid, os
 try:
     from nbtlib import File, Compound, Double, List as NList
