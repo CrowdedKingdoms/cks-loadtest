@@ -31,10 +31,18 @@ export LT_INDEX_LIMIT=8
 export LT_CLIENTS=0                     # wait for /v1/clients/add
 export LT_STATS_DIR=/var/lib/ck-mc-lt/stats
 export LT_INSTANCE_ID=test-mc-loadgen-1
+# Required so every /v1/clients/add writes the bot's CK hub Pos to the west seam
+# before LoadWalker starts (otherwise Fabric places them at world spawn):
+export CROWDY_ORG_TOKEN=...
+export CROWDY_ID_PEPPER=...
+export CROWDY_CLUSTER_SECRET=...
+# Optional: CROWDY_API_ORIGIN (default https://ck.test.crowdedkingdoms.com), CROWDY_APP_ID
+cd minecraft && npm install && cd ..
 node minecraft/mc-harness.mjs
 ```
 
-Drive with the existing `cks-loadtest-ctl` against `hosts.txt`.
+Drive with the existing `cks-loadtest-ctl` against `hosts.txt`. Each add calls
+`seam-pose.mjs` so a previous leave that saved spawn coords cannot stick.
 
 ## Metrics
 

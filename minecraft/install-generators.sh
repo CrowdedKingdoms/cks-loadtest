@@ -54,7 +54,8 @@ TOKEN="$(cat "$RUN/control-token")"
 TAR="$(mktemp -t ck-mc-dist.XXXXXX.tar.gz)"
 tar -C "$DIST" -czf "$TAR" .
 HARNESS_TAR="$(mktemp -t ck-mc-harness.XXXXXX.tar.gz)"
-tar -C "$REPO" -czf "$HARNESS_TAR" minecraft/mc-harness.mjs minecraft/README.md
+tar -C "$REPO" -czf "$HARNESS_TAR" minecraft/mc-harness.mjs minecraft/seam-pose.mjs \
+    minecraft/package.json minecraft/package-lock.json minecraft/README.md
 
 : > "$RUN/hosts.txt"
 i=0
@@ -68,7 +69,7 @@ for n in "${NAMES[@]}"; do
   # Node
   tailscale ssh "ubuntu@$ip" -- 'command -v node >/dev/null || (curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y -qq nodejs)'
   cat "$TAR" | tailscale ssh "ubuntu@$ip" -- 'tar -xzf - -C /opt/ck-mc-loadwalker && chmod +x /opt/ck-mc-loadwalker/run.sh'
-  cat "$HARNESS_TAR" | tailscale ssh "ubuntu@$ip" -- 'tar -xzf - -C /opt/ck-mc-harness'
+  cat "$HARNESS_TAR" | tailscale ssh "ubuntu@$ip" -- 'tar -xzf - -C /opt/ck-mc-harness && cd /opt/ck-mc-harness/minecraft && npm install --omit=dev --silent'
   env_file="$(mktemp)"
   {
     grep -Ev '^\s*(#|$)' "$RUN/lt.env"
@@ -83,6 +84,7 @@ LT_MC_DIST=/opt/ck-mc-loadwalker
 LT_STATS_DIR=/var/lib/ck-mc-lt/stats
 EOF
   } > "$env_file"
+  # CROWDY_* for seam-pose on every /v1/clients/add must already be in $RUN/lt.env
   cat "$env_file" | tailscale ssh "ubuntu@$ip" -- 'cat > /opt/ck-mc-harness/lt.env && chmod 600 /opt/ck-mc-harness/lt.env'
   rm -f "$env_file"
   unit="$(mktemp)"

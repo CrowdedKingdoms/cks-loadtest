@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { writeSeamPose, seamTargetForIndex } from "./seam-pose.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -194,19 +195,29 @@ function requestAdd(count) {
   }
   busy = true;
   addError = "";
+  // Pose must land in CK before the JVM joins — every add, so a prior leave that
+  // saved world-spawn Pos cannot stick into the next start.
   setImmediate(() => {
-    try {
-      for (let i = 0; i < count; i++) {
-        const gi = INDEX_BASE + used;
-        spawnWalker(gi);
-        used++;
+    (async () => {
+      try {
+        for (let i = 0; i < count; i++) {
+          const gi = INDEX_BASE + used;
+          const name = botName(gi);
+          const target = seamTargetForIndex(gi);
+          console.log(
+            `mc-harness: seam pose ${name} -> ${target.x},${target.y},${target.z}`,
+          );
+          await writeSeamPose(name, gi);
+          spawnWalker(gi);
+          used++;
+        }
+      } catch (e) {
+        addError = String(e?.message || e);
+        console.error("mc-harness: add failed", e);
+      } finally {
+        busy = false;
       }
-    } catch (e) {
-      addError = String(e?.message || e);
-      console.error("mc-harness: add failed", e);
-    } finally {
-      busy = false;
-    }
+    })();
   });
   return "";
 }
