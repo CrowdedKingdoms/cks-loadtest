@@ -75,6 +75,15 @@ for n in names:
             os.chmod(path, 0o600)
         except OSError:
             pass
+        # Fabric runs as minecraft; root-owned 0600 ages are invisible → Ask() at spawn.
+        try:
+            import pwd, grp
+            uid = pwd.getpwnam("minecraft").pw_uid
+            gid = grp.getgrnam("minecraft").gr_gid
+            os.chown(path, uid, gid)
+            os.chown(ages, uid, gid)
+        except (KeyError, OSError, PermissionError):
+            pass
         # Drop legacy plain-uuid files so operators are not misled.
         plain = os.path.join(ages, u)
         if os.path.isfile(plain):
