@@ -28,6 +28,8 @@ export LT_MC_HOST_WEST=40.160.15.239
 export LT_MC_HOST_EAST=40.160.99.136    # odd indices 1,3,5…; enables alternation
 export LT_MC_PORT=25565                 # or LT_MC_PORT_WEST / LT_MC_PORT_EAST
 export LT_LOGIN_STAGGER_MS=5000         # delay between each bot pose+login (default 5s)
+export LT_EARLY_STABLE_MS=20000         # watch window; early exit/transfer → retry
+export LT_ADD_RETRIES=2                 # extra attempts per slot after first
 # Optional: LT_MC_ALTERNATE=0 to force west-only even when EAST is set
 export LT_MC_DIST=/opt/ck-mc-loadwalker # loadwalker-dist tree
 export LT_INDEX_BASE=0
@@ -51,6 +53,12 @@ side it will join (`west` or `east`), then starts one LoadWalker against that
 Fabric host. Bots are started **one at a time** with `LT_LOGIN_STAGGER_MS`
 between them. Even global indices join west; odd join east — both walk the
 locked east/west seam choreography toward/past each other.
+
+If a bot dies in the early window (e.g. east join gets `ClientboundTransferPacket`
+because the cluster says they belong on west), the harness **retries that slot**
+(up to `LT_ADD_RETRIES`) and redirects to the transfer destination. A permanent
+failure advances to the next index so the ramp does not deadlock waiting for
+`active` to recover.
 
 ## Metrics
 

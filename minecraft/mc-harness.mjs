@@ -83,6 +83,10 @@ const MC_ALTERNATE =
   (MC_HOST_EAST !== "" && env("LT_MC_ALTERNATE", "auto") !== "0");
 /** Delay after each bot's spawn before the next pose+login (ms). Default 5s. */
 const LOGIN_STAGGER_MS = Math.max(0, Number(env("LT_LOGIN_STAGGER_MS", "5000")));
+/** How long after spawn to treat an exit as "early" (retry window). Default 20s. */
+const EARLY_STABLE_MS = Math.max(1000, Number(env("LT_EARLY_STABLE_MS", "20000")));
+/** Extra attempts after the first when a bot dies early / transfer-fails. Default 2. */
+const ADD_RETRIES = Math.max(0, Number(env("LT_ADD_RETRIES", "2")));
 const MC_DIST = requireEnv("LT_MC_DIST");
 const INDEX_BASE = Number(env("LT_INDEX_BASE", "0"));
 const INDEX_LIMIT = Number(env("LT_INDEX_LIMIT", "8"));
@@ -197,12 +201,57 @@ function json(res, code, body) {
   res.end(data);
 }
 
+function walkerLogPath(name) {
+  const logDir = STATS_DIR ? path.join(STATS_DIR, "walkers") : path.join(os.tmpdir(), "ck-mc-walkers");
+  fs.mkdirSync(logDir, { recursive: true });
+  return path.join(logDir, `${name}.log`);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Parse LoadWalker TRANSFER FAILURE line → join destination. */
+function parseTransferDest(logText) {
+  const m = String(logText).match(
+    /TRANSFER FAILURE\s+\S+\s+ClientboundTransferPacket to ([^\s:]+):(\d+)/,
+  );
+  if (!m) return null;
+  return { host: m[1], port: Number(m[2]) };
+}
+
+function endpointFromHostPort(host, port) {
+  const westHost = MC_HOST_WEST || MC_HOST;
+  const eastHost = MC_HOST_EAST;
+  let side = "west";
+  let ckServer = "west";
+  if (eastHost && host === eastHost) {
+    side = "east";
+    ckServer = "east";
+  } else if (host === westHost) {
+    side = "west";
+    ckServer = "west";
+  } else if (eastHost && host.includes("east")) {
+    side = "east";
+    ckServer = "east";
+  }
+  return { side, host, port: Number(port), ckServer };
+}
+
+function stopWalker(globalIndex) {
+  const state = clients.get(globalIndex);
+  if (!state) return;
+  try {
+    if (state.alive) state.proc.kill("SIGTERM");
+  } catch {
+    /* ignore */
+  }
+}
+
 function spawnWalker(globalIndex, endpoint) {
   const name = botName(globalIndex);
   const { host, port, side } = endpoint;
-  const logDir = STATS_DIR ? path.join(STATS_DIR, "walkers") : path.join(os.tmpdir(), "ck-mc-walkers");
-  fs.mkdirSync(logDir, { recursive: true });
-  const logPath = path.join(logDir, `${name}.log`);
+  const logPath = walkerLogPath(name);
   const logFd = fs.openSync(logPath, "a");
   const proc = spawn(runSh, [name, host, String(port)], {
     cwd: MC_DIST,
@@ -212,12 +261,23 @@ function spawnWalker(globalIndex, endpoint) {
   });
   fs.closeSync(logFd);
 
-  const state = { proc, name, side, host, port, transfers: 0, east: 0, west: 0, alive: true };
+  const state = {
+    proc,
+    name,
+    side,
+    host,
+    port,
+    logPath,
+    transfers: 0,
+    east: 0,
+    west: 0,
+    alive: true,
+    earlyExitReason: "",
+  };
   clients.set(globalIndex, state);
   lifetime.starts++;
 
   // Tail log for metrics (best-effort)
-  const stream = fs.createReadStream(logPath, { encoding: "utf8", start: 0 });
   let buf = "";
   const onChunk = (chunk) => {
     buf += chunk;
@@ -229,6 +289,7 @@ function spawnWalker(globalIndex, endpoint) {
         state.transfers++;
         lifetime.transfers++;
         if (openWindow) openWindow.transfers++;
+        state.earlyExitReason = "transfer";
       }
       if (line.includes("east pause")) {
         state.east++;
@@ -242,7 +303,6 @@ function spawnWalker(globalIndex, endpoint) {
       }
     }
   };
-  // Follow with fs.watchFile
   let pos = 0;
   try {
     pos = fs.statSync(logPath).size;
@@ -273,11 +333,106 @@ function spawnWalker(globalIndex, endpoint) {
     console.error(`mc-harness: ${name} exited code=${code} signal=${signal}`);
   });
 
-  stream.destroy();
   console.log(
     `${ts()} mc-harness: started ${name} -> ${side} ${host}:${port} log=${logPath}`,
   );
   return state;
+}
+
+/**
+ * Watch a freshly spawned walker. Early death (esp. TRANSFER FAILURE) is retriable.
+ * Resolves { ok:true } if still alive after the window, else { ok:false, transferTo?, reason }.
+ */
+async function waitEarlyOutcome(globalIndex, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = clients.get(globalIndex);
+    if (!state || !state.alive) {
+      let text = "";
+      try {
+        text = fs.readFileSync(state?.logPath || walkerLogPath(botName(globalIndex)), "utf8");
+      } catch {
+        /* ignore */
+      }
+      const dest = parseTransferDest(text);
+      return {
+        ok: false,
+        reason: dest ? "transfer" : state?.earlyExitReason || "early-exit",
+        transferTo: dest,
+      };
+    }
+    await sleep(400);
+  }
+  const state = clients.get(globalIndex);
+  if (state?.alive) return { ok: true };
+  let text = "";
+  try {
+    text = fs.readFileSync(state?.logPath || walkerLogPath(botName(globalIndex)), "utf8");
+  } catch {
+    /* ignore */
+  }
+  const dest = parseTransferDest(text);
+  return {
+    ok: false,
+    reason: dest ? "transfer" : "early-exit",
+    transferTo: dest,
+  };
+}
+
+/**
+ * Pose + spawn one index with retries. Transfer-to-west (east join "belongs on west")
+ * is retried against the transfer destination rather than stalling the ramp.
+ */
+async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
+  const name = botName(globalIndex);
+  let endpoint = { ...initialEndpoint };
+  let lastReason = "unknown";
+  const maxAttempts = ADD_RETRIES + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    stopWalker(globalIndex);
+    await sleep(300);
+
+    const target = seamTargetForIndex(globalIndex);
+    console.log(
+      `${ts()} mc-harness: seam pose ${name} attempt=${attempt}/${maxAttempts} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
+    );
+    await writeSeamPoseWithRetries(name, globalIndex, { server: endpoint.ckServer });
+    spawnWalker(globalIndex, endpoint);
+
+    const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS);
+    if (outcome.ok) {
+      console.log(
+        `${ts()} mc-harness: ${name} stable on ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
+      );
+      return { ok: true, endpoint };
+    }
+
+    lastReason = outcome.reason || "early-exit";
+    console.error(
+      `${ts()} mc-harness: ${name} early failure reason=${lastReason} attempt=${attempt}/${maxAttempts}`,
+    );
+
+    if (attempt >= maxAttempts) break;
+
+    if (outcome.transferTo) {
+      const redirected = endpointFromHostPort(
+        outcome.transferTo.host,
+        outcome.transferTo.port,
+      );
+      console.error(
+        `${ts()} mc-harness: ${name} transfer failure → retry on ${redirected.side} ${redirected.host}:${redirected.port} (retriable add)`,
+      );
+      endpoint = redirected;
+    } else {
+      console.error(
+        `${ts()} mc-harness: ${name} retrying same endpoint ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
+      );
+    }
+  }
+
+  stopWalker(globalIndex);
+  return { ok: false, reason: lastReason, endpoint };
 }
 
 function requestAdd(count) {
@@ -288,29 +443,40 @@ function requestAdd(count) {
   }
   busy = true;
   addError = "";
-  // Pose must land in CK before the JVM joins — every add, so a prior leave that
-  // saved world-spawn Pos cannot stick into the next start. Logins are staggered
-  // one-at-a-time so west/east player-lists are not burst-filled.
+  // Pose must land in CK before the JVM joins. Logins are staggered one-at-a-time.
+  // Early deaths (transfer / crash) retry the same index; permanent failure advances
+  // to the next index so the ramp never deadlocks waiting for active>=N.
   setImmediate(() => {
     (async () => {
+      let okCount = 0;
+      let failCount = 0;
       try {
         for (let i = 0; i < count; i++) {
           const gi = INDEX_BASE + used;
-          const name = botName(gi);
-          const endpoint = endpointForIndex(gi);
-          const target = seamTargetForIndex(gi);
-          console.log(
-            `${ts()} mc-harness: seam pose ${name} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
-          );
-          await writeSeamPoseWithRetries(name, gi, { server: endpoint.ckServer });
-          spawnWalker(gi, endpoint);
+          const initial = endpointForIndex(gi);
+          const result = await spawnSlotWithRetries(gi, initial);
           used++;
+          if (result.ok) {
+            okCount++;
+          } else {
+            failCount++;
+            console.error(
+              `${ts()} mc-harness: slot ${botName(gi)} gave up (${result.reason}); continuing ramp`,
+            );
+          }
           if (i + 1 < count && LOGIN_STAGGER_MS > 0) {
             console.log(
               `${ts()} mc-harness: login stagger ${LOGIN_STAGGER_MS}ms before next bot`,
             );
-            await new Promise((r) => setTimeout(r, LOGIN_STAGGER_MS));
+            await sleep(LOGIN_STAGGER_MS);
           }
+        }
+        if (failCount > 0 && okCount === 0) {
+          addError = `all ${failCount} add slot(s) failed early (last reasons in harness log)`;
+        } else if (failCount > 0) {
+          console.error(
+            `${ts()} mc-harness: add finished with ok=${okCount} failed=${failCount} (ramp continued)`,
+          );
         }
       } catch (e) {
         const detail = formatErrorDetail(e, {
@@ -346,6 +512,8 @@ function statusJson() {
     mc_host_east: MC_HOST_EAST || undefined,
     mc_alternate: MC_ALTERNATE,
     login_stagger_ms: LOGIN_STAGGER_MS,
+    early_stable_ms: EARLY_STABLE_MS,
+    add_retries: ADD_RETRIES,
     mc_port: Number(MC_PORT),
   };
 }
