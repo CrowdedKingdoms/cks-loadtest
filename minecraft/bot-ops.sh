@@ -57,6 +57,11 @@ out = list(by_name.values())
 json.dump(out, open(path, "w"), indent=2)
 print(f"whitelist {path}: {len(out)} entries")
 
+# PlayerAges only reads <uuid>.json with born (yyyy-MM) + answered (yyyy-MM-dd).
+# Plain date files are ignored → Join Ask() → world-spawn without CK → harness spawn-miss.
+import datetime
+today = datetime.date.today().isoformat()
+payload = json.dumps({"born": "1990-01", "answered": today}, separators=(",", ":"))
 for n in names:
     u = offline_uuid(n)
     for ages in [
@@ -64,8 +69,20 @@ for n in names:
         f"/opt/mc/{side}/Crowded Kingdoms/crowdedkingdoms/ages",
     ]:
         os.makedirs(ages, exist_ok=True)
-        open(os.path.join(ages, u), "w").write("1990-01-15\n")
-    print(f"ages {n} {u}")
+        path = os.path.join(ages, f"{u}.json")
+        open(path, "w").write(payload + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        # Drop legacy plain-uuid files so operators are not misled.
+        plain = os.path.join(ages, u)
+        if os.path.isfile(plain):
+            try:
+                os.remove(plain)
+            except OSError:
+                pass
+    print(f"ages {n} {u} -> {payload}")
 PY
 }
 

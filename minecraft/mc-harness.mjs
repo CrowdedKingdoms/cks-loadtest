@@ -30,9 +30,14 @@ const SEAM_POSE_RETRY_MS = Math.max(0, Number(env("LT_SEAM_POSE_RETRY_MS", "1500
 const SEAM_POSE_SETTLE_MS = Math.max(0, Number(env("LT_SEAM_POSE_SETTLE_MS", "750")));
 /**
  * How long the walker must stay off-seam after first `phase=play` before we call it a
- * spawn-miss (Load6-8: hub Pos wrote OK, in-game stayed at world spawn with lane/block).
+ * spawn-miss (Load6+: hub Pos wrote OK, in-game stayed at world spawn — often missing
+ * age JSON so CK never attaches). Default 8s so a slow CK claim is not killed early.
  */
-const PLACEMENT_CONFIRM_MS = Math.max(500, Number(env("LT_PLACEMENT_CONFIRM_MS", "3000")));
+const PLACEMENT_CONFIRM_MS = Math.max(500, Number(env("LT_PLACEMENT_CONFIRM_MS", "8000")));
+/** When true, the first unrecovered seam-entry failure aborts the add ramp and kills all bots. */
+const ABORT_ON_SEAM_FAIL =
+  env("LT_ABORT_ON_SEAM_FAIL", "1") === "1" ||
+  env("LT_ABORT_ON_SEAM_FAIL", "1").toLowerCase() === "true";
 
 function ts() {
   return new Date().toISOString();
@@ -180,6 +185,7 @@ const postStableRetrying = new Set();
 let used = 0;
 let busy = false;
 let addError = "";
+let abortAdd = false;
 let shuttingDown = false;
 let currentRung = null;
 /** @type {{ id: string, openedAt: number, transfers: number, east: number, west: number } | null} */
@@ -276,6 +282,26 @@ function stopWalker(globalIndex) {
   } catch {
     /* ignore */
   }
+}
+
+/** Kill every walker without exiting the harness process (operator cancel / seam-fail abort). */
+function stopAllWalkers() {
+  for (const gi of [...clients.keys()]) {
+    stopWalker(gi);
+  }
+  postStableRetrying.clear();
+}
+
+/**
+ * Stop all bots and reset the index counter so a fresh add can reuse Load1…N.
+ * Does not close an open rung window (caller may close separately).
+ */
+function clearClients() {
+  abortAdd = true;
+  stopAllWalkers();
+  clients.clear();
+  used = 0;
+  addError = "";
 }
 
 function spawnWalker(globalIndex, endpoint) {
@@ -628,15 +654,20 @@ function requestAdd(count) {
   }
   busy = true;
   addError = "";
+  abortAdd = false;
   // Pose must land in CK before the JVM joins. Logins are staggered one-at-a-time.
-  // Early deaths (transfer / crash) retry the same index; permanent failure advances
-  // to the next index so the ramp never deadlocks waiting for active>=N.
+  // Early deaths (transfer / crash) retry the same index. By default the first
+  // unrecovered seam-entry failure aborts the whole run (LT_ABORT_ON_SEAM_FAIL=1).
   setImmediate(() => {
     (async () => {
       let okCount = 0;
       let failCount = 0;
       try {
         for (let i = 0; i < count; i++) {
+          if (abortAdd || shuttingDown) {
+            console.error(`${ts()} mc-harness: add aborted before slot ${i + 1}/${count}`);
+            break;
+          }
           const gi = INDEX_BASE + used;
           const initial = endpointForIndex(gi);
           const result = await spawnSlotWithRetries(gi, initial);
@@ -645,10 +676,21 @@ function requestAdd(count) {
             okCount++;
           } else {
             failCount++;
+            const name = botName(gi);
+            if (ABORT_ON_SEAM_FAIL) {
+              addError = `seam-entry failure on ${name}: ${result.reason} — aborted run (ok=${okCount} before fail)`;
+              console.error(
+                `${ts()} mc-harness: ${addError}; stopping all walkers`,
+              );
+              stopAllWalkers();
+              abortAdd = true;
+              break;
+            }
             console.error(
-              `${ts()} mc-harness: slot ${botName(gi)} gave up (${result.reason}); continuing ramp`,
+              `${ts()} mc-harness: slot ${name} gave up (${result.reason}); continuing ramp`,
             );
           }
+          if (abortAdd || shuttingDown) break;
           if (i + 1 < count && LOGIN_STAGGER_MS > 0) {
             console.log(
               `${ts()} mc-harness: login stagger ${LOGIN_STAGGER_MS}ms before next bot`,
@@ -656,9 +698,9 @@ function requestAdd(count) {
             await sleep(LOGIN_STAGGER_MS);
           }
         }
-        if (failCount > 0 && okCount === 0) {
+        if (failCount > 0 && okCount === 0 && !addError) {
           addError = `all ${failCount} add slot(s) failed early (last reasons in harness log)`;
-        } else if (failCount > 0) {
+        } else if (failCount > 0 && !ABORT_ON_SEAM_FAIL) {
           console.error(
             `${ts()} mc-harness: add finished with ok=${okCount} failed=${failCount} (ramp continued)`,
           );
@@ -699,6 +741,8 @@ function statusJson() {
     login_stagger_ms: LOGIN_STAGGER_MS,
     early_stable_ms: EARLY_STABLE_MS,
     add_retries: ADD_RETRIES,
+    abort_on_seam_fail: ABORT_ON_SEAM_FAIL,
+    placement_confirm_ms: PLACEMENT_CONFIRM_MS,
     mc_port: Number(MC_PORT),
   };
 }
@@ -816,6 +860,11 @@ async function handle(req, res) {
       const err = requestAdd(Number(body.count || 0));
       if (err) return json(res, 400, { error: err });
       return json(res, 202, { accepted: true, status: statusJson() });
+    }
+    if (req.method === "POST" && url.pathname === "/v1/clients/clear") {
+      if (busy) abortAdd = true;
+      clearClients();
+      return json(res, 200, { ok: true, status: statusJson() });
     }
     if (req.method === "POST" && url.pathname === "/v1/rung/open") {
       const body = await readBody(req);
