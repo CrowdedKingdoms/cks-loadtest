@@ -107,8 +107,8 @@ const MC_ALTERNATE =
   env("LT_MC_ALTERNATE", "") === "1" ||
   env("LT_MC_ALTERNATE", "").toLowerCase() === "true" ||
   (MC_HOST_EAST !== "" && env("LT_MC_ALTERNATE", "auto") !== "0");
-/** Delay after each bot's spawn before the next pose+login (ms). Default 5s. */
-const LOGIN_STAGGER_MS = Math.max(0, Number(env("LT_LOGIN_STAGGER_MS", "5000")));
+/** Delay after each bot's spawn before the next pose+login (ms). Default 2s. */
+const LOGIN_STAGGER_MS = Math.max(0, Number(env("LT_LOGIN_STAGGER_MS", "2000")));
 /** How long after spawn to treat an exit as "early" (retry window). Default 20s. */
 const EARLY_STABLE_MS = Math.max(1000, Number(env("LT_EARLY_STABLE_MS", "20000")));
 /** Extra attempts after the first when a bot dies early / transfer-fails. Default 2. */
