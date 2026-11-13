@@ -9,12 +9,53 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { writeSeamPose, seamTargetForIndex } from "./seam-pose.mjs";
+import {
+  writeSeamPose,
+  seamTargetForIndex,
+  formatErrorDetail,
+  isTransientNetworkError,
+} from "./seam-pose.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function env(name, fallback = "") {
   return process.env[name] ?? fallback;
+}
+
+const SEAM_POSE_ATTEMPTS = Math.max(1, Number(env("LT_SEAM_POSE_ATTEMPTS", "3")));
+const SEAM_POSE_RETRY_MS = Math.max(0, Number(env("LT_SEAM_POSE_RETRY_MS", "1500")));
+
+function ts() {
+  return new Date().toISOString();
+}
+
+async function writeSeamPoseWithRetries(name, index) {
+  let lastErr;
+  for (let attempt = 1; attempt <= SEAM_POSE_ATTEMPTS; attempt++) {
+    try {
+      if (attempt > 1) {
+        console.error(
+          `${ts()} mc-harness: seam pose retry ${attempt}/${SEAM_POSE_ATTEMPTS} for ${name} after ${SEAM_POSE_RETRY_MS}ms`,
+        );
+        await new Promise((r) => setTimeout(r, SEAM_POSE_RETRY_MS));
+      }
+      return await writeSeamPose(name, index);
+    } catch (e) {
+      lastErr = e;
+      const detail = formatErrorDetail(e, {
+        op: "seam-pose",
+        attempt,
+        attempts: SEAM_POSE_ATTEMPTS,
+        url: process.env.CROWDY_API_ORIGIN || "(default ck.test)",
+      });
+      const retry = attempt < SEAM_POSE_ATTEMPTS && isTransientNetworkError(e);
+      console.error(
+        `${ts()} mc-harness: seam pose failed for ${name}: ${detail}${retry ? " (will retry)" : ""}`,
+      );
+      if (!retry) break;
+    }
+  }
+  throw lastErr;
 }
 
 function requireEnv(name) {
@@ -205,15 +246,20 @@ function requestAdd(count) {
           const name = botName(gi);
           const target = seamTargetForIndex(gi);
           console.log(
-            `mc-harness: seam pose ${name} -> ${target.x},${target.y},${target.z}`,
+            `${ts()} mc-harness: seam pose ${name} -> ${target.x},${target.y},${target.z}`,
           );
-          await writeSeamPose(name, gi);
+          await writeSeamPoseWithRetries(name, gi);
           spawnWalker(gi);
           used++;
         }
       } catch (e) {
-        addError = String(e?.message || e);
-        console.error("mc-harness: add failed", e);
+        const detail = formatErrorDetail(e, {
+          op: "clients/add",
+          url: process.env.CROWDY_API_ORIGIN || "(default ck.test)",
+        });
+        addError = detail;
+        console.error(`${ts()} mc-harness: add failed: ${detail}`);
+        if (e?.stack) console.error(e.stack);
       } finally {
         busy = false;
       }

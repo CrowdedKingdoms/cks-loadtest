@@ -45,19 +45,112 @@ function sealRecord(secret, userId, version, recordBytes) {
   return mac.digest().toString("base64url");
 }
 
+/** Flatten err + cause chain for logs / add_error (Node fetch hides ENOTFOUND etc. in .cause). */
+export function formatErrorDetail(err, extras = {}) {
+  const parts = [];
+  if (extras.op) parts.push(`op=${extras.op}`);
+  if (extras.url) parts.push(`url=${extras.url}`);
+  if (extras.attempt != null) {
+    parts.push(`attempt=${extras.attempt}${extras.attempts != null ? `/${extras.attempts}` : ""}`);
+  }
+  if (extras.status != null) parts.push(`status=${extras.status}`);
+  if (extras.body) {
+    const b = String(extras.body).replace(/\s+/g, " ").slice(0, 500);
+    if (b) parts.push(`body=${b}`);
+  }
+  let cur = err;
+  let depth = 0;
+  const chain = [];
+  while (cur && depth < 8) {
+    const bits = [];
+    const name = cur.name || (cur.constructor && cur.constructor.name);
+    const msg = cur.message != null ? String(cur.message) : String(cur);
+    if (name && name !== "Error") bits.push(name);
+    bits.push(msg);
+    for (const k of ["code", "errno", "syscall", "hostname", "address", "port"]) {
+      if (cur[k] != null && cur[k] !== "") bits.push(`${k}=${cur[k]}`);
+    }
+    chain.push(bits.join(" "));
+    cur = cur.cause;
+    depth++;
+  }
+  if (chain.length) parts.push(chain.join(" <- "));
+  return parts.join(" | ");
+}
+
+export function isTransientNetworkError(err) {
+  const codes = new Set();
+  let cur = err;
+  let depth = 0;
+  while (cur && depth < 8) {
+    if (cur.code) codes.add(String(cur.code));
+    const msg = String(cur.message || "");
+    if (/fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|UND_ERR|socket hang up|network/i.test(msg)) {
+      return true;
+    }
+    cur = cur.cause;
+    depth++;
+  }
+  for (const c of codes) {
+    if (
+      /^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR_|ABORT_ERR)/.test(c)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function gql(origin, orgToken, query, variables) {
-  const res = await fetch(`${origin}/graphql`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${orgToken}`,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const body = await res.json();
+  const url = `${origin}/graphql`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${orgToken}`,
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+  } catch (e) {
+    throw new Error(formatErrorDetail(e, { op: "gql-fetch", url }), { cause: e });
+  }
+  const text = await res.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error(
+      formatErrorDetail(e, {
+        op: "gql-parse",
+        url,
+        status: res.status,
+        body: text,
+      }),
+      { cause: e },
+    );
+  }
+  if (!res.ok) {
+    throw new Error(
+      formatErrorDetail(new Error(`HTTP ${res.status}`), {
+        op: "gql-http",
+        url,
+        status: res.status,
+        body: text,
+      }),
+    );
+  }
   if (body.errors?.length) {
     const e = body.errors[0];
-    throw new Error(`${e.extensions?.code || "GQL"}: ${e.message}`);
+    throw new Error(
+      formatErrorDetail(new Error(`${e.extensions?.code || "GQL"}: ${e.message}`), {
+        op: "gql",
+        url,
+        status: res.status,
+        body: JSON.stringify(body.errors).slice(0, 500),
+      }),
+    );
   }
   return body.data;
 }
@@ -117,77 +210,85 @@ export async function writeSeamPose(name, index) {
   const mcUuid = offlineUuid(name);
   const ext = externalId(pepper, mcUuid);
 
-  const mint = await gql(
-    origin,
-    orgToken,
-    `mutation Mint($i: MintManagedPlayerTokenInput!) {
+  try {
+    const mint = await gql(
+      origin,
+      orgToken,
+      `mutation Mint($i: MintManagedPlayerTokenInput!) {
       mintManagedPlayerToken(input: $i) {
         token appId expiresAt gameApiUrl gameApiWsUrl discoveryUrl launchUrl
       }
     }`,
-    { i: { appId, externalId: ext, ageYears: 36, country: "CA" } },
-  );
-  const tokenResponse = mint.mintManagedPlayerToken;
-  const client = new CrowdyClient({ httpUrl: origin });
-  client.portal.adoptAppToken(tokenResponse);
-  const me = await client.users.me();
-  const userId = String(me.userId);
+      { i: { appId, externalId: ext, ageYears: 36, country: "CA" } },
+    );
+    const tokenResponse = mint.mintManagedPlayerToken;
+    const client = new CrowdyClient({ httpUrl: origin });
+    client.portal.adoptAppToken(tokenResponse);
+    const me = await client.users.me();
+    const userId = String(me.userId);
 
-  const exec = await client.exec.connect(appId, { nodeType: "player", key: userId });
-  try {
-    const view = await exec.call("player", userId, "mc_get");
-    const version = Number(view.version ?? 0);
-    let parsed;
-    if (!view.data) {
-      parsed = emptyPlayerTag();
-    } else {
-      const raw = Buffer.from(view.data, "base64");
-      let uncompressed;
-      try {
-        uncompressed = gunzipSync(raw);
-      } catch {
-        uncompressed = raw;
-      }
-      parsed = nbt.parseUncompressed(uncompressed);
-    }
-
-    setPos(parsed, target.x, target.y, target.z);
-    const outBytes = gzipSync(nbt.writeUncompressed(parsed));
-    const nextVersion = version + 1;
-    const seal = sealRecord(clusterSecret, userId, nextVersion, outBytes);
-    const data = outBytes.toString("base64");
-
-    await exec.call("player", userId, "mc_claim", { server: serverId });
-    const rid = `${serverId}-${nextVersion}-${randomBytes(8).toString("hex")}`;
-    await exec.call("player", userId, "mc_save", {
-      server: serverId,
-      version: nextVersion,
-      data,
-      seal,
-      handoff: "",
-      rid,
-    });
-    await exec.call("player", userId, "mc_release", { server: serverId });
-
-    const check = await exec.call("player", userId, "mc_get");
-    const checkRaw = Buffer.from(check.data, "base64");
-    let checkUn;
+    const exec = await client.exec.connect(appId, { nodeType: "player", key: userId });
     try {
-      checkUn = gunzipSync(checkRaw);
-    } catch {
-      checkUn = checkRaw;
+      const view = await exec.call("player", userId, "mc_get");
+      const version = Number(view.version ?? 0);
+      let parsed;
+      if (!view.data) {
+        parsed = emptyPlayerTag();
+      } else {
+        const raw = Buffer.from(view.data, "base64");
+        let uncompressed;
+        try {
+          uncompressed = gunzipSync(raw);
+        } catch {
+          uncompressed = raw;
+        }
+        parsed = nbt.parseUncompressed(uncompressed);
+      }
+
+      setPos(parsed, target.x, target.y, target.z);
+      const outBytes = gzipSync(nbt.writeUncompressed(parsed));
+      const nextVersion = version + 1;
+      const seal = sealRecord(clusterSecret, userId, nextVersion, outBytes);
+      const data = outBytes.toString("base64");
+
+      await exec.call("player", userId, "mc_claim", { server: serverId });
+      const rid = `${serverId}-${nextVersion}-${randomBytes(8).toString("hex")}`;
+      await exec.call("player", userId, "mc_save", {
+        server: serverId,
+        version: nextVersion,
+        data,
+        seal,
+        handoff: "",
+        rid,
+      });
+      await exec.call("player", userId, "mc_release", { server: serverId });
+
+      const check = await exec.call("player", userId, "mc_get");
+      const checkRaw = Buffer.from(check.data, "base64");
+      let checkUn;
+      try {
+        checkUn = gunzipSync(checkRaw);
+      } catch {
+        checkUn = checkRaw;
+      }
+      const after = readPos(nbt.parseUncompressed(checkUn));
+      const [ax, ay, az] = after || [];
+      if (
+        Math.abs(ax - target.x) > 0.01 ||
+        Math.abs(ay - target.y) > 0.01 ||
+        Math.abs(az - target.z) > 0.01
+      ) {
+        throw new Error(`Pos did not stick for ${name}: got ${JSON.stringify(after)}`);
+      }
+      return { name, userId, target, pos: after };
+    } finally {
+      exec.close();
     }
-    const after = readPos(nbt.parseUncompressed(checkUn));
-    const [ax, ay, az] = after || [];
-    if (
-      Math.abs(ax - target.x) > 0.01 ||
-      Math.abs(ay - target.y) > 0.01 ||
-      Math.abs(az - target.z) > 0.01
-    ) {
-      throw new Error(`Pos did not stick for ${name}: got ${JSON.stringify(after)}`);
-    }
-    return { name, userId, target, pos: after };
-  } finally {
-    exec.close();
+  } catch (e) {
+    // CrowdyClient / undici often surface only "fetch failed"; keep cause chain + URL.
+    if (String(e?.message || "").includes("op=")) throw e;
+    throw new Error(formatErrorDetail(e, { op: "writeSeamPose", url: origin }), {
+      cause: e,
+    });
   }
 }
