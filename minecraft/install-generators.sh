@@ -174,7 +174,9 @@ TimeoutStopSec=30
 [Install]
 WantedBy=multi-user.target
 EOF
-      cat "$unit" | tssh "$ip" 'sudo tee /etc/systemd/system/ck-mc-harness.service >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now ck-mc-harness.service && sleep 2 && systemctl is-active ck-mc-harness.service'
+      # enable --now does not reload an already-running unit; always restart so a
+      # SoftMax reinstall picks up the new mc-harness.mjs / lt.env.
+      cat "$unit" | tssh "$ip" 'sudo tee /etc/systemd/system/ck-mc-harness.service >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable ck-mc-harness.service && sudo systemctl restart ck-mc-harness.service && sleep 2 && systemctl is-active ck-mc-harness.service'
       rm -f "$unit"
       i=$(( i + 1 ))
     done
