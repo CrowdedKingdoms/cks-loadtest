@@ -1,5 +1,6 @@
 /**
- * Write a LoadWalker's CK hub player-record Pos to the west seam before spawn.
+ * Write a LoadWalker's CK hub player-record Pos to the seam before spawn.
+ * Pos is west-of-line or east-of-line to match the join home (`server` / `side`).
  * Env: CROWDY_ORG_TOKEN, CROWDY_ID_PEPPER, CROWDY_CLUSTER_SECRET
  * Optional: CROWDY_API_ORIGIN (default ck.test), CROWDY_APP_ID, CROWDY_MC_SERVER (default west)
  */
@@ -184,11 +185,28 @@ function emptyPlayerTag() {
   };
 }
 
-/** Same stagger as fix-load-poses.mjs: west of the line, y=63. index is 0-based LoadN-1. */
-export function seamTargetForIndex(index) {
+/**
+ * Seam stagger for LoadN. index is 0-based LoadN-1.
+ * Home side must match join host: west of the chunk line (x below 2000) for west
+ * joins, east of the line (x 2000+) for east joins — otherwise Fabric sends
+ * "belongs on west/east" and LoadWalker exits on ClientboundTransferPacket.
+ *
+ * @param {number} index
+ * @param {{ side?: string, server?: string } | string} [sideOrOpts]
+ *   `"east"` / `{ side: "east" }` / `{ server: "east" }` → x≈2009.5–2011.1;
+ *   otherwise west → x≈1990.5–1992.1. Same z stagger either side.
+ */
+export function seamTargetForIndex(index, sideOrOpts) {
   const i = Number(index) | 0;
+  const side =
+    typeof sideOrOpts === "string"
+      ? sideOrOpts
+      : sideOrOpts?.side || sideOrOpts?.server || "west";
+  const east = side === "east";
   return {
-    x: 1990.5 + (i % 3) * 0.8,
+    // west: 1990.5 + (i%3)*0.8 → 1990.5..1992.1 (west of seam)
+    // east: 2009.5 + (i%3)*0.8 → 2009.5..2011.1 (east of seam, in walk band)
+    x: (east ? 2009.5 : 1990.5) + (i % 3) * 0.8,
     y: 63,
     z: -55 - (i % 5) * 0.6,
   };
@@ -226,7 +244,9 @@ export function looksLikeWorldSpawn(pos) {
  * (even if a prior leave saved world-spawn coords).
  * @param {string} name
  * @param {number} index
- * @param {{ server?: string }} [opts] — Fabric server id for claim/save (`west` / `east`).
+ * @param {{ server?: string, side?: string, target?: { x: number, y: number, z: number } }} [opts]
+ *   Fabric server id for claim/save (`west` / `east`). Pos is chosen for that side
+ *   unless `target` is passed explicitly.
  */
 export async function writeSeamPose(name, index, opts = {}) {
   const origin = process.env.CROWDY_API_ORIGIN || DEFAULT_ORIGIN;
@@ -235,7 +255,9 @@ export async function writeSeamPose(name, index, opts = {}) {
   const orgToken = mustEnv("CROWDY_ORG_TOKEN");
   const pepper = mustEnv("CROWDY_ID_PEPPER");
   const clusterSecret = mustEnv("CROWDY_CLUSTER_SECRET");
-  const target = seamTargetForIndex(index);
+  const target =
+    opts.target ||
+    seamTargetForIndex(index, { side: opts.side || serverId });
 
   const mcUuid = offlineUuid(name);
   const ext = externalId(pepper, mcUuid);

@@ -52,26 +52,25 @@ node minecraft/mc-harness.mjs
 ```
 
 Drive with the existing `cks-loadtest-ctl` against `hosts.txt`. Each add:
-poses the bot at the **same seam** (`seamTargetForIndex`), claims/saves on the
-side it will join (`west` or `east`), then starts one LoadWalker against that
-Fabric host. Bots are started **one at a time** with `LT_LOGIN_STAGGER_MS`
-between them. Even global indices join west; odd join east — both walk the
-locked east/west seam choreography toward/past each other.
+poses the bot on the **home side of the seam** (`seamTargetForIndex` — west of
+x=2000 for west joins, east of the line ~2009–2011 for east joins), claims/saves
+on that side, then starts one LoadWalker against that Fabric host. Bots are
+started **one at a time** with `LT_LOGIN_STAGGER_MS` between them. Even global
+indices join west; odd join east — both walk the locked east/west seam
+choreography toward/past each other.
 
-If a bot dies in the early window (e.g. east join gets `ClientboundTransferPacket`
-because the cluster says they belong on west), the harness **retries that slot**
-(up to `LT_ADD_RETRIES`) and redirects to the transfer destination. The same
-transfer retry (exponential backoff, same attempt budget) also applies **after**
-the bot is already stable — mid-run LoadWalker exits on
-`ClientboundTransferPacket` (e.g. walking east and getting handed to east) no
-longer permanently drop `active`. If the hub Pos write succeeds but the walker
-stays at **world spawn** (far from the seam, often with `blocked` / `lane` in
-the log — the Load6–8 failure mode), that is a **spawn-miss**: the harness kills
-the JVM, rewrites the seam pose with backoff, and retries (preferring west after
-an east miss). A permanent failure advances to the next index so the ramp does
-not deadlock waiting for `active` to recover, and does **not** leave a stranded
-spawn bot counted as stable. Max-runtime and other non-transfer exits are not
-respawned.
+If a bot dies in the early window (e.g. still gets `ClientboundTransferPacket`),
+the harness **retries that slot** (up to `LT_ADD_RETRIES`) and redirects to the
+transfer destination. The same transfer retry (exponential backoff, same attempt
+budget) also applies **after** the bot is already stable — mid-run LoadWalker
+exits on `ClientboundTransferPacket` no longer permanently drop `active`. If the
+hub Pos write succeeds but the walker stays at **world spawn** (far from the
+seam — the Load6–8 failure mode), that is a **spawn-miss**: the harness kills
+the JVM, rewrites the seam pose with backoff, and retries on the **same** home
+(no forced west fallback after an east miss). A permanent failure advances to
+the next index so the ramp does not deadlock waiting for `active` to recover,
+and does **not** leave a stranded spawn bot counted as stable. Max-runtime and
+other non-transfer exits are not respawned.
 
 ## Metrics
 

@@ -554,17 +554,17 @@ async function waitEarlyOutcome(globalIndex, timeoutMs, target) {
 }
 
 /**
- * Pose + spawn one index with retries. Transfer-to-west (east join "belongs on west")
- * is retried against the transfer destination rather than stalling the ramp.
- * Spawn-miss (hub pose wrote but in-game still at world spawn) rewrites the pose with
- * backoff and respawns — does not silently leave the bot stranded.
+ * Pose + spawn one index with retries. Hub Pos is written on the assigned home
+ * side (west-of-line for west, east-of-line for east) so east joins no longer
+ * "belong on west" and transfer-bounce. Transfer redirects still follow the
+ * packet destination when a bounce does happen. Spawn-miss rewrites pose on the
+ * same home and retries — no forced west fallback after an east miss.
  */
 async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
   const name = botName(globalIndex);
   let endpoint = { ...initialEndpoint };
   let lastReason = "unknown";
   const maxAttempts = ADD_RETRIES + 1;
-  const target = seamTargetForIndex(globalIndex);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     stopWalker(globalIndex);
@@ -578,10 +578,16 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
       await sleep(wait);
     }
 
+    // Recompute when endpoint flips (transfer redirect); pose must match home.
+    const target = seamTargetForIndex(globalIndex, { side: endpoint.side });
     console.log(
       `${ts()} mc-harness: seam pose ${name} attempt=${attempt}/${maxAttempts} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
     );
-    await writeSeamPoseWithRetries(name, globalIndex, { server: endpoint.ckServer });
+    await writeSeamPoseWithRetries(name, globalIndex, {
+      server: endpoint.ckServer,
+      side: endpoint.side,
+      target,
+    });
     spawnWalker(globalIndex, endpoint);
 
     const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS, target);
@@ -621,20 +627,11 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
       );
       endpoint = redirected;
     } else if (lastReason === "spawn-miss") {
-      // Pose did not stick in-game: kill, rewrite hub Pos with backoff, try again.
-      // Prefer west for a seam rewrite when the miss was on east (east join often
-      // transfer-bounces; west is the seam-side home for these load bots).
-      if (endpoint.side === "east" && (MC_HOST_WEST || MC_HOST)) {
-        const west = endpointForIndex(0); // even → west shape
-        console.error(
-          `${ts()} mc-harness: ${name} spawn-miss → rewrite pose and retry on west ${west.host}:${west.port}`,
-        );
-        endpoint = west;
-      } else {
-        console.error(
-          `${ts()} mc-harness: ${name} spawn-miss → rewrite pose and retry on ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
-        );
-      }
+      // Pose did not stick in-game: kill, rewrite hub Pos with backoff, same home.
+      // Do not force west after an east miss — east-of-line poses are the home fix.
+      console.error(
+        `${ts()} mc-harness: ${name} spawn-miss → rewrite pose and retry on ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
+      );
     } else {
       console.error(
         `${ts()} mc-harness: ${name} retrying same endpoint ${endpoint.side} ${endpoint.host}:${endpoint.port}`,
