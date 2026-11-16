@@ -178,7 +178,7 @@ if (!fs.existsSync(runSh)) {
   process.exit(2);
 }
 
-/** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, side: string, host: string, port: number, transfers: number, east: number, west: number, alive: boolean, stable?: boolean, suppressExitRetry?: boolean, endpoint?: { side: string, host: string, port: number, ckServer: string } }>} */
+/** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, side: string, host: string, port: number, transfers: number, east: number, west: number, relays: number, confirmedSide: string | null, alive: boolean, stable?: boolean, suppressExitRetry?: boolean, endpoint?: { side: string, host: string, port: number, ckServer: string } }>} */
 const clients = new Map();
 /** Indices currently in a post-stable transfer respawn (avoid double-schedule). */
 const postStableRetrying = new Set();
@@ -188,16 +188,39 @@ let addError = "";
 let abortAdd = false;
 let shuttingDown = false;
 let currentRung = null;
-/** @type {{ id: string, openedAt: number, transfers: number, east: number, west: number } | null} */
+/** @type {{ id: string, openedAt: number, transfers: number, east: number, west: number, relays: number } | null} */
 let openWindow = null;
 
 const lifetime = {
   transfers: 0,
   east_pauses: 0,
   west_pauses: 0,
+  relays: 0,
   starts: 0,
   exits: 0,
 };
+
+/**
+ * LoadWalker owns a side only once the server has placed the bot fully across the seam
+ * (east x>=2008, west x<=1991). The band between is still the border.
+ */
+const EAST_OWNED_X = 2008;
+const WEST_OWNED_X = 1991;
+
+function ownedSide(x) {
+  if (x >= EAST_OWNED_X) return "east";
+  if (x <= WEST_OWNED_X) return "west";
+  return null;
+}
+
+/** Server position from a play packet (`name at x y z` or `blocked at x=`). Not a pause line. */
+function serverReportedX(line) {
+  const blocked = line.match(/ blocked at x=(-?\d+(?:\.\d+)?)/);
+  if (blocked) return Number(blocked[1]);
+  const at = line.match(/ at (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?)\s*$/);
+  if (at) return Number(at[1]);
+  return null;
+}
 
 function botName(globalIndex) {
   return `${NAME_PREFIX}${globalIndex + 1}`;
@@ -336,6 +359,9 @@ function spawnWalker(globalIndex, endpoint) {
     transfers: 0,
     east: 0,
     west: 0,
+    relays: 0,
+    /** Last side the server's position packet confirmed. A spawn does not count as a crossing. */
+    confirmedSide: null,
     alive: true,
     /** Set true after the early-stable window passes near the seam. */
     stable: false,
@@ -361,16 +387,27 @@ function spawnWalker(globalIndex, endpoint) {
         if (openWindow) openWindow.transfers++;
         state.earlyExitReason = "transfer";
       }
-      if (line.includes("east pause")) {
+      // Pause stats count only a finished hold. "east pause start" is not a completed pause.
+      if (line.includes("east pause done")) {
         state.east++;
         lifetime.east_pauses++;
         if (openWindow) openWindow.east++;
       }
-      if (line.includes("west pause")) {
+      if (line.includes("west pause done")) {
         state.west++;
         lifetime.west_pauses++;
         if (openWindow) openWindow.west++;
       }
+      // A crossing counts when the server's position moves the bot from one owned side to the other.
+      // A pause line, finished or not, does not. A visible transfer packet is a failure, counted above.
+      const reportedX = serverReportedX(line);
+      const sideNow = reportedX == null ? null : ownedSide(reportedX);
+      if (sideNow && state.confirmedSide && sideNow !== state.confirmedSide) {
+        state.relays++;
+        lifetime.relays++;
+        if (openWindow) openWindow.relays++;
+      }
+      if (sideNow) state.confirmedSide = sideNow;
     }
   };
   let pos = logMark;
@@ -749,11 +786,13 @@ function statsJson() {
   let transfers = 0;
   let east = 0;
   let west = 0;
+  let relays = 0;
   for (const c of clients.values()) {
     if (c.alive) active++;
     transfers += c.transfers;
     east += c.east;
     west += c.west;
+    relays += c.relays;
   }
   const window = openWindow
     ? {
@@ -761,25 +800,25 @@ function statsJson() {
         transfers: openWindow.transfers,
         east_pauses: openWindow.east,
         west_pauses: openWindow.west,
-        relays: openWindow.east + openWindow.west,
+        relays: openWindow.relays,
       }
     : null;
   return {
     instance_id: INSTANCE_ID,
     lifetime: {
       ...lifetime,
-      relays: lifetime.east_pauses + lifetime.west_pauses,
       active,
       live_transfers: transfers,
       live_east_pauses: east,
       live_west_pauses: west,
+      live_relays: relays,
     },
     window,
     counters: {
       transfers: lifetime.transfers,
       east_pauses: lifetime.east_pauses,
       west_pauses: lifetime.west_pauses,
-      relays: lifetime.east_pauses + lifetime.west_pauses,
+      relays: lifetime.relays,
     },
   };
 }
@@ -791,7 +830,7 @@ function ensureStatsDir() {
 function openRung(id) {
   if (!id) return "id required";
   if (openWindow) return `rung ${openWindow.id} already open`;
-  openWindow = { id, openedAt: Date.now(), transfers: 0, east: 0, west: 0 };
+  openWindow = { id, openedAt: Date.now(), transfers: 0, east: 0, west: 0, relays: 0 };
   currentRung = id;
   return "";
 }
@@ -809,7 +848,7 @@ function closeRung() {
         transfers: openWindow.transfers,
         east_pauses: openWindow.east,
         west_pauses: openWindow.west,
-        relays: openWindow.east + openWindow.west,
+        relays: openWindow.relays,
       },
     },
     status: statusJson(),
