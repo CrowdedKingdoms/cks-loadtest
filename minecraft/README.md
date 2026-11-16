@@ -79,8 +79,8 @@ respawned.
 
 - `active` — walkers still on one TCP session
 - `transfers` — `ClientboundTransferPacket` count (failures)
-- `east_pauses` / `west_pauses` — completed deep targets
-- `relays` — east_pauses + west_pauses (same-socket crossings observed)
+- `east_pauses` / `west_pauses` — pauses that finished (`east pause done` / `west pause done`). A "pause start" line does not count.
+- `relays` — same-socket crossings the server confirmed: the bot's reported position moved from fully west (x ≤ 1991) to fully east (x ≥ 2008), or the reverse. A pause by itself is not a crossing. `transfers` remains the visible transfer-packet failure count.
 
 ## SoftMax multi-VM fleet (preferred)
 
