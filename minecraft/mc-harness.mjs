@@ -213,10 +213,18 @@ function ownedSide(x) {
   return null;
 }
 
-/** Server position from a play packet (`name at x y z` or `blocked at x=`). Not a pause line. */
+/**
+ * Server-reported X for owned-side tracking. Prefer LoadWalker's common status tick
+ * (`phase=play … x=2007.51 …`); also `blocked at x=` and the rare `at x y z` line.
+ * Pause-done lines have no X and are ignored here (pauses have their own counters).
+ */
 function serverReportedX(line) {
   const blocked = line.match(/ blocked at x=(-?\d+(?:\.\d+)?)/);
   if (blocked) return Number(blocked[1]);
+  // Common: "Load1 phase=play placed=true x=2007.510000000003 y=63.0 z=-55.0 …"
+  const play = line.match(/\bphase=play\b[\s\S]*?\bx=(-?\d+(?:\.\d+)?)/);
+  if (play) return Number(play[1]);
+  // Rare one-shot after a place packet: "Load1 at 2007.5 63.0 -55.0"
   const at = line.match(/ at (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?)\s*$/);
   if (at) return Number(at[1]);
   return null;
