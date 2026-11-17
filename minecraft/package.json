@@ -1,0 +1,9 @@
+{
+  "name": "cks-loadtest-minecraft",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@crowdedkingdoms/crowdyjs": "18.31.1-test.1",
+    "prismarine-nbt": "^2.7.0"
+  }
+}
