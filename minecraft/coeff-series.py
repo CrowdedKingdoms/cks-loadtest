@@ -3,15 +3,22 @@
 
 Writes one JSON object per plateau to coefficients.jsonl. A row is accepted
 only when the 3-minute hold sticks, crossing-based relays are > 0, transfers
-are 0, duplicate-UUID warnings during the window are 0, actors per online
-player are about 1, Java RSS and the server-property retune are present, and
-binding is not cpu.
+are 0, duplicate-UUID warnings during the window are 0, Java RSS and the
+server-property retune are present, and binding is not cpu.
+actors_per_player is logged at every step and does not stop the climb,
+whether it is below 1.7, between 1.7 and 3.0, or above 3.0.
 
-Hold targets are fleet totals 2, then 4, then 8. Bots are added on the first
-loadgen only so global indices stay consecutive (even west, odd east). Creep
-by 4 only after an accepted unbound hold at 8. Series 2 (a new 2x b3-16 pair)
-opens only when RAM is what fills and the actor gates passed. Mesh width stays
-2. This script does not create or delete VMs.
+Hold targets are fleet totals 2, then 4, then 8, unless COEFF_LADDER sets
+the first targets (this climb uses 8, then creeps). Bots are added onto the
+host that owns the next free indices, in index_base order, so the global
+sequence stays consecutive (even west, odd east) and a full slice spills
+onto the next loadgen. fleet-ctl add --count N still means N per host; this
+driver must not use that, because the fleet would jump by N times the hosts.
+Creep by 4 after an accepted unbound hold. Series 2 (a new 2x b3-16 pair)
+opens only when RAM is what fills and the strict 0.95–1.05 actor band
+passed. Mesh width stays 2. This script does not
+create or delete VMs. COEFF_CLEAR_AT_END=1 wipes walkers when the script
+exits; the default leaves the last hold running.
 
 LoadWalker max runtime must be longer than the hold. The unset default is
 180s, which ends the walker as the hold ends.
@@ -41,6 +48,9 @@ CPU_LOAD_FACTOR = 0.90
 CPU_BUSY_PCT = 90.0
 ACTOR_LO = 0.95
 ACTOR_HI = 1.05
+# Logged only. A ratio outside 1.7–3.0 used to stop the climb. It does not.
+DOUBLE_LO = 1.7
+DOUBLE_HI = 3.0
 
 RUN = Path(os.environ.get("COEFF_RUN") or (Path.home() / ".local/state/cks-mc-loadtest-run"))
 KEY = Path(os.environ.get("COEFF_SSH_KEY") or (Path.home() / ".local/state/cks-test-mc-cluster/id_ed25519"))
@@ -75,6 +85,22 @@ def binding_of(*, hold_ok: bool, ram_frac: float | None, load1: float | None, np
     return "unbound"
 
 
+def in_actor_band(ratio: object) -> bool:
+    return isinstance(ratio, (int, float)) and ACTOR_LO <= float(ratio) <= ACTOR_HI
+
+
+def actor_ratio_note(ratio: object) -> str:
+    """Where the ratio sits. This never decides whether the climb continues."""
+    if not isinstance(ratio, (int, float)):
+        return "missing"
+    value = float(ratio)
+    if value > DOUBLE_HI:
+        return "above 3.0"
+    if value < DOUBLE_LO:
+        return "below 1.7"
+    return "in range"
+
+
 def reject_reasons(row: dict) -> list[str]:
     reasons: list[str] = []
     if not row.get("hold_ok"):
@@ -87,9 +113,6 @@ def reject_reasons(row: dict) -> list[str]:
         reasons.append("n_held")
     if int(row.get("dup_uuid_warnings") if row.get("dup_uuid_warnings") is not None else -1) != 0:
         reasons.append("dup_uuid_warnings")
-    ratio = row.get("actors_per_player")
-    if not isinstance(ratio, (int, float)) or not (ACTOR_LO <= float(ratio) <= ACTOR_HI):
-        reasons.append("actors_per_player")
     if row.get("binding") == "cpu":
         reasons.append("binding=cpu")
     if not row.get("java_rss_ok"):
@@ -119,7 +142,17 @@ def series2_eligible(row: dict) -> bool:
 
 
 def creep_allowed(row: dict) -> bool:
-    return bool(row.get("accepted") and row.get("binding") == "unbound" and row.get("hold_ok"))
+    """Step again when the hold kept every walker and the seam is still crossing.
+    A cpu tag on a hold that stayed up is recorded. The climb stops when a hold drops walkers."""
+    if not row.get("hold_ok"):
+        return False
+    if int(row.get("relays") or 0) <= 0:
+        return False
+    if int(row.get("transfers") or 0) != 0:
+        return False
+    if row.get("binding") == "ram":
+        return False
+    return True
 
 
 def self_test() -> int:
@@ -141,7 +174,17 @@ def self_test() -> int:
         ("cpu out", {**base, "binding": "cpu"}, ["binding=cpu"]),
         ("no relay", {**base, "relays": 0}, ["relays=0"]),
         ("dup", {**base, "dup_uuid_warnings": 3}, ["dup_uuid_warnings"]),
-        ("actors", {**base, "actors_per_player": 9.0}, ["actors_per_player"]),
+        ("actors high", {**base, "actors_per_player": 9.0}, []),
+        ("actors above cap", {**base, "actors_per_player": 4.2222}, []),
+        ("actors below floor", {**base, "actors_per_player": 0.5}, []),
+        ("double count", {**base, "actors_per_player": 2.44}, []),
+        ("double count exact", {**base, "actors_per_player": 2.0}, []),
+        (
+            "double count plus kick",
+            {**base, "actors_per_player": 2.44, "transfers": 1},
+            ["transfers"],
+        ),
+        ("four actors", {**base, "actors_per_player": 4.0}, []),
         ("no rss", {**base, "java_rss_ok": False}, ["java_rss"]),
         ("broken", {**base, "hold_ok": False, "n_held": 6}, ["hold_broken", "n_held"]),
     ]
@@ -168,12 +211,45 @@ def self_test() -> int:
     if series2_eligible(dirty):
         print("FAIL series2 must ignore a ghost pile")
         failed += 1
+    for ratio, note in ((4.2222, "above 3.0"), (0.5, "below 1.7"), (2.44, "in range"), (1.0, "below 1.7")):
+        sample = {**base, "actors_per_player": ratio}
+        if reject_reasons(sample) or actor_ratio_note(ratio) != note:
+            print(f"FAIL ratio {ratio} should continue and log {note}")
+            failed += 1
+        if creep_allowed({**sample, "accepted": not reject_reasons(sample)}) is not True:
+            print(f"FAIL creep at ratio {ratio}")
+            failed += 1
     if creep_allowed({**base, "accepted": True}) is not True:
         print("FAIL creep")
         failed += 1
-    if creep_allowed({**base, "accepted": False, "binding": "cpu"}):
-        print("FAIL no creep on cpu")
+    if not creep_allowed({**base, "accepted": False, "binding": "cpu", "hold_ok": True}):
+        print("FAIL cpu tag should not stop a hold that stuck")
         failed += 1
+    if creep_allowed({**base, "hold_ok": False, "binding": "cpu", "n_held": 6}):
+        print("FAIL no creep when the hold broke")
+        failed += 1
+    full = [
+        {"_host": "http://lg1:9109", "index_base": 0, "index_used": 28, "index_limit": 28},
+        {"_host": "http://lg2:9109", "index_base": 28, "index_used": 0, "index_limit": 28},
+        {"_host": "http://lg3:9109", "index_base": 56, "index_used": 0, "index_limit": 28},
+    ]
+    if place_adds(full, 4) != [("http://lg2:9109", 4)]:
+        print(f"FAIL full first slice should spill onto the second: {place_adds(full, 4)}")
+        failed += 1
+    crossing = [
+        {"_host": "http://lg2:9109", "index_base": 28, "index_used": 0, "index_limit": 28},
+        {"_host": "http://lg1:9109", "index_base": 0, "index_used": 26, "index_limit": 28},
+    ]
+    split = place_adds(crossing, 4)
+    if split != [("http://lg1:9109", 2), ("http://lg2:9109", 2)]:
+        print(f"FAIL boundary split: {split}")
+        failed += 1
+    try:
+        place_adds(full, 60)
+        print("FAIL oversize delta should fail before any add")
+        failed += 1
+    except SliceShortfall:
+        pass
     if failed:
         print(f"{failed} failed")
         return 1
@@ -364,11 +440,37 @@ def ensure_walker_runtime(token: str) -> None:
                 raise SystemExit(f"pose-split dropped after restart on {row.get('instance_id')}")
 
 
-def add_on_first(token: str, count: int) -> None:
-    host = hosts()[0]
-    code, body = api(host, token, "POST", "/v1/clients/add", {"count": count})
-    if code not in (200, 202):
-        raise RuntimeError(f"add {count} rejected {code}: {body}")
+class SliceShortfall(RuntimeError):
+    """The fleet's free index slices cannot hold this many new walkers."""
+
+
+def place_adds(rows: list[dict], delta: int) -> list[tuple[str, int]]:
+    """Assign `delta` new walkers onto hosts in index_base order.
+
+    Each host only receives as many as its slice has free. A step that
+    crosses a boundary is split so the caller can finish the first host
+    before starting the next. This does not talk to the fleet.
+    """
+    if delta <= 0:
+        raise ValueError(f"delta must be positive, got {delta}")
+    ordered = sorted(rows, key=lambda row: int(row.get("index_base") or 0))
+    plan: list[tuple[str, int]] = []
+    left = delta
+    for row in ordered:
+        if left <= 0:
+            break
+        room = int(row.get("index_limit") or 0) - int(row.get("index_used") or 0)
+        if room <= 0:
+            continue
+        host = row.get("_host") or row.get("host")
+        if not host:
+            raise ValueError("status row missing host")
+        take = min(room, left)
+        plan.append((str(host), take))
+        left -= take
+    if left:
+        raise SliceShortfall(f"fleet index slices short by {left}")
+    return plan
 
 
 def wait_until(token: str, target: int, timeout: int) -> tuple[bool, str]:
@@ -389,6 +491,32 @@ def wait_until(token: str, target: int, timeout: int) -> tuple[bool, str]:
             return False, last
         time.sleep(POLL_SEC)
     return False, f"timeout {last}"
+
+
+def add_on_host(token: str, host: str, count: int) -> None:
+    code, body = api(host, token, "POST", "/v1/clients/add", {"count": count})
+    if code not in (200, 202):
+        raise RuntimeError(f"add {count} on {host} rejected {code}: {body}")
+
+
+def add_across_slices(token: str, delta: int) -> tuple[bool, str]:
+    """Place `delta` walkers on the slices that own the next indices.
+
+    SliceShortfall is raised before any HTTP call when the fleet has no room.
+    A boundary split waits until the first host finishes before the next
+    host starts, so logins stay one at a time.
+    """
+    rows = fan_status(token)
+    plan = place_adds(rows, delta)
+    progressed = fleet_active(rows)
+    for host, count in plan:
+        log(f"add {count} on {host} toward fleet {progressed + count}")
+        add_on_host(token, host, count)
+        progressed += count
+        ok, detail = wait_until(token, progressed, timeout=max(180, 45 * count))
+        if not ok:
+            return False, detail
+    return True, f"active={progressed}"
 
 
 def sample_metrics(out: Path, seconds: int) -> subprocess.Popen[str]:
@@ -706,6 +834,9 @@ def build_row(
     reasons = reject_reasons(row)
     row["accepted"] = not reasons
     row["reject_reasons"] = reasons
+    note = actor_ratio_note(ratio)
+    row["actors_note"] = note
+    row["actors_waiver"] = "" if in_actor_band(ratio) else "logged_not_gating"
     row["opens_series_2"] = series2_eligible(row)
     return row
 
@@ -810,10 +941,41 @@ def clear_fleet(token: str) -> None:
     time.sleep(2)
 
 
+def clear_when_finished() -> bool:
+    return os.environ.get("COEFF_CLEAR_AT_END", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def climb_ceiling() -> int:
+    raw = os.environ.get("COEFF_CEILING", "").strip()
+    if not raw:
+        return 0
+    ceiling = int(raw)
+    if ceiling <= 0:
+        raise SystemExit(f"COEFF_CEILING must be a positive count, got {raw!r}")
+    return ceiling
+
+
+def resume_live() -> bool:
+    return os.environ.get("COEFF_RESUME", "").strip().lower() in {"1", "true", "yes"}
+
+
+def ladder_targets() -> list[int]:
+    raw = os.environ.get("COEFF_LADDER", "").strip()
+    if not raw:
+        return list(LADDER)
+    targets = [int(part) for part in raw.split(",") if part.strip()]
+    if not targets or any(n <= 0 for n in targets):
+        raise SystemExit(f"COEFF_LADDER must be positive counts, got {raw!r}")
+    return targets
+
+
 def append_row(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fh:
         fh.write(json.dumps(row, sort_keys=True) + "\n")
+    log(
+        f"actors_per_player={row.get('actors_per_player')} note={row.get('actors_note')} continuing"
+    )
     log(
         f"row n_target={row['n_target']} n_held={row['n_held']} binding={row['binding']} "
         f"accepted={row['accepted']} relays={row['relays']} transfers={row['transfers']} "
@@ -830,13 +992,19 @@ def main() -> int:
     out_dir.mkdir(parents=True)
     jsonl = out_dir / "coefficients.jsonl"
     log(f"series 1 out={out_dir}")
-    ensure_walker_runtime(token)
+    resuming = resume_live()
+    if resuming:
+        rows = fan_status(token)
+        log(f"resuming live walkers active={fleet_active(rows)}; not clearing")
+    else:
+        ensure_walker_runtime(token)
+        clear_fleet(token)
+        rows = fan_status(token)
+        if fleet_active(rows) != 0 or any(int(r.get("index_used") or 0) != 0 for r in rows):
+            raise SystemExit("fleet not reset before the ladder")
     close_open_rungs(token)
-    clear_fleet(token)
-    rows = fan_status(token)
-    if fleet_active(rows) != 0 or any(int(r.get("index_used") or 0) != 0 for r in rows):
-        raise SystemExit("fleet not reset before the ladder")
-    targets = list(LADDER)
+    targets = ladder_targets()
+    log(f"ladder {targets} ceiling={climb_ceiling() or 'none'} clear_at_end={clear_when_finished()}")
     index = 0
     opens_series_2 = False
     stopped = "ladder complete"
@@ -847,9 +1015,11 @@ def main() -> int:
             delta = target - before
             if delta <= 0:
                 raise SystemExit(f"fleet already at {before}, wanted to climb to {target}")
-            log(f"add {delta} on first loadgen toward fleet {target}")
-            add_on_first(token, delta)
-            ok, detail = wait_until(token, target, timeout=max(180, 45 * delta))
+            log(f"add {delta} across loadgen slices toward fleet {target}")
+            try:
+                ok, detail = add_across_slices(token, delta)
+            except SliceShortfall as exc:
+                ok, detail = False, str(exc)
             if not ok:
                 row = build_row(
                     n_target=target,
@@ -875,16 +1045,24 @@ def main() -> int:
                 break
             index += 1
             if index == len(targets) and creep_allowed(row):
-                targets.append(target + CREEP)
-                log(f"creep to {target + CREEP}")
+                nxt = target + CREEP
+                ceiling = climb_ceiling()
+                if ceiling and nxt > ceiling:
+                    stopped = f"reached {target} under ceiling {ceiling}"
+                else:
+                    targets.append(nxt)
+                    log(f"creep to {nxt}")
             elif index == len(targets):
                 stopped = "no creep: hold was not an accepted unbound row"
     finally:
-        log("clearing walkers")
-        try:
-            clear_fleet(token)
-        except Exception as exc:
-            log(f"clear failed: {exc}")
+        if clear_when_finished():
+            log("clearing walkers")
+            try:
+                clear_fleet(token)
+            except Exception as exc:
+                log(f"clear failed: {exc}")
+        else:
+            log("leaving walkers up")
     outcome = {
         "series": "8gb",
         "stopped": stopped,

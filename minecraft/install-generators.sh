@@ -3,16 +3,22 @@
 #
 # Mirrors infra-control-plane/scripts/ops/loadtest-generators.sh:
 #   - one harness process per bare OVH VM (no containers)
-#   - disjoint LT_INDEX_BASE / LT_INDEX_LIMIT slices from fleet order
+#   - disjoint LT_INDEX_BASE / LT_INDEX_LIMIT slices from fleet order,
+#     sized from idle MemAvailable so one host cannot be told to run 100 JVMs
 #   - control bind on the host's OWN tailnet address :9109 (never 0.0.0.0)
 #   - hosts.txt for fleet-ctl / cks-loadtest-ctl fan-out
 #   - apt daily timers disabled; Restart=no so crashes stay visible
 #
 #   minecraft/install-generators.sh install --run $RUN --dist /path/to/loadwalker-dist \
-#       --clients-per-host 25 [--port 9109]
+#       [--clients-per-host 25] [--port 9109]
 #   minecraft/install-generators.sh verify  --run $RUN
 #   minecraft/install-generators.sh collect --run $RUN
 #   minecraft/install-generators.sh hosts   --run $RUN
+#   minecraft/install-generators.sh self-test
+#
+# --clients-per-host is optional. Install measures MemAvailable on every host
+# and refuses a count above floor((tightest MemAvailable - 1.5GiB) / 450MiB).
+# Measure while the hosts are idle; a loaded box reports a smaller cap.
 #
 # $RUN must contain:
 #   loadgen-fleet.json   from minecraft/loadgen-fleet.mjs up
@@ -31,12 +37,80 @@ while [ $# -gt 0 ]; do
     --dist) DIST="${2:-}"; shift 2 ;;
     --clients-per-host) CPH="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install-generators: unknown $1" >&2; exit 2 ;;
   esac
 done
 die() { echo "install-generators: $*" >&2; exit 2; }
-[ -n "$CMD" ] || die "usage: install|verify|collect|hosts --run DIR ..."
+[ -n "$CMD" ] || die "usage: install|verify|collect|hosts|self-test --run DIR ..."
+
+# One LoadWalker was ~370–400 MiB RSS when lg-1 was OOM-killed. Budget 450 MiB
+# and leave 1.5 GiB for node, Tailscale, and the OS. The harness reads the same
+# numbers from LT_WALKER_RSS_KB and LT_MEM_RESERVE_KB.
+WALKER_RSS_KB=$((450 * 1024))
+MEM_RESERVE_KB=$((1536 * 1024))
+
+walker_cap() {
+  local avail="$1" reserve="$2" walker="$3"
+  if [ "$avail" -le "$reserve" ] || [ "$walker" -le 0 ]; then
+    echo 0
+    return
+  fi
+  echo $(( (avail - reserve) / walker ))
+}
+
+# stdin: "base limit name" lines, already sorted by base. Adjacent slices
+# touch at the boundary and are not an overlap. base 0 limit 100 and base 40
+# do overlap, which a same-base check misses.
+report_range_overlaps() {
+  local b l name end prev_end="" prev_name="" rc=0 line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    read -r b l name <<<"$line"
+    [[ "$b" =~ ^[0-9]+$ && "$l" =~ ^[0-9]+$ ]] || continue
+    end=$(( b + l ))
+    if [ -n "$prev_end" ] && [ "$b" -lt "$prev_end" ]; then
+      echo "OVERLAP ${prev_name} covers through $((prev_end - 1)) and ${name} starts at ${b}" >&2
+      rc=1
+    fi
+    prev_end="$end"
+    prev_name="$name"
+  done
+  return "$rc"
+}
+
+install_generators_self_test() {
+  local fail=0 cap
+  cap="$(walker_cap 15728640 "$MEM_RESERVE_KB" "$WALKER_RSS_KB")"
+  if [ "$cap" != 30 ]; then
+    echo "FAIL 15GiB available cap=$cap want 30" >&2
+    fail=1
+  fi
+  cap="$(walker_cap "$MEM_RESERVE_KB" "$MEM_RESERVE_KB" "$WALKER_RSS_KB")"
+  if [ "$cap" != 0 ]; then
+    echo "FAIL reserve cap=$cap want 0" >&2
+    fail=1
+  fi
+  if printf '%s\n' "0 100 lg1" "40 40 lg2" | sort -n | report_range_overlaps; then
+    echo "FAIL overlap 0/100 and 40/40 was accepted" >&2
+    fail=1
+  fi
+  if ! printf '%s\n' "56 28 lg3" "0 28 lg1" "28 28 lg2" | sort -n | report_range_overlaps; then
+    echo "FAIL disjoint slices were rejected" >&2
+    fail=1
+  fi
+  if [ "$fail" = 0 ]; then
+    echo "install-generators self-test ok"
+    return 0
+  fi
+  return 1
+}
+
+if [ "$CMD" = "self-test" ]; then
+  install_generators_self_test
+  exit $?
+fi
+
 [ -n "$RUN" ] && [ -d "$RUN" ] || die "--run DIR required"
 # SoftMax inventory may be a sibling of the one-box shortcut state:
 #   LOADGEN_STATE=$RUN/loadgen-fleet-softmax.json
@@ -75,6 +149,25 @@ resolve_addrs() {
 resolve_addrs
 tssh() { tailscale ssh "ubuntu@$1" -- "${@:2}"; }
 
+# Tightest idle MemAvailable across the fleet. A loaded host reports a
+# smaller cap, so install while the walkers are down.
+measured_clients_per_host() {
+  local n ip kb min="" cap
+  for n in "${NAMES[@]}"; do
+    ip="${ADDR[$n]}"
+    kb="$(tssh "$ip" "awk '/MemAvailable:/ {print \$2}' /proc/meminfo" | tr -d '[:space:]')"
+    [[ "$kb" =~ ^[0-9]+$ ]] || die "$n: MemAvailable unreadable (${kb:-empty})"
+    echo "  $n MemAvailable=${kb}kB" >&2
+    if [ -z "$min" ] || [ "$kb" -lt "$min" ]; then min="$kb"; fi
+  done
+  cap="$(walker_cap "$min" "$MEM_RESERVE_KB" "$WALKER_RSS_KB")"
+  echo "install-generators: memory cap ${cap} walkers/host (tightest MemAvailable ${min}kB, walker ${WALKER_RSS_KB}kB, reserve ${MEM_RESERVE_KB}kB)" >&2
+  if [ "$cap" -le 0 ]; then
+    die "memory cap is 0; free MemAvailable down to the ${MEM_RESERVE_KB}kB reserve before install"
+  fi
+  echo "$cap"
+}
+
 write_hosts() {
   : > "$RUN/hosts.txt"
   for n in "${NAMES[@]}"; do
@@ -110,11 +203,20 @@ case "$CMD" in
 
   install)
     [ -n "$DIST" ] && [ -d "$DIST" ] || die "--dist DIR (loadwalker-dist) required"
-    [ -n "$CPH" ] && [ "$CPH" -gt 0 ] || die "--clients-per-host N required"
+    if [ -n "$CPH" ] && ! [[ "$CPH" =~ ^[1-9][0-9]*$ ]]; then
+      die "--clients-per-host must be a positive integer"
+    fi
     [ -f "$RUN/lt.env" ] || die "no $RUN/lt.env"
     [ -f "$RUN/control-token" ] || die "no $RUN/control-token"
     TOKEN="$(cat "$RUN/control-token")"
     check_nproc_all
+    cap="$(measured_clients_per_host)" || die "could not measure MemAvailable"
+    if [ -z "$CPH" ]; then
+      CPH="$cap"
+    elif [ "$CPH" -gt "$cap" ]; then
+      die "--clients-per-host ${CPH} exceeds memory cap ${cap} (floor((MemAvailable - 1.5GiB) / 450MiB) on the tightest host)"
+    fi
+    echo "install-generators: clients-per-host=${CPH}" >&2
 
     TAR="$(mktemp -t ck-mc-dist.XXXXXX.tar.gz)"
     tar -C "$DIST" -czf "$TAR" .
@@ -138,11 +240,13 @@ case "$CMD" in
       cat "$HARNESS_TAR" | tssh "$ip" 'tar -xzf - -C /opt/ck-mc-harness && cd /opt/ck-mc-harness/minecraft && npm install --omit=dev --silent'
       env_file="$(mktemp)"
       {
-        grep -Ev '^\s*(#|$)' "$RUN/lt.env"
+        grep -Ev '^\s*(#|$)|^\s*(LT_WALKER_RSS_KB|LT_MEM_RESERVE_KB)=' "$RUN/lt.env"
         cat <<EOF
 LT_CLIENTS=0
 LT_INDEX_BASE=$base
 LT_INDEX_LIMIT=$CPH
+LT_WALKER_RSS_KB=$WALKER_RSS_KB
+LT_MEM_RESERVE_KB=$MEM_RESERVE_KB
 LT_INSTANCE_ID=$n
 LT_CONTROL_BIND=$ip:$PORT
 LT_CONTROL_TOKEN=$TOKEN
@@ -167,6 +271,11 @@ EnvironmentFile=/opt/ck-mc-harness/lt.env
 ExecStart=/usr/bin/node /opt/ck-mc-harness/minecraft/mc-harness.mjs
 # SoftMax: a crash must stay visible rather than silently re-provision mid-rung.
 Restart=no
+# One JVM OOM must not stop node. MemoryMax keeps that kill inside this
+# cgroup, about 2 GiB under a b3-16, so Tailscale and ssh stay up.
+OOMPolicy=continue
+MemoryMax=12G
+OOMScoreAdjust=-500
 LimitNOFILE=200000
 KillSignal=SIGTERM
 TimeoutStopSec=30
@@ -226,6 +335,13 @@ EOF
       limits+=("$limit")
       i=$(( i + 1 ))
     done
+    overlap_in=""
+    for ((i=0; i<${#NAMES[@]}; i++)); do
+      overlap_in+="${bases[$i]} ${limits[$i]} ${NAMES[$i]}"$'\n'
+    done
+    if ! printf '%s' "$overlap_in" | sort -n | report_range_overlaps; then
+      rc=1
+    fi
     # SoftMax contiguous slices when every host shares the same limit.
     if [ "${#limits[@]}" -gt 1 ] && [ "${limits[0]}" != "?" ]; then
       cph="${limits[0]}"
@@ -254,5 +370,5 @@ EOF
     done
     ;;
 
-  *) die "unknown command $CMD (install|verify|collect|hosts)" ;;
+  *) die "unknown command $CMD (install|verify|collect|hosts|self-test)" ;;
 esac

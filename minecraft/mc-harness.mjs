@@ -121,6 +121,12 @@ const ADD_RETRIES = Math.max(0, Number(env("LT_ADD_RETRIES", "2")));
 const MC_DIST = requireEnv("LT_MC_DIST");
 const INDEX_BASE = Number(env("LT_INDEX_BASE", "0"));
 const INDEX_LIMIT = Number(env("LT_INDEX_LIMIT", "8"));
+/** One LoadWalker was ~370–400 MiB RSS on the 2026-11-16 OOM. Budget 450 MiB. */
+const WALKER_RSS_KB = Math.max(1, Number(env("LT_WALKER_RSS_KB", String(450 * 1024))));
+/** Leave this much MemAvailable after the next walker for node, Tailscale, and the OS. */
+const MEM_RESERVE_KB = Math.max(0, Number(env("LT_MEM_RESERVE_KB", String(1536 * 1024))));
+/** Above the unit's OOMScoreAdjust=-500, so the kernel kills a walker before node. */
+const WALKER_OOM_SCORE_ADJ = "500";
 const INSTANCE_ID = env("LT_INSTANCE_ID", os.hostname());
 const STATS_DIR = env("LT_STATS_DIR", "");
 const NAME_PREFIX = env("LT_MC_NAME_PREFIX", "Load");
@@ -335,6 +341,56 @@ function clearClients() {
   addError = "";
 }
 
+function memAvailableKb() {
+  try {
+    const text = fs.readFileSync("/proc/meminfo", "utf8");
+    const match = text.match(/^MemAvailable:\s+(\d+)\s+kB/m);
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Empty when one more walker would still leave the reserve free. */
+function memoryBlocksSpawn() {
+  const avail = memAvailableKb();
+  if (avail == null) return "MemAvailable unreadable";
+  if (avail < WALKER_RSS_KB + MEM_RESERVE_KB) {
+    return `not enough MemAvailable=${avail}kB for one walker (${WALKER_RSS_KB}kB) plus reserve ${MEM_RESERVE_KB}kB`;
+  }
+  return "";
+}
+
+function preferWalkerForOom(pid) {
+  if (!pid) return;
+  try {
+    fs.writeFileSync(`/proc/${pid}/oom_score_adj`, WALKER_OOM_SCORE_ADJ);
+  } catch (e) {
+    if (e?.code === "ENOENT") return;
+    console.error(`${ts()} mc-harness: oom_score_adj pid=${pid}: ${e?.message || e}`);
+  }
+}
+
+/** The service score is inherited. Raise it on the shell and on java if run.sh forks. */
+function preferWalkerTreeForOom(pid) {
+  const pending = [pid];
+  const seen = new Set();
+  while (pending.length) {
+    const cur = pending.pop();
+    if (!cur || seen.has(cur)) continue;
+    seen.add(cur);
+    preferWalkerForOom(cur);
+    try {
+      const raw = fs.readFileSync(`/proc/${cur}/task/${cur}/children`, "utf8");
+      for (const part of raw.trim().split(/\s+/)) {
+        if (part) pending.push(Number(part));
+      }
+    } catch {
+      /* child list appears after the shell forks */
+    }
+  }
+}
+
 function spawnWalker(globalIndex, endpoint) {
   const name = botName(globalIndex);
   const { host, port, side } = endpoint;
@@ -346,6 +402,8 @@ function spawnWalker(globalIndex, endpoint) {
     stdio: ["ignore", logFd, logFd],
     detached: false,
   });
+  preferWalkerTreeForOom(proc.pid);
+  setTimeout(() => preferWalkerTreeForOom(proc.pid), 250);
   fs.closeSync(logFd);
 
   let logMark = 0;
@@ -694,6 +752,8 @@ function requestAdd(count) {
   if (used + count > INDEX_LIMIT) {
     return `would exceed LT_INDEX_LIMIT=${INDEX_LIMIT} (used=${used})`;
   }
+  const memErr = memoryBlocksSpawn();
+  if (memErr) return memErr;
   busy = true;
   addError = "";
   abortAdd = false;
@@ -708,6 +768,13 @@ function requestAdd(count) {
         for (let i = 0; i < count; i++) {
           if (abortAdd || shuttingDown) {
             console.error(`${ts()} mc-harness: add aborted before slot ${i + 1}/${count}`);
+            break;
+          }
+          const slotMemErr = memoryBlocksSpawn();
+          if (slotMemErr) {
+            addError = slotMemErr;
+            console.error(`${ts()} mc-harness: ${addError}; stopping add`);
+            abortAdd = true;
             break;
           }
           const gi = INDEX_BASE + used;
@@ -771,6 +838,9 @@ function statusJson() {
     index_base: INDEX_BASE,
     index_used: used,
     index_limit: INDEX_LIMIT,
+    mem_available_kb: memAvailableKb(),
+    walker_rss_kb: WALKER_RSS_KB,
+    mem_reserve_kb: MEM_RESERVE_KB,
     active,
     busy,
     add_error: addError || undefined,
