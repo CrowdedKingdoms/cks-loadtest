@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
-# Sample CPU / RAM / NIC / Java RSS on the two Fabric game VMs.
+# Sample CPU / RAM / NIC / Java RSS on the Fabric game VMs.
 #
 #   minecraft/fabric-metrics.sh --west 40.160.15.239 --east 40.160.99.136 \
 #     --ssh-key ~/.local/state/cks-test-mc-cluster/id_ed25519 \
 #     --out /path/to/run/fabric-metrics.jsonl --interval 5 --seconds 60
 #
+# --north is optional. Omit it and the sampler stays on the west/east pair.
+#
 # Each sample includes host MemTotal/used, CPU busy percent, NIC byte counters,
 # load1, nproc, and the RSS of the Fabric/Minecraft Java process. Java RSS is
 # required on a coefficient row; host used-RAM is not a stand-in.
 set -euo pipefail
-WEST=""; EAST=""; KEY="${HOME}/.local/state/cks-test-mc-cluster/id_ed25519"
-OUT=""; INTERVAL=5; SECONDS_N=60
+WEST=""; EAST=""; NORTH=""; KEY="${HOME}/.local/state/cks-test-mc-cluster/id_ed25519"
+OUT=""; INTERVAL=5; SECONDS_N=60; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --west) WEST="${2:-}"; shift 2 ;;
     --east) EAST="${2:-}"; shift 2 ;;
+    --north) NORTH="${2:-}"; shift 2 ;;
     --ssh-key) KEY="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --interval) INTERVAL="${2:-}"; shift 2 ;;
     --seconds) SECONDS_N="${2:-}"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
     *) echo "fabric-metrics: unknown $1" >&2; exit 2 ;;
   esac
 done
+if [ "$DRY" = 1 ]; then
+  [ -n "$WEST" ] && [ -n "$EAST" ] || { echo "need --west --east" >&2; exit 2; }
+  printf 'west %s\n' "$WEST"
+  printf 'east %s\n' "$EAST"
+  if [ -n "$NORTH" ]; then
+    printf 'north %s\n' "$NORTH"
+  fi
+  exit 0
+fi
 [ -n "$WEST" ] && [ -n "$EAST" ] && [ -n "$OUT" ] || { echo "need --west --east --out" >&2; exit 2; }
 mkdir -p "$(dirname "$OUT")"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new)
@@ -88,7 +101,11 @@ end=$(( $(date +%s) + SECONDS_N ))
 : > "$OUT"
 while [ "$(date +%s)" -lt "$end" ]; do
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  for pair in "west:$WEST" "east:$EAST"; do
+  pairs=("west:$WEST" "east:$EAST")
+  if [ -n "$NORTH" ]; then
+    pairs+=("north:$NORTH")
+  fi
+  for pair in "${pairs[@]}"; do
     label="${pair%%:*}"; ip="${pair#*:}"
     raw="$(sample "$ip" "$label" 2>/dev/null || echo '{}')"
     echo "{\"ts\":\"$ts\",\"host\":\"$label\",\"ip\":\"$ip\",\"sample\":$raw}" >> "$OUT"

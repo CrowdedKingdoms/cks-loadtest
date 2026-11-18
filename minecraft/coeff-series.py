@@ -16,9 +16,13 @@ onto the next loadgen. fleet-ctl add --count N still means N per host; this
 driver must not use that, because the fleet would jump by N times the hosts.
 Creep by 4 after an accepted unbound hold. Series 2 (a new 2x b3-16 pair)
 opens only when RAM is what fills and the strict 0.95–1.05 actor band
-passed. Mesh width stays 2. This script does not
+passed. The ladder's mesh width stays 2. This script does not
 create or delete VMs. COEFF_CLEAR_AT_END=1 wipes walkers when the script
 exits; the default leaves the last hold running.
+
+COEFF_NORTH selects a different run: 10 bots on a closed triangle through
+west, east, and north. That smoke does not climb and does not open series 2.
+Leave COEFF_NORTH unset to keep this ladder.
 
 LoadWalker max runtime must be longer than the hold. The unset default is
 180s, which ends the walker as the hold ends.
@@ -59,9 +63,18 @@ RCON_PASS_FILE = Path(
 )
 WEST = os.environ.get("COEFF_WEST", "40.160.15.239")
 EAST = os.environ.get("COEFF_EAST", "40.160.99.136")
+NORTH = os.environ.get("COEFF_NORTH", "").strip()
 METRICS = Path(__file__).with_name("fabric-metrics.sh")
 FLAVOR = "b3-8"
 SERVERS = 2
+SMOKE_BOTS = 10
+SMOKE_TIMEOUT = 600
+# Same vertices as seam-pose.mjs TRIANGLE_VERTICES. The self-test locks them.
+TRIANGLE_VERTICES = (
+    {"side": "west", "x": 1975, "z": 1975},
+    {"side": "east", "x": 2025, "z": 1975},
+    {"side": "north", "x": 2000, "z": 2025},
+)
 
 
 def log(line: str) -> None:
@@ -250,11 +263,114 @@ def self_test() -> int:
         failed += 1
     except SliceShortfall:
         pass
+    if SERVERS != 2:
+        print("FAIL ladder mesh width must stay 2")
+        failed += 1
+    if mesh_width("") != 2 or mesh_width("203.0.113.9") != 3:
+        print("FAIL mesh_width")
+        failed += 1
+    bare = metrics_command(Path("/tmp/coeff-metrics.jsonl"), 30)
+    if bare[2:6] != ["--west", WEST, "--east", EAST] or "--north" in bare:
+        print(f"FAIL two-server metrics argv: {bare}")
+        failed += 1
+    tri = metrics_command(Path("/tmp/coeff-metrics.jsonl"), 30, "203.0.113.9")
+    east_at = tri.index("--east")
+    if tri[east_at + 2 : east_at + 4] != ["--north", "203.0.113.9"]:
+        print(f"FAIL triangle metrics argv: {tri}")
+        failed += 1
+    if not smoke_passed(bots=10, active=10, bots_lapped=10, transfers=0, unexpected_disconnects=0):
+        print("FAIL smoke should pass one lap each")
+        failed += 1
+    if smoke_passed(bots=10, active=10, bots_lapped=9, transfers=0, unexpected_disconnects=0):
+        print("FAIL smoke must see every bot on west, east, and north")
+        failed += 1
+    if smoke_passed(bots=10, active=10, bots_lapped=10, transfers=1, unexpected_disconnects=0):
+        print("FAIL smoke must reject a transfer")
+        failed += 1
+    if smoke_passed(bots=10, active=9, bots_lapped=9, transfers=0, unexpected_disconnects=1):
+        print("FAIL smoke must reject a disconnect")
+        failed += 1
+    if not triangle_vertices_match():
+        print("FAIL triangle vertices drifted from seam-pose.mjs")
+        failed += 1
     if failed:
         print(f"{failed} failed")
         return 1
     print("coeff-series self-test ok")
     return 0
+
+
+def mesh_width(north: str = "") -> int:
+    return 3 if str(north).strip() else 2
+
+
+def smoke_bot_count() -> int:
+    raw = os.environ.get("COEFF_SMOKE_BOTS", "").strip()
+    if not raw:
+        return SMOKE_BOTS
+    count = int(raw)
+    if count <= 0:
+        raise SystemExit(f"COEFF_SMOKE_BOTS must be a positive count, got {raw!r}")
+    return count
+
+
+def smoke_timeout() -> int:
+    raw = os.environ.get("COEFF_SMOKE_TIMEOUT", "").strip()
+    if not raw:
+        return SMOKE_TIMEOUT
+    seconds = int(raw)
+    if seconds <= 0:
+        raise SystemExit(f"COEFF_SMOKE_TIMEOUT must be positive seconds, got {raw!r}")
+    return seconds
+
+
+def smoke_passed(
+    *,
+    bots: int,
+    active: int,
+    bots_lapped: int,
+    transfers: int,
+    unexpected_disconnects: int,
+) -> bool:
+    """One lap each: every bot has been on west, east, and north, and none dropped."""
+    return (
+        bots > 0
+        and active == bots
+        and bots_lapped == bots
+        and int(transfers) == 0
+        and int(unexpected_disconnects) == 0
+    )
+
+
+def triangle_vertices_match() -> bool:
+    script = Path(__file__).with_name("seam-pose.mjs")
+    got = subprocess.run(
+        ["node", str(script), "--print-triangle"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if got.returncode != 0:
+        print(got.stderr.strip() or got.stdout.strip())
+        return False
+    try:
+        data = json.loads(got.stdout)
+    except json.JSONDecodeError:
+        print(got.stdout.strip())
+        return False
+    return data == [dict(v) for v in TRIANGLE_VERTICES]
+
+
+def triangle_snapshot(rows: list[dict]) -> dict:
+    return {
+        "active": fleet_active(rows),
+        "busy": any(r.get("busy") for r in rows),
+        "bots_lapped": sum(int(r.get("bots_lapped") or 0) for r in rows),
+        "laps": sum(int(r.get("laps") or 0) for r in rows),
+        "transfers": sum(int(r.get("transfers") or 0) for r in rows),
+        "unexpected_disconnects": sum(int(r.get("unexpected_disconnects") or 0) for r in rows),
+        "errors": [str(r.get("add_error")) for r in rows if r.get("add_error")],
+    }
 
 
 def read_token() -> str:
@@ -519,16 +635,20 @@ def add_across_slices(token: str, delta: int) -> tuple[bool, str]:
     return True, f"active={progressed}"
 
 
-def sample_metrics(out: Path, seconds: int) -> subprocess.Popen[str]:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    return subprocess.Popen(
+def metrics_command(out: Path, seconds: int, north: str = "") -> list[str]:
+    """West and east always. North is appended only when this run has a third host."""
+    cmd = [
+        "bash",
+        str(METRICS),
+        "--west",
+        WEST,
+        "--east",
+        EAST,
+    ]
+    if north:
+        cmd.extend(["--north", north])
+    cmd.extend(
         [
-            "bash",
-            str(METRICS),
-            "--west",
-            WEST,
-            "--east",
-            EAST,
             "--ssh-key",
             str(KEY),
             "--out",
@@ -537,14 +657,22 @@ def sample_metrics(out: Path, seconds: int) -> subprocess.Popen[str]:
             "15",
             "--seconds",
             str(seconds),
-        ],
+        ]
+    )
+    return cmd
+
+
+def sample_metrics(out: Path, seconds: int, north: str = "") -> subprocess.Popen[str]:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen(
+        metrics_command(out, seconds, north),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
     )
 
 
-def summarize_metrics(path: Path) -> dict:
+def summarize_metrics(path: Path, hosts: tuple[str, ...] = ("west", "east")) -> dict:
     per: dict[str, dict] = {}
     if not path.exists():
         return {"ok": False, "per": per}
@@ -572,7 +700,7 @@ def summarize_metrics(path: Path) -> dict:
         if pressure.get("nproc"):
             slot["nproc"] = pressure["nproc"]
         slot["nic"].append(sample.get("nic") or {})
-    ok = "west" in per and "east" in per and per["west"]["java"] and per["east"]["java"] and per["west"]["mem"] and per["east"]["mem"]
+    ok = all(name in per and per[name]["java"] and per[name]["mem"] for name in hosts)
     return {"ok": bool(ok), "per": per}
 
 
@@ -984,9 +1112,154 @@ def append_row(path: Path, row: dict) -> None:
     )
 
 
+def run_triangle_smoke() -> int:
+    """Ten bots, one lap each across west, east, and north. Not a capacity climb."""
+    token = read_token()
+    bots = smoke_bot_count()
+    timeout = smoke_timeout()
+    out_dir = RUN / f"triangle-smoke-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    out_dir.mkdir(parents=True)
+    log(f"triangle smoke bots={bots} north={NORTH} timeout={timeout}s out={out_dir}")
+    rows = fan_status(token)
+    missing = [str(r.get("instance_id")) for r in rows if not r.get("mc_triangle")]
+    if missing:
+        raise SystemExit("LT_MC_HOST_NORTH is not set on loadgen " + ", ".join(missing))
+    if not resume_live():
+        clear_fleet(token)
+        rows = fan_status(token)
+        if fleet_active(rows) != 0 or any(int(r.get("index_used") or 0) != 0 for r in rows):
+            raise SystemExit("fleet not reset before the triangle smoke")
+    close_open_rungs(token)
+    rung = f"r-triangle-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    metrics_path = out_dir / "fabric-metrics.jsonl"
+    proc = None
+    stopped = "lap complete"
+    snap = {
+        "active": 0,
+        "bots_lapped": 0,
+        "laps": 0,
+        "transfers": 0,
+        "unexpected_disconnects": 0,
+    }
+    try:
+        for host in hosts():
+            code, body = api(host, token, "POST", "/v1/rung/open", {"id": rung})
+            if code >= 300:
+                raise RuntimeError(f"rung open failed on {host}: {body}")
+        proc = sample_metrics(metrics_path, timeout + 30, NORTH)
+        snap = triangle_snapshot(fan_status(token))
+        before = snap["active"]
+        delta = bots - before
+        if delta <= 0:
+            raise SystemExit(f"fleet already at {before}, smoke wants {bots}")
+        log(f"add {delta} across loadgen slices toward {bots} triangle bots")
+        try:
+            ok, detail = add_across_slices(token, delta)
+        except SliceShortfall as exc:
+            ok, detail = False, str(exc)
+        if not ok:
+            stopped = f"ramp failed: {detail}"
+            snap = triangle_snapshot(fan_status(token))
+        else:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                snap = triangle_snapshot(fan_status(token))
+                log(
+                    f"smoke active={snap['active']} lapped={snap['bots_lapped']} "
+                    f"laps={snap['laps']} transfers={snap['transfers']} "
+                    f"disconnects={snap['unexpected_disconnects']}"
+                )
+                if snap["errors"]:
+                    stopped = "add error: " + "; ".join(snap["errors"])
+                    break
+                if snap["transfers"]:
+                    stopped = "transfer"
+                    break
+                if snap["unexpected_disconnects"]:
+                    stopped = "unexpected disconnect"
+                    break
+                if not snap["busy"] and snap["active"] != bots:
+                    stopped = f"active={snap['active']}"
+                    break
+                if smoke_passed(
+                    bots=bots,
+                    active=snap["active"],
+                    bots_lapped=snap["bots_lapped"],
+                    transfers=snap["transfers"],
+                    unexpected_disconnects=snap["unexpected_disconnects"],
+                ):
+                    stopped = "lap complete"
+                    break
+                time.sleep(POLL_SEC)
+            else:
+                stopped = "timeout"
+                snap = triangle_snapshot(fan_status(token))
+    except Exception as exc:
+        stopped = f"smoke failed: {exc}"
+        log(stopped)
+        try:
+            snap = triangle_snapshot(fan_status(token))
+        except Exception:
+            log("status unreadable after the smoke error")
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for host in hosts():
+            api(host, token, "POST", "/v1/rung/close", {"id": rung})
+        if clear_when_finished():
+            log("clearing walkers")
+            try:
+                clear_fleet(token)
+            except Exception as exc:
+                log(f"clear failed: {exc}")
+        else:
+            log("leaving walkers up")
+    passed = stopped == "lap complete" and smoke_passed(
+        bots=bots,
+        active=snap["active"],
+        bots_lapped=snap["bots_lapped"],
+        transfers=snap["transfers"],
+        unexpected_disconnects=snap["unexpected_disconnects"],
+    )
+    metrics = summarize_metrics(metrics_path, ("west", "east", "north"))
+    outcome = {
+        "series": "triangle-smoke",
+        "stopped": stopped,
+        "hold_ok": passed,
+        "bots": bots,
+        "active": snap["active"],
+        "bots_lapped": snap["bots_lapped"],
+        "laps": snap["laps"],
+        "transfers": snap["transfers"],
+        "unexpected_disconnects": snap["unexpected_disconnects"],
+        "servers": 3,
+        "mesh_width": 3,
+        "third_server_added": True,
+        "vertices": [dict(v) for v in TRIANGLE_VERTICES],
+        "hosts": {"west": WEST, "east": EAST, "north": NORTH},
+        "metrics_ok": metrics.get("ok"),
+        "rung_id": rung,
+        "outcome": str(out_dir / "smoke-outcome.json"),
+        "note": (
+            "Each bot starts on the server that owns its first vertex and loops "
+            "west, east, north. A lap counts only after that bot has been on all three. "
+            "This is not a capacity climb."
+        ),
+    }
+    (out_dir / "smoke-outcome.json").write_text(json.dumps(outcome, indent=2) + "\n")
+    log(json.dumps(outcome))
+    return 0 if passed else 1
+
+
 def main() -> int:
     if "--self-test" in sys.argv:
         return self_test()
+    if NORTH:
+        return run_triangle_smoke()
     token = read_token()
     out_dir = RUN / f"coeff-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
     out_dir.mkdir(parents=True)

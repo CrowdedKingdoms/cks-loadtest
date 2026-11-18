@@ -16,6 +16,11 @@ import {
   looksLikeWorldSpawn,
   formatErrorDetail,
   isTransientNetworkError,
+  homeForIndex,
+  sideForJoinHost,
+  ownedSide,
+  recordOwnerVisit,
+  triangleWaypointSpec,
 } from "./seam-pose.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -105,13 +110,21 @@ const MC_HOST = env("LT_MC_HOST", "");
 const MC_PORT = env("LT_MC_PORT", "25565");
 const MC_HOST_WEST = env("LT_MC_HOST_WEST", MC_HOST);
 const MC_HOST_EAST = env("LT_MC_HOST_EAST", "");
+const MC_HOST_NORTH = env("LT_MC_HOST_NORTH", "");
 const MC_PORT_WEST = env("LT_MC_PORT_WEST", MC_PORT);
 const MC_PORT_EAST = env("LT_MC_PORT_EAST", MC_PORT);
+const MC_PORT_NORTH = env("LT_MC_PORT_NORTH", MC_PORT);
+/**
+ * A north host selects the closed triangle (west → east → north → west).
+ * Even/odd west-east placement is only the two-server path.
+ */
+const TRIANGLE = MC_HOST_NORTH !== "";
 /** When east host is set, even global indices → west, odd → east (same seam Pos). */
 const MC_ALTERNATE =
-  env("LT_MC_ALTERNATE", "") === "1" ||
-  env("LT_MC_ALTERNATE", "").toLowerCase() === "true" ||
-  (MC_HOST_EAST !== "" && env("LT_MC_ALTERNATE", "auto") !== "0");
+  !TRIANGLE &&
+  (env("LT_MC_ALTERNATE", "") === "1" ||
+    env("LT_MC_ALTERNATE", "").toLowerCase() === "true" ||
+    (MC_HOST_EAST !== "" && env("LT_MC_ALTERNATE", "auto") !== "0"));
 /** Delay after each bot's spawn before the next pose+login (ms). Default 2s. */
 const LOGIN_STAGGER_MS = Math.max(0, Number(env("LT_LOGIN_STAGGER_MS", "2000")));
 /** How long after spawn to treat an exit as "early" (retry window). Default 20s. */
@@ -137,6 +150,10 @@ if (!MC_HOST_WEST && !MC_HOST) {
   console.error("mc-harness: LT_MC_HOST or LT_MC_HOST_WEST is required");
   process.exit(2);
 }
+if (TRIANGLE && !MC_HOST_EAST) {
+  console.error("mc-harness: LT_MC_HOST_NORTH needs LT_MC_HOST_EAST");
+  process.exit(2);
+}
 if (MC_ALTERNATE && !MC_HOST_EAST) {
   console.error("mc-harness: LT_MC_ALTERNATE needs LT_MC_HOST_EAST");
   process.exit(2);
@@ -144,29 +161,30 @@ if (MC_ALTERNATE && !MC_HOST_EAST) {
 
 /** @returns {{ side: string, host: string, port: number, ckServer: string }} */
 function endpointForIndex(globalIndex) {
-  const westHost = MC_HOST_WEST || MC_HOST;
-  if (!MC_ALTERNATE || !MC_HOST_EAST) {
-    return {
-      side: "west",
-      host: westHost,
-      port: Number(MC_PORT_WEST || MC_PORT),
-      ckServer: "west",
-    };
-  }
-  // even → west, odd → east
-  if ((globalIndex & 1) === 1) {
-    return {
-      side: "east",
-      host: MC_HOST_EAST,
-      port: Number(MC_PORT_EAST || MC_PORT),
-      ckServer: "east",
-    };
-  }
+  return homeForIndex(globalIndex, {
+    west: MC_HOST_WEST || MC_HOST,
+    east: MC_HOST_EAST,
+    north: TRIANGLE ? MC_HOST_NORTH : "",
+    port: Number(MC_PORT),
+    portWest: Number(MC_PORT_WEST || MC_PORT),
+    portEast: Number(MC_PORT_EAST || MC_PORT),
+    portNorth: Number(MC_PORT_NORTH || MC_PORT),
+    alternate: MC_ALTERNATE,
+  });
+}
+
+/** Env the JVM reads when it should pause at each triangle vertex and loop. */
+function triangleWalkerEnv(globalIndex) {
+  if (!TRIANGLE) return process.env;
+  const loop = triangleWaypointSpec(globalIndex);
   return {
-    side: "west",
-    host: westHost,
-    port: Number(MC_PORT_WEST || MC_PORT),
-    ckServer: "west",
+    ...process.env,
+    LT_MC_PATH: "triangle",
+    LOADWALKER_PATH: "triangle",
+    LT_MC_WAYPOINTS: loop.spec,
+    LOADWALKER_WAYPOINTS: loop.spec,
+    LT_MC_WAYPOINT_START: loop.start,
+    LOADWALKER_WAYPOINT_START: loop.start,
   };
 }
 
@@ -194,45 +212,42 @@ let addError = "";
 let abortAdd = false;
 let shuttingDown = false;
 let currentRung = null;
-/** @type {{ id: string, openedAt: number, transfers: number, east: number, west: number, relays: number } | null} */
+/** @type {{ id: string, openedAt: number, transfers: number, east: number, west: number, north: number, relays: number, laps: number, unexpected: number } | null} */
 let openWindow = null;
 
 const lifetime = {
   transfers: 0,
   east_pauses: 0,
   west_pauses: 0,
+  north_pauses: 0,
   relays: 0,
+  laps: 0,
+  unexpected_disconnects: 0,
   starts: 0,
   exits: 0,
 };
 
 /**
- * LoadWalker owns a side only once the server has placed the bot fully across the seam
- * (east x>=2008, west x<=1991). The band between is still the border.
+ * Server-reported pose for owned-side tracking. Prefer LoadWalker's common status tick
+ * (`phase=play … x=2007.51 … z=-55.0`); also `blocked at x=` and the rare `at x y z` line.
+ * Pause-done lines have no position and are ignored here (pauses have their own counters).
+ * @returns {{ x: number, z: number | null } | null}
  */
-const EAST_OWNED_X = 2008;
-const WEST_OWNED_X = 1991;
-
-function ownedSide(x) {
-  if (x >= EAST_OWNED_X) return "east";
-  if (x <= WEST_OWNED_X) return "west";
-  return null;
-}
-
-/**
- * Server-reported X for owned-side tracking. Prefer LoadWalker's common status tick
- * (`phase=play … x=2007.51 …`); also `blocked at x=` and the rare `at x y z` line.
- * Pause-done lines have no X and are ignored here (pauses have their own counters).
- */
-function serverReportedX(line) {
-  const blocked = line.match(/ blocked at x=(-?\d+(?:\.\d+)?)/);
-  if (blocked) return Number(blocked[1]);
+function serverReportedPose(line) {
+  const blocked = line.match(/ blocked at x=(-?\d+(?:\.\d+)?)(?:[^\n]*\bz=(-?\d+(?:\.\d+)?))?/);
+  if (blocked) {
+    return { x: Number(blocked[1]), z: blocked[2] == null ? null : Number(blocked[2]) };
+  }
   // Common: "Load1 phase=play placed=true x=2007.510000000003 y=63.0 z=-55.0 …"
-  const play = line.match(/\bphase=play\b[\s\S]*?\bx=(-?\d+(?:\.\d+)?)/);
-  if (play) return Number(play[1]);
+  const play = line.match(
+    /\bphase=play\b[^\n]*\bx=(-?\d+(?:\.\d+)?)(?:[^\n]*\bz=(-?\d+(?:\.\d+)?))?/,
+  );
+  if (play) {
+    return { x: Number(play[1]), z: play[2] == null ? null : Number(play[2]) };
+  }
   // Rare one-shot after a place packet: "Load1 at 2007.5 63.0 -55.0"
   const at = line.match(/ at (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?)\s*$/);
-  if (at) return Number(at[1]);
+  if (at) return { x: Number(at[1]), z: Number(at[3]) };
   return null;
 }
 
@@ -292,21 +307,12 @@ function parseTransferDest(logText) {
 }
 
 function endpointFromHostPort(host, port) {
-  const westHost = MC_HOST_WEST || MC_HOST;
-  const eastHost = MC_HOST_EAST;
-  let side = "west";
-  let ckServer = "west";
-  if (eastHost && host === eastHost) {
-    side = "east";
-    ckServer = "east";
-  } else if (host === westHost) {
-    side = "west";
-    ckServer = "west";
-  } else if (eastHost && host.includes("east")) {
-    side = "east";
-    ckServer = "east";
-  }
-  return { side, host, port: Number(port), ckServer };
+  const side = sideForJoinHost(host, {
+    west: MC_HOST_WEST || MC_HOST,
+    east: MC_HOST_EAST,
+    north: TRIANGLE ? MC_HOST_NORTH : "",
+  });
+  return { side, host, port: Number(port), ckServer: side };
 }
 
 function stopWalker(globalIndex) {
@@ -398,7 +404,7 @@ function spawnWalker(globalIndex, endpoint) {
   const logFd = fs.openSync(logPath, "a");
   const proc = spawn(runSh, [name, host, String(port)], {
     cwd: MC_DIST,
-    env: process.env,
+    env: triangleWalkerEnv(globalIndex),
     stdio: ["ignore", logFd, logFd],
     detached: false,
   });
@@ -425,6 +431,10 @@ function spawnWalker(globalIndex, endpoint) {
     transfers: 0,
     east: 0,
     west: 0,
+    north: 0,
+    laps: 0,
+    visited: new Set(),
+    lapHold: null,
     relays: 0,
     /** Last side the server's position packet confirmed. A spawn does not count as a crossing. */
     confirmedSide: null,
@@ -464,10 +474,29 @@ function spawnWalker(globalIndex, endpoint) {
         lifetime.west_pauses++;
         if (openWindow) openWindow.west++;
       }
+      if (line.includes("north pause done")) {
+        state.north++;
+        lifetime.north_pauses++;
+        if (openWindow) openWindow.north++;
+      }
       // A crossing counts when the server's position moves the bot from one owned side to the other.
       // A pause line, finished or not, does not. A visible transfer packet is a failure, counted above.
-      const reportedX = serverReportedX(line);
-      const sideNow = reportedX == null ? null : ownedSide(reportedX);
+      // Triangle laps count only after this bot has been on west, east, and north.
+      const pose = serverReportedPose(line);
+      const sideNow = pose ? ownedSide(pose.x, pose.z, { triangle: TRIANGLE }) : null;
+      if (TRIANGLE && sideNow) {
+        const next = recordOwnerVisit(
+          { visited: state.visited, laps: state.laps, lapHold: state.lapHold },
+          sideNow,
+        );
+        state.visited = next.visited;
+        state.laps = next.laps;
+        state.lapHold = next.lapHold;
+        if (next.counted) {
+          lifetime.laps++;
+          if (openWindow) openWindow.laps++;
+        }
+      }
       if (sideNow && state.confirmedSide && sideNow !== state.confirmedSide) {
         state.relays++;
         lifetime.relays++;
@@ -498,6 +527,11 @@ function spawnWalker(globalIndex, endpoint) {
     clearInterval(watch);
     state.alive = false;
     lifetime.exits++;
+    const unexpected = state.stable && !state.suppressExitRetry && !shuttingDown;
+    if (unexpected) {
+      lifetime.unexpected_disconnects++;
+      if (openWindow) openWindow.unexpected++;
+    }
     console.error(`mc-harness: ${name} exited code=${code} signal=${signal}`);
     maybeSchedulePostStableTransferRetry(globalIndex, state);
   });
@@ -682,13 +716,17 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
     }
 
     // Recompute when endpoint flips (transfer redirect); pose must match home.
-    const target = seamTargetForIndex(globalIndex, { side: endpoint.side });
+    const target = seamTargetForIndex(globalIndex, {
+      side: endpoint.side,
+      triangle: TRIANGLE,
+    });
     console.log(
       `${ts()} mc-harness: seam pose ${name} attempt=${attempt}/${maxAttempts} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
     );
     await writeSeamPoseWithRetries(name, globalIndex, {
       server: endpoint.ckServer,
       side: endpoint.side,
+      triangle: TRIANGLE,
       target,
     });
     spawnWalker(globalIndex, endpoint);
@@ -849,7 +887,10 @@ function statusJson() {
     mc_host: MC_HOST_WEST || MC_HOST,
     mc_host_west: MC_HOST_WEST || MC_HOST || undefined,
     mc_host_east: MC_HOST_EAST || undefined,
+    mc_host_north: MC_HOST_NORTH || undefined,
+    mc_triangle: TRIANGLE,
     mc_alternate: MC_ALTERNATE,
+    ...liveCounts(),
     login_stagger_ms: LOGIN_STAGGER_MS,
     early_stable_ms: EARLY_STABLE_MS,
     add_retries: ADD_RETRIES,
@@ -859,26 +900,63 @@ function statusJson() {
   };
 }
 
-function statsJson() {
-  let active = 0;
+function liveCounts() {
   let transfers = 0;
+  let laps = 0;
+  let botsLapped = 0;
   let east = 0;
   let west = 0;
+  let north = 0;
   let relays = 0;
   for (const c of clients.values()) {
-    if (c.alive) active++;
     transfers += c.transfers;
+    laps += c.laps || 0;
+    if ((c.laps || 0) >= 1) botsLapped++;
     east += c.east;
     west += c.west;
+    north += c.north || 0;
     relays += c.relays;
   }
+  const windowed = openWindow
+    ? {
+        transfers: openWindow.transfers,
+        laps: openWindow.laps,
+        unexpected_disconnects: openWindow.unexpected,
+      }
+    : {
+        transfers,
+        laps,
+        unexpected_disconnects: lifetime.unexpected_disconnects,
+      };
+  return {
+    transfers: windowed.transfers,
+    laps: windowed.laps,
+    bots_lapped: botsLapped,
+    unexpected_disconnects: windowed.unexpected_disconnects,
+    live_transfers: transfers,
+    live_laps: laps,
+    live_east: east,
+    live_west: west,
+    live_north: north,
+    live_relays: relays,
+  };
+}
+
+function statsJson() {
+  let active = 0;
+  for (const c of clients.values()) if (c.alive) active++;
+  const live = liveCounts();
   const window = openWindow
     ? {
         id: openWindow.id,
         transfers: openWindow.transfers,
         east_pauses: openWindow.east,
         west_pauses: openWindow.west,
+        north_pauses: openWindow.north,
         relays: openWindow.relays,
+        laps: openWindow.laps,
+        unexpected_disconnects: openWindow.unexpected,
+        bots_lapped: live.bots_lapped,
       }
     : null;
   return {
@@ -886,17 +964,23 @@ function statsJson() {
     lifetime: {
       ...lifetime,
       active,
-      live_transfers: transfers,
-      live_east_pauses: east,
-      live_west_pauses: west,
-      live_relays: relays,
+      live_transfers: live.live_transfers,
+      live_east_pauses: live.live_east,
+      live_west_pauses: live.live_west,
+      live_north_pauses: live.live_north,
+      live_relays: live.live_relays,
+      live_laps: live.live_laps,
+      bots_lapped: live.bots_lapped,
     },
     window,
     counters: {
       transfers: lifetime.transfers,
       east_pauses: lifetime.east_pauses,
       west_pauses: lifetime.west_pauses,
+      north_pauses: lifetime.north_pauses,
       relays: lifetime.relays,
+      laps: lifetime.laps,
+      unexpected_disconnects: lifetime.unexpected_disconnects,
     },
   };
 }
@@ -908,7 +992,17 @@ function ensureStatsDir() {
 function openRung(id) {
   if (!id) return "id required";
   if (openWindow) return `rung ${openWindow.id} already open`;
-  openWindow = { id, openedAt: Date.now(), transfers: 0, east: 0, west: 0, relays: 0 };
+  openWindow = {
+    id,
+    openedAt: Date.now(),
+    transfers: 0,
+    east: 0,
+    west: 0,
+    north: 0,
+    relays: 0,
+    laps: 0,
+    unexpected: 0,
+  };
   currentRung = id;
   return "";
 }
@@ -926,7 +1020,11 @@ function closeRung() {
         transfers: openWindow.transfers,
         east_pauses: openWindow.east,
         west_pauses: openWindow.west,
+        north_pauses: openWindow.north,
         relays: openWindow.relays,
+        laps: openWindow.laps,
+        unexpected_disconnects: openWindow.unexpected,
+        bots_lapped: liveCounts().bots_lapped,
       },
     },
     status: statusJson(),
@@ -1015,7 +1113,12 @@ function listen() {
     handle(req, res);
   });
   server.listen(port, host, () => {
-    console.log(`mc-harness: control on ${host}:${port} instance=${INSTANCE_ID} dist=${MC_DIST}`);
+    const mode = TRIANGLE
+      ? `triangle west=${MC_HOST_WEST || MC_HOST} east=${MC_HOST_EAST} north=${MC_HOST_NORTH}`
+      : `seam west=${MC_HOST_WEST || MC_HOST} east=${MC_HOST_EAST || "-"} alternate=${MC_ALTERNATE}`;
+    console.log(
+      `mc-harness: control on ${host}:${port} instance=${INSTANCE_ID} dist=${MC_DIST} ${mode}`,
+    );
   });
 }
 

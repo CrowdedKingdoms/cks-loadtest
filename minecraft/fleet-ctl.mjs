@@ -96,7 +96,11 @@ function mergeStats(snaps) {
     transfers: 0,
     east_pauses: 0,
     west_pauses: 0,
+    north_pauses: 0,
     relays: 0,
+    laps: 0,
+    bots_lapped: 0,
+    unexpected_disconnects: 0,
     busy: false,
     per_host: [],
   };
@@ -125,6 +129,25 @@ function mergeStats(snaps) {
       pickNum(win, "west_pauses") ||
       pickNum(life, "west_pauses") ||
       pickNum(s, "west_pauses");
+    fleet.north_pauses +=
+      pickNum(ctr, "north_pauses") ||
+      pickNum(win, "north_pauses") ||
+      pickNum(life, "north_pauses") ||
+      pickNum(s, "north_pauses");
+    fleet.laps +=
+      pickNum(ctr, "laps") ||
+      pickNum(win, "laps") ||
+      pickNum(life, "laps") ||
+      pickNum(s, "laps");
+    fleet.bots_lapped +=
+      pickNum(win, "bots_lapped") ||
+      pickNum(life, "bots_lapped") ||
+      pickNum(s, "bots_lapped");
+    fleet.unexpected_disconnects +=
+      pickNum(ctr, "unexpected_disconnects") ||
+      pickNum(win, "unexpected_disconnects") ||
+      pickNum(life, "unexpected_disconnects") ||
+      pickNum(s, "unexpected_disconnects");
     fleet.relays +=
       pickNum(ctr, "relays") ||
       pickNum(win, "relays") ||
