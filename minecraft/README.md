@@ -16,7 +16,27 @@ Every bot must:
 That choreography lives in CrowdedKingdoms `cks-minecraft-mod` as
 `LoadWalker` (`server/.../dev/LoadWalker.java`). Build a portable dist with
 `./gradlew :server:loadWalkerDist` and point `LT_MC_DIST` at
-`server/build/loadwalker-dist`.
+`server/build/loadwalker-dist`. It is the path when `LT_MC_HOST_NORTH` is unset.
+
+## Three-server triangle
+
+Set `LT_MC_HOST_NORTH` (and `COEFF_NORTH` for the driver) to run a closed
+triangle instead of the even/odd seam. Vertices, in order:
+
+1. west about `(1975, 1975)`
+2. east about `(2025, 1975)`
+3. north about `(2000, 2025)`
+
+Each bot pauses at a vertex, walks to the next, and loops. Global index `% 3`
+picks the first vertex, and the bot joins the server that owns it. Even/odd
+placement is not used. A lap counts only after that bot has been on west,
+east, and north.
+
+The harness passes the loop to the JVM as `LT_MC_PATH=triangle` and
+`LT_MC_WAYPOINTS` (`x,y,z,side` separated by `;`, this bot's vertex first).
+`minecraft/coeff-series.py` with `COEFF_NORTH` set adds 10 bots and waits for
+one lap each. It does not climb the two-server ladder. Leave `COEFF_NORTH`
+unset and the ladder is unchanged.
 
 ## Run on a generator
 
@@ -26,7 +46,8 @@ export LT_CONTROL_TOKEN=...
 # West (even indices 0,2,4…). LT_MC_HOST alone still works as west-only.
 export LT_MC_HOST_WEST=40.160.15.239
 export LT_MC_HOST_EAST=40.160.99.136    # odd indices 1,3,5…; enables alternation
-export LT_MC_PORT=25565                 # or LT_MC_PORT_WEST / LT_MC_PORT_EAST
+# export LT_MC_HOST_NORTH=203.0.113.10  # set for the triangle; drops even/odd
+export LT_MC_PORT=25565                 # or LT_MC_PORT_WEST / LT_MC_PORT_EAST / LT_MC_PORT_NORTH
 export LT_LOGIN_STAGGER_MS=2000         # delay between each bot pose+login (default 2s)
 export LT_EARLY_STABLE_MS=20000         # watch window; early exit/transfer/spawn-miss → retry
 export LT_ADD_RETRIES=2                 # extra attempts per slot after first
@@ -78,8 +99,9 @@ other non-transfer exits are not respawned.
 
 - `active` — walkers still on one TCP session
 - `transfers` — `ClientboundTransferPacket` count (failures)
-- `east_pauses` / `west_pauses` — pauses that finished (`east pause done` / `west pause done`). A "pause start" line does not count.
-- `relays` — same-socket crossings the server confirmed: the bot's reported position moved from fully west (x ≤ 1991) to fully east (x ≥ 2008), or the reverse. A pause by itself is not a crossing. `transfers` remains the visible transfer-packet failure count.
+- `east_pauses` / `west_pauses` / `north_pauses` — pauses that finished (`east pause done` / `west pause done` / `north pause done`). A "pause start" line does not count.
+- `relays` — same-socket crossings the server confirmed: the bot's reported position moved from one fully owned side to another. Two-server sides are west (x ≤ 1991) and east (x ≥ 2008). With a north host, north is z ≥ 2008, and west/east also require z ≤ 1991. A pause by itself is not a crossing. `transfers` remains the visible transfer-packet failure count.
+- `laps` / `bots_lapped` — triangle only. A lap counts after that bot has been on west, east, and north. `unexpected_disconnects` counts a stable walker that left without the harness stopping it.
 
 ## SoftMax multi-VM fleet (preferred)
 
