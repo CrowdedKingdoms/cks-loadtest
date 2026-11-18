@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SoftMax-style install / verify / collect for Minecraft LoadWalker generators.
 #
-# Mirrors infra-control-plane/scripts/ops/loadtest-generators.sh:
+# Same install shape as the SoftMax generator fleet:
 #   - one harness process per bare OVH VM (no containers)
 #   - disjoint LT_INDEX_BASE / LT_INDEX_LIMIT slices from fleet order,
 #     sized from idle MemAvailable so one host cannot be told to run 100 JVMs
