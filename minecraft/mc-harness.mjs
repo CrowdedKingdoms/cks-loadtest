@@ -133,7 +133,7 @@ const NAME_PREFIX = env("LT_MC_NAME_PREFIX", "Load");
 const JAVA = env("LT_MC_JAVA", "java");
 const START_CLIENTS = Number(env("LT_CLIENTS", "0"));
 
-if (!MC_HOST_WEST && !MC_HOST) {
+if (env("LT_MC_WANDER_PLACE", "") !== "section" && !MC_HOST_WEST && !MC_HOST) {
   console.error("mc-harness: LT_MC_HOST or LT_MC_HOST_WEST is required");
   process.exit(2);
 }
