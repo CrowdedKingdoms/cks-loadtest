@@ -235,7 +235,7 @@ export async function writeSeamPose(name, index, opts = {}) {
   const orgToken = mustEnv("CROWDY_ORG_TOKEN");
   const pepper = mustEnv("CROWDY_ID_PEPPER");
   const clusterSecret = mustEnv("CROWDY_CLUSTER_SECRET");
-  const target = seamTargetForIndex(index);
+  const target = opts.target || seamTargetForIndex(index);
 
   const mcUuid = offlineUuid(name);
   const ext = externalId(pepper, mcUuid);

@@ -17,6 +17,7 @@ import {
   formatErrorDetail,
   isTransientNetworkError,
 } from "./seam-pose.mjs";
+import { sectionHost, sectionPlace } from "./section-place.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -143,6 +144,18 @@ if (MC_ALTERNATE && !MC_HOST_EAST) {
 
 /** @returns {{ side: string, host: string, port: number, ckServer: string }} */
 function endpointForIndex(globalIndex) {
+  if (env("LT_MC_WANDER_PLACE", "") === "section") {
+    const placed = sectionPlace(globalIndex);
+    return {
+      side: placed.server,
+      host: sectionHost(placed.server),
+      port: Number(MC_PORT),
+      ckServer: placed.server,
+      x: placed.x,
+      y: placed.y,
+      z: placed.z,
+    };
+  }
   const westHost = MC_HOST_WEST || MC_HOST;
   if (!MC_ALTERNATE || !MC_HOST_EAST) {
     return {
@@ -391,9 +404,15 @@ function spawnWalker(globalIndex, endpoint, runId) {
   const { host, port, side } = endpoint;
   const logPath = walkerLogPath(name);
   const logFd = fs.openSync(logPath, "a");
+  const motion = process.env.LT_MC_MOTION || "";
+  const pathMode = process.env.LT_MC_PATH || (motion === "wander" || motion === "shuttle" || motion === "triangle" ? motion : "");
   const proc = spawn(runSh, [name, host, String(port)], {
     cwd: MC_DIST,
-    env: process.env,
+    env: {
+      ...process.env,
+      ...(pathMode ? { LT_MC_PATH: pathMode } : {}),
+      ...(process.env.LT_MC_WANDER_BPS ? { LT_MC_WANDER_BPS: process.env.LT_MC_WANDER_BPS } : {}),
+    },
     stdio: ["ignore", logFd, logFd],
     detached: false,
   });
@@ -661,7 +680,9 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint, runId) {
   let endpoint = { ...initialEndpoint };
   let lastReason = "unknown";
   const maxAttempts = ADD_RETRIES + 1;
-  const target = seamTargetForIndex(globalIndex);
+  const target = endpoint.x != null
+    ? { x: endpoint.x, y: endpoint.y, z: endpoint.z }
+    : seamTargetForIndex(globalIndex);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     stopWalker(globalIndex);
@@ -678,7 +699,7 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint, runId) {
     console.log(
       `${ts()} mc-harness: seam pose ${name} attempt=${attempt}/${maxAttempts} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
     );
-    await writeSeamPoseWithRetries(name, globalIndex, { server: endpoint.ckServer });
+    await writeSeamPoseWithRetries(name, globalIndex, { server: endpoint.ckServer, target });
     spawnWalker(globalIndex, endpoint, runId);
 
     const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS, target);
