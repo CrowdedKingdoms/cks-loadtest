@@ -34,7 +34,7 @@ LOCAL_COLUMNS = DIR / "section-columns.json"
 
 JAR_SHA = "b7a2ab65f87de5d0e542476fea1421ee6d89c224560ecd7f172c875c220d5aa0"
 COMMIT = "c9ff2a3f3c711de6d5af17ef2f36e7b913c6e252"
-PACK_SIZE = 32
+PACK_SIZE = int(os.environ.get("CK_PACK_SIZE", "9"))
 PACK_BASE_KB = 457884
 PACK_EACH_KB = 1243
 PACK_HEAP = "2g"
