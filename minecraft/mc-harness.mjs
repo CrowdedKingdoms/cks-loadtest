@@ -791,7 +791,22 @@ function requestAdd(count, runId) {
             break;
           }
           const gi = INDEX_BASE + used;
-          const initial = endpointForIndex(gi);
+          let initial;
+          try {
+            initial = endpointForIndex(gi);
+          } catch (err) {
+            const msg = String(err && err.message ? err.message : err);
+            if (err?.code === "UNPLACED" || /no measured dry column|unplaced index/.test(msg)) {
+              // This index stays unplaced. Other bots stay up. This is not a clear.
+              used++;
+              failCount++;
+              console.error(
+                `${ts()} mc-harness: ${botName(gi)} spawn-miss unplaced; continuing`,
+              );
+              continue;
+            }
+            throw err;
+          }
           const result = await spawnSlotWithRetries(gi, initial, runId);
           used++;
           if (result.ok) {

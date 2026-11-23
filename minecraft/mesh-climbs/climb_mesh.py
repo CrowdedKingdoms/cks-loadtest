@@ -266,7 +266,7 @@ def rules_text(mesh):
         "## Climb",
         "",
         "Every new bot is placed at a seeded point in its own section, inset 32 blocks from every edge of that section, with its feet one block above the ground. The section is index modulo "
-        f"{mesh.servers}. A retry of the same index stands on the same block. The point is anywhere in the cell, so some start near a cut. It is not an edge band and not a junction. Open water is skipped for another dry point in the same section. A column that has not been measured is not given a sea-level Y.",
+        f"{mesh.servers}. A retry of the same index stands on the same block. The point is anywhere in the cell, so some start near a cut. It is not an edge band and not a junction. Open water is skipped for another dry point in the same section. A column that has not been measured is skipped the same way and is not given a sea-level Y. If every candidate is unmeasured, that index stays unplaced. The add is a spawn miss and does not clear bots that are already seated.",
         "",
         f"The driver only adds. A stuck bot, or a bot still running an older wander script, stays in the count. A newer wander script in `{PENDING_WANDER.name}/` is copied for the next pack. A running JVM is not killed and is not retargeted to pick that script up. Packs of {PACK_SIZE}. Charge {PACK_BASE_KB} KB plus {PACK_EACH_KB} KB for each further bot, on a {PACK_HEAP} heap. Wander at {WANDER_BPS} blocks/s. `ClientboundTransferPacket` is logged and not followed.",
         "",
@@ -281,6 +281,41 @@ def rules_text(mesh):
 
 def climb_preamble(mesh):
     return rules_text(mesh) + "\n\nNot started. No bots have been placed by this driver.\n"
+
+
+def append_note_line(mesh, paragraph):
+    """Append one paragraph. Does not rewrite earlier notes."""
+    text = paragraph.strip()
+    if not text:
+        return
+    path = mesh.note_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else ""
+    if text in existing:
+        return
+    with path.open("a") as fh:
+        if existing and not existing.endswith("\n"):
+            fh.write("\n")
+        fh.write("\n" + text + "\n")
+
+
+def note_started(mesh):
+    version = getattr(mesh, "version", None) or {}
+    append_note_line(
+        mesh,
+        "The climb started. "
+        f"mod_commit {version.get('mod_commit') or 'unnamed'}, "
+        f"mod_sha256 {version.get('mod_sha256') or 'unread'}, "
+        f"version_certainty {version.get('version_certainty') or 'unread'}.",
+    )
+
+
+def note_stopped(mesh, reason):
+    append_note_line(
+        mesh,
+        f"Stopped this climb: {reason}. Not a bend. "
+        "Bots already connected were left in place. Nothing was cleared.",
+    )
 
 
 def refresh_note(mesh, body):
@@ -1932,6 +1967,7 @@ def run(mesh):
                     clean_held = int(prior.get("n_held") or 0)
     if seated is None:
         raise SystemExit("no generator answered; not treating that as zero seated")
+    note_started(mesh)
     if (clean_held and seated < clean_held) or target < seated:
         jump, side, cpu, load1 = fresh_jump(mesh, games)
         target = seated + jump
@@ -1961,6 +1997,11 @@ def run(mesh):
             _status, active, _ready = wait_settled(mesh, loads, seated + add)
             if active is None:
                 log(mesh, "fast pack status missing; stopping this climb")
+                note_stopped(mesh, "spawn status missing")
+                break
+            if active <= 0:
+                log(mesh, "fast pack seated nobody; stopping this climb; not a bend")
+                note_stopped(mesh, "no bot seated; unplaced indexes were spawn misses")
                 break
             if errors:
                 log(mesh, "fast pack errors " + ",".join(sorted(errors)))
@@ -1987,6 +2028,7 @@ def run(mesh):
         if row is not None and row.get("stop_reason"):
             append_csv(mesh, row)
             log(mesh, "stopped this climb; not a bend")
+            note_stopped(mesh, row.get("stop_reason"))
             break
         if row is None or why in ("no-room", "stop"):
             log(mesh, "pack did not start; not a bend")

@@ -3,10 +3,11 @@
  * Whole section, inset 32 blocks. Not an edge band and not a junction.
  * Index modulo the section count picks the section. The same index always
  * walks the same candidate list, so a retry stands on the same block.
- * Open water is skipped for another dry point in that section. Feet are
- * one block above the ground. An unknown column stops the search: it is
- * not treated as sea level, and a later table does not move a bot whose
- * column was already chosen.
+ * Open water is skipped for another dry point in that section. An unknown
+ * column is skipped the same way. It is not treated as sea level. Feet are
+ * one block above the ground. The same index and the same table always
+ * walk the same candidate list. If every candidate is unmeasured, or none
+ * of them is a measured dry column, the index stays unplaced.
  *
  * column(x, z) returns {ground} with ground > 0, {water: true} or ground <= 0
  * for open water, or null when that column has not been measured.
@@ -138,21 +139,27 @@ function sectionSpawn(index, sections, options) {
   const rand = mulberry32((i + 1) >>> 0);
   const attempts = opts.attempts == null ? ATTEMPTS : opts.attempts;
   const column = opts.column || null;
+  let sawMeasured = false;
   for (let n = 0; n < attempts; n++) {
     const x = x0 + Math.floor(rand() * spanX);
     const z = z0 + Math.floor(rand() * spanZ);
-    if (!column) {
-      return { server: cell.id, x, y: null, z, pending: true, reason: "no-column" };
-    }
+    if (!column) continue;
     const col = column(x, z);
-    if (col == null) {
-      return { server: cell.id, x, y: null, z, pending: true, reason: "unknown-column" };
-    }
+    // Unknown is skipped, the same as open water. Do not invent a height.
+    if (col == null) continue;
+    sawMeasured = true;
     if (col.water || !(Number(col.ground) > 0)) continue;
     const ground = Math.floor(Number(col.ground));
     return { server: cell.id, x, y: ground + 1, z, pending: false, ground };
   }
-  throw new Error("no dry column in " + cell.id + " for index " + i);
+  return {
+    server: cell.id,
+    x: null,
+    y: null,
+    z: null,
+    pending: true,
+    reason: sawMeasured ? "no-dry" : "unmeasured",
+  };
 }
 
 /** Table values: ground Y, or 0 for open water. A missing key is unknown. */
@@ -213,18 +220,25 @@ function selfTest() {
       check(mesh + " spread " + id, box.maxX - box.minX > 400 && box.maxZ - box.minZ > 400);
     }
   }
-  const unknown = () => null;
-  const pending = sectionSpawn(4, FOUR_SECTIONS, { column: unknown });
-  const pendingAgain = sectionSpawn(4, FOUR_SECTIONS, { column: unknown });
-  check("pending stable", pending.pending && pending.x === pendingAgain.x && pending.z === pendingAgain.z);
-  check("pending section", pending.server === "west");
+  const seen = [];
+  const probed = sectionSpawn(4, FOUR_SECTIONS, {
+    attempts: 6,
+    column: (x, z) => {
+      seen.push([x, z]);
+      return null;
+    },
+  });
+  check("unknown skipped", seen.length === 6 && probed.pending && probed.reason === "unmeasured" && probed.y == null);
+  const probedAgain = sectionSpawn(4, FOUR_SECTIONS, { attempts: 6, column: () => null });
+  check("unmeasured stable", probedAgain.pending && probedAgain.reason === "unmeasured" && probedAgain.server === "west");
   const table = {};
-  table[pending.x + "," + pending.z] = 0;
-  const skipped = sectionSpawn(4, FOUR_SECTIONS, { column: columnFromTable(table) });
-  check("water then next", skipped.pending && (skipped.x !== pending.x || skipped.z !== pending.z));
-  table[skipped.x + "," + skipped.z] = 150;
-  const stood = sectionSpawn(4, FOUR_SECTIONS, { column: columnFromTable(table) });
-  check("feet above ground", !stood.pending && stood.y === 151 && stood.x === skipped.x && stood.z === skipped.z);
+  table[seen[0][0] + "," + seen[0][1]] = 0;
+  table[seen[2][0] + "," + seen[2][1]] = 150;
+  const stood = sectionSpawn(4, FOUR_SECTIONS, { column: columnFromTable(table), attempts: 6 });
+  check(
+    "skip water and unknown",
+    !stood.pending && stood.y === 151 && stood.x === seen[2][0] && stood.z === seen[2][1] && stood.server === "west",
+  );
   check("sixteen count", P16_SECTIONS.length === 16);
   check("p1 origin", P16_SECTIONS[0].id === "p1" && P16_SECTIONS[0].x0 === 0 && P16_SECTIONS[0].z0 === 0);
   check("p16 corner", P16_SECTIONS[15].id === "p16" && P16_SECTIONS[15].x0 === 6144 && P16_SECTIONS[15].z0 === 6144);

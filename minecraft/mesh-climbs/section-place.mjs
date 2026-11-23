@@ -29,15 +29,17 @@ function readTable() {
   }
 }
 
-/** Feet Y is ground + 1. Throws when the column is still unknown or no dry point exists. */
+/** Feet Y is ground + 1. An index with no measured dry column stays unplaced. */
 export function sectionPlace(index) {
   const { sectionSpawn, sectionsFor, columnFromTable } = freshSpawn();
   const mesh = process.env.LT_SECTION_MESH || "";
   const placed = sectionSpawn(index, sectionsFor(mesh), { column: columnFromTable(readTable()) });
   if (placed.pending) {
-    throw new Error(
-      `column ${placed.x},${placed.z} on ${placed.server} is not a measured dry point (${placed.reason})`,
+    const err = new Error(
+      `unplaced index ${index}: no measured dry column (${placed.reason || "unmeasured"})`,
     );
+    err.code = "UNPLACED";
+    throw err;
   }
   return placed;
 }
