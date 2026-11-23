@@ -470,6 +470,11 @@ def copy_place_files(mesh, ip, harness_path):
     if harness_path == "MISSING":
         raise RuntimeError("mc-harness.mjs was not found")
     remote_dir = str(Path(harness_path).parent)
+    harness_src = HERE.parent / "mc-harness.mjs"
+    pose_src = HERE.parent / "seam-pose.mjs"
+    scp_to(ip, harness_src, f"ubuntu@{ip}:{remote_dir}/mc-harness.mjs")
+    if pose_src.exists():
+        scp_to(ip, pose_src, f"ubuntu@{ip}:{remote_dir}/seam-pose.mjs")
     for local in (SPAWN, PLACE):
         scp_to(ip, local, f"ubuntu@{ip}:{remote_dir}/{local.name}")
     if LOCAL_COLUMNS.exists():
@@ -644,6 +649,7 @@ def write_env(mesh, ip, base, limit, hosts_for_sections):
         "LT_CLIENTS": "0",
         "LT_MC_GRID": "",
         "LT_MC_MOTION": "wander",
+        "LT_MC_PATH": "wander",
         "LT_MC_WANDER_PLACE": "section",
         "LT_MC_WANDER_BPS": WANDER_BPS,
         "LT_MC_MAX_RUNTIME_S": RUNTIME_S,
