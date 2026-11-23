@@ -45,6 +45,7 @@ function parseArgs(argv) {
     else if (a === "--stable-sec") out.stableSec = Number(argv[++i]);
     else if (a === "--id") out.id = argv[++i];
     else if (a === "--out") out.out = argv[++i];
+    else if (a === "--run-id") out.runId = argv[++i];
     else if (a.startsWith("-")) {
       console.error("unknown flag", a);
       usage();
@@ -55,22 +56,33 @@ function parseArgs(argv) {
 
 async function req(host, token, method, p, body) {
   const url = host.replace(/\/$/, "") + p;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(body ? { "Content-Type": "application/json" } : {}),
-    },
-    ...(body ? { body } : {}),
-  });
-  const text = await res.text();
-  let json = null;
   try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    /* raw */
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(body ? { body } : {}),
+    });
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      /* raw */
+    }
+    return { host, status: res.status, text, json, omitted: false };
+  } catch (e) {
+    return {
+      host,
+      status: 0,
+      text: "",
+      json: null,
+      omitted: true,
+      error: String(e?.message || e),
+    };
   }
-  return { host, status: res.status, text, json };
 }
 
 async function fan(hosts, token, method, p, body) {
@@ -171,13 +183,29 @@ if (!hosts.length) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const runId = args.runId || process.env.LT_RUN_ID || "";
+function withRun(path) {
+  if (!runId) return path;
+  const join = path.includes("?") ? "&" : "?";
+  return `${path}${join}run_id=${encodeURIComponent(runId)}`;
+}
+function runBody(extra = {}) {
+  return JSON.stringify({ ...extra, ...(runId ? { run_id: runId } : {}) });
+}
+
 if (cmd === "status") {
-  const rows = await fan(hosts, token, "GET", "/v1/status", null);
+  const rows = await fan(hosts, token, "GET", withRun("/v1/status"), null);
+  const answered = [];
   for (const r of rows) {
+    if (r.omitted || r.status !== 200) {
+      console.log(`--- ${r.host} omitted`);
+      continue;
+    }
+    answered.push(r);
     console.log(`--- ${r.host} (${r.status})`);
     console.log(r.text);
   }
-  process.exit(rows.every((r) => r.status === 200) ? 0 : 1);
+  process.exit(answered.length ? 0 : 1);
 }
 
 if (cmd === "stats") {
@@ -201,18 +229,27 @@ if (cmd === "add") {
     token,
     "POST",
     "/v1/clients/add",
-    JSON.stringify({ count }),
+    runBody({ count }),
   );
+  const answered = [];
   for (const r of rows) {
+    if (r.omitted) {
+      console.log(`--- ${r.host} omitted`);
+      continue;
+    }
+    answered.push(r);
     console.log(`--- ${r.host} (${r.status})`);
     console.log(r.text);
   }
-  // SoftMax ctl expects 202
-  process.exit(rows.every((r) => r.status === 202 || r.status === 200) ? 0 : 1);
+  process.exit(answered.length && answered.every((r) => r.status === 202 || r.status === 200) ? 0 : 1);
 }
 
 if (cmd === "clear") {
-  const rows = await fan(hosts, token, "POST", "/v1/clients/clear", "{}");
+  if (!runId) {
+    console.error("clear requires --run-id or LT_RUN_ID");
+    process.exit(2);
+  }
+  const rows = await fan(hosts, token, "POST", "/v1/clients/clear", runBody());
   for (const r of rows) {
     console.log(`--- ${r.host} (${r.status})`);
     console.log(r.text);
@@ -267,25 +304,33 @@ if (cmd === "wait") {
   let baseUsed = [];
   let baseLive = [];
   if (delta > 0) {
-    const rows = await fan(hosts, token, "GET", "/v1/status", null);
-    baseUsed = rows.map((r) => Number(r.json?.used || r.json?.index_used || 0));
-    baseLive = rows.map(
-      (r) =>
-        Number(r.json?.active || 0) + Number(r.json?.suspended || 0),
+    const rows = await fan(hosts, token, "GET", withRun("/v1/status"), null);
+    baseUsed = rows.map((r) => (r.omitted || r.status !== 200 ? null : Number(r.json?.used || r.json?.index_used || 0)));
+    baseLive = rows.map((r) =>
+      r.omitted || r.status !== 200
+        ? null
+        : Number(r.json?.active || 0) + Number(r.json?.suspended || 0),
     );
   }
   let stableSince = null;
   for (;;) {
-    const rows = await fan(hosts, token, "GET", "/v1/status", null);
+    const rows = await fan(hosts, token, "GET", withRun("/v1/status"), null);
     let idle = true;
     let grown = true;
     let err = null;
+    let answered = 0;
     for (let i = 0; i < rows.length; i++) {
-      const st = rows[i].json || {};
+      if (rows[i].omitted || rows[i].status !== 200 || !rows[i].json) {
+        console.error(`[wait] ${rows[i].host} omitted`);
+        continue;
+      }
+      answered++;
+      const st = rows[i].json;
       if (st.busy) idle = false;
       const live = Number(st.active || 0) + Number(st.suspended || 0);
       if (
         delta > 0 &&
+        baseUsed[i] != null &&
         (Number(st.used || st.index_used || 0) < baseUsed[i] + delta ||
           live < baseLive[i] + delta)
       ) {
@@ -293,7 +338,12 @@ if (cmd === "wait") {
       }
       if (st.add_error) err = `${rows[i].host}: ${st.add_error}`;
     }
+    if (!answered) {
+      console.error("wait: no generator answered");
+      process.exit(1);
+    }
     const summary = rows
+      .filter((r) => !r.omitted && r.status === 200)
       .map((r) => {
         const st = r.json || {};
         return `${r.host.replace(/^https?:\/\//, "")} a=${st.active} u=${st.used ?? st.index_used} busy=${st.busy}`;

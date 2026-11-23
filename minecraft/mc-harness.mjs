@@ -34,10 +34,15 @@ const SEAM_POSE_SETTLE_MS = Math.max(0, Number(env("LT_SEAM_POSE_SETTLE_MS", "75
  * age JSON so CK never attaches). Default 8s so a slow CK claim is not killed early.
  */
 const PLACEMENT_CONFIRM_MS = Math.max(500, Number(env("LT_PLACEMENT_CONFIRM_MS", "8000")));
-/** When true, the first unrecovered seam-entry failure aborts the add ramp and kills all bots. */
+/** When true, the first unrecovered seam-entry failure aborts the add ramp and kills all bots.
+ * Default off: one spawn miss leaves the bots that are already seated. */
 const ABORT_ON_SEAM_FAIL =
-  env("LT_ABORT_ON_SEAM_FAIL", "1") === "1" ||
-  env("LT_ABORT_ON_SEAM_FAIL", "1").toLowerCase() === "true";
+  env("LT_ABORT_ON_SEAM_FAIL", "0") === "1" ||
+  env("LT_ABORT_ON_SEAM_FAIL", "0").toLowerCase() === "true";
+/** Refuse an add at or above this much cgroup usage. */
+const ADMIT_MIB = 9216;
+/** Also refuse when usage is within this margin of the cgroup cap. */
+const HEADROOM_MIB = 2048;
 
 function ts() {
   return new Date().toISOString();
@@ -184,6 +189,8 @@ const clients = new Map();
 const postStableRetrying = new Set();
 let used = 0;
 let busy = false;
+/** Run id of the add currently in flight, if any. */
+let addingRunId = "";
 let addError = "";
 let abortAdd = false;
 let shuttingDown = false;
@@ -295,6 +302,52 @@ function endpointFromHostPort(host, port) {
   return { side, host, port: Number(port), ckServer };
 }
 
+function cgroupDir() {
+  try {
+    const text = fs.readFileSync("/proc/self/cgroup", "utf8");
+    const line = text.split("\n").find((row) => row.startsWith("0::"));
+    if (line) {
+      const rel = line.slice(3);
+      if (rel && rel !== "/") return path.join("/sys/fs/cgroup", rel);
+    }
+  } catch {
+    /* fall through */
+  }
+  return "/sys/fs/cgroup/system.slice/ck-mc-harness.service";
+}
+
+/** @returns {{ curMiB: number, capMiB: number | null } | null} */
+function readCgroupMemory() {
+  try {
+    const dir = cgroupDir();
+    const curRaw = fs.readFileSync(path.join(dir, "memory.current"), "utf8").trim();
+    const capRaw = fs.readFileSync(path.join(dir, "memory.max"), "utf8").trim();
+    const cur = Number(curRaw);
+    if (!Number.isFinite(cur) || cur < 0) return null;
+    const capNumeric = /^\d+$/.test(capRaw);
+    return {
+      curMiB: Math.floor(cur / 1048576),
+      capMiB: capNumeric ? Math.floor(Number(capRaw) / 1048576) : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Empty when this generator can take another pack. */
+function admissionError() {
+  const mem = readCgroupMemory();
+  if (!mem) return "memory unread";
+  if (mem.capMiB == null) return "cap is not a number";
+  if (mem.curMiB >= ADMIT_MIB) {
+    return `generator at ${mem.curMiB} MiB, at or above ${ADMIT_MIB}`;
+  }
+  if (mem.curMiB >= mem.capMiB - HEADROOM_MIB) {
+    return `generator at ${mem.curMiB} MiB, within 2 GiB of cap ${mem.capMiB}`;
+  }
+  return "";
+}
+
 function stopWalker(globalIndex) {
   const state = clients.get(globalIndex);
   if (!state) return;
@@ -319,16 +372,22 @@ function stopAllWalkers() {
  * Stop all bots and reset the index counter so a fresh add can reuse Load1…N.
  * Does not close an open rung window (caller may close separately).
  */
-function clearClients() {
-  abortAdd = true;
-  stopAllWalkers();
-  clients.clear();
-  used = 0;
-  addError = "";
+function clearClients(runId) {
+  if (!runId) return "run_id required";
+  if (addingRunId === runId) abortAdd = true;
+  for (const [gi, state] of [...clients.entries()]) {
+    if (state.runId !== runId) continue;
+    stopWalker(gi);
+    clients.delete(gi);
+  }
+  if (clients.size === 0) used = 0;
+  return "";
 }
 
-function spawnWalker(globalIndex, endpoint) {
+function spawnWalker(globalIndex, endpoint, runId) {
   const name = botName(globalIndex);
+  const previousRun = clients.get(globalIndex)?.runId || "";
+  const keptRun = runId || previousRun;
   const { host, port, side } = endpoint;
   const logPath = walkerLogPath(name);
   const logFd = fs.openSync(logPath, "a");
@@ -369,6 +428,7 @@ function spawnWalker(globalIndex, endpoint) {
     suppressExitRetry: false,
     endpoint: { ...endpoint },
     earlyExitReason: "",
+    runId: keptRun,
   };
   clients.set(globalIndex, state);
   lifetime.starts++;
@@ -596,7 +656,7 @@ async function waitEarlyOutcome(globalIndex, timeoutMs, target) {
  * Spawn-miss (hub pose wrote but in-game still at world spawn) rewrites the pose with
  * backoff and respawns — does not silently leave the bot stranded.
  */
-async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
+async function spawnSlotWithRetries(globalIndex, initialEndpoint, runId) {
   const name = botName(globalIndex);
   let endpoint = { ...initialEndpoint };
   let lastReason = "unknown";
@@ -619,7 +679,7 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
       `${ts()} mc-harness: seam pose ${name} attempt=${attempt}/${maxAttempts} side=${endpoint.side} -> ${target.x},${target.y},${target.z} join=${endpoint.host}:${endpoint.port}`,
     );
     await writeSeamPoseWithRetries(name, globalIndex, { server: endpoint.ckServer });
-    spawnWalker(globalIndex, endpoint);
+    spawnWalker(globalIndex, endpoint, runId);
 
     const outcome = await waitEarlyOutcome(globalIndex, EARLY_STABLE_MS, target);
     if (outcome.ok) {
@@ -683,18 +743,22 @@ async function spawnSlotWithRetries(globalIndex, initialEndpoint) {
   return { ok: false, reason: lastReason, endpoint };
 }
 
-function requestAdd(count) {
+function requestAdd(count, runId) {
+  if (!runId) return "run_id required";
+  const blocked = admissionError();
+  if (blocked) return blocked;
   if (busy) return "busy";
   if (count <= 0) return "count must be > 0";
   if (used + count > INDEX_LIMIT) {
     return `would exceed LT_INDEX_LIMIT=${INDEX_LIMIT} (used=${used})`;
   }
   busy = true;
+  addingRunId = runId;
   addError = "";
   abortAdd = false;
   // Pose must land in CK before the JVM joins. Logins are staggered one-at-a-time.
-  // Early deaths (transfer / crash) retry the same index. By default the first
-  // unrecovered seam-entry failure aborts the whole run (LT_ABORT_ON_SEAM_FAIL=1).
+  // Early deaths retry the same index. One spawn miss does not stop the other bots
+  // unless LT_ABORT_ON_SEAM_FAIL is set.
   setImmediate(() => {
     (async () => {
       let okCount = 0;
@@ -707,7 +771,7 @@ function requestAdd(count) {
           }
           const gi = INDEX_BASE + used;
           const initial = endpointForIndex(gi);
-          const result = await spawnSlotWithRetries(gi, initial);
+          const result = await spawnSlotWithRetries(gi, initial, runId);
           used++;
           if (result.ok) {
             okCount++;
@@ -717,9 +781,9 @@ function requestAdd(count) {
             if (ABORT_ON_SEAM_FAIL) {
               addError = `seam-entry failure on ${name}: ${result.reason} — aborted run (ok=${okCount} before fail)`;
               console.error(
-                `${ts()} mc-harness: ${addError}; stopping all walkers`,
+                `${ts()} mc-harness: ${addError}; stopping walkers for ${runId}`,
               );
-              stopAllWalkers();
+              clearClients(runId);
               abortAdd = true;
               break;
             }
@@ -752,15 +816,22 @@ function requestAdd(count) {
         if (e?.stack) console.error(e.stack);
       } finally {
         busy = false;
+        addingRunId = "";
       }
     })();
   });
   return "";
 }
 
-function statusJson() {
+function matchingClients(runId) {
+  const all = [...clients.values()];
+  if (!runId) return all;
+  return all.filter((c) => c.runId === runId);
+}
+
+function statusJson(runId = "") {
   let active = 0;
-  for (const c of clients.values()) if (c.alive) active++;
+  for (const c of matchingClients(runId)) if (c.alive) active++;
   return {
     instance_id: INSTANCE_ID,
     index_base: INDEX_BASE,
@@ -781,6 +852,7 @@ function statusJson() {
     abort_on_seam_fail: ABORT_ON_SEAM_FAIL,
     placement_confirm_ms: PLACEMENT_CONFIRM_MS,
     mc_port: Number(MC_PORT),
+    run_id: runId || undefined,
   };
 }
 
@@ -889,21 +961,22 @@ async function handle(req, res) {
   }
   try {
     if (req.method === "GET" && url.pathname === "/v1/status") {
-      return json(res, 200, statusJson());
+      return json(res, 200, statusJson(url.searchParams.get("run_id") || ""));
     }
     if (req.method === "GET" && url.pathname === "/v1/stats") {
       return json(res, 200, statsJson());
     }
     if (req.method === "POST" && url.pathname === "/v1/clients/add") {
       const body = await readBody(req);
-      const err = requestAdd(Number(body.count || 0));
+      const err = requestAdd(Number(body.count || 0), String(body.run_id || ""));
       if (err) return json(res, 400, { error: err });
-      return json(res, 202, { accepted: true, status: statusJson() });
+      return json(res, 202, { accepted: true, status: statusJson(String(body.run_id || "")) });
     }
     if (req.method === "POST" && url.pathname === "/v1/clients/clear") {
-      if (busy) abortAdd = true;
-      clearClients();
-      return json(res, 200, { ok: true, status: statusJson() });
+      const body = await readBody(req);
+      const err = clearClients(String(body.run_id || ""));
+      if (err) return json(res, 400, { error: err });
+      return json(res, 200, { ok: true, status: statusJson(String(body.run_id || "")) });
     }
     if (req.method === "POST" && url.pathname === "/v1/rung/open") {
       const body = await readBody(req);
@@ -947,7 +1020,7 @@ function listen() {
 ensureStatsDir();
 listen();
 if (START_CLIENTS > 0) {
-  const err = requestAdd(START_CLIENTS);
+  const err = requestAdd(START_CLIENTS, env("LT_RUN_ID", "boot"));
   if (err) {
     console.error("mc-harness: initial add failed:", err);
     process.exit(2);

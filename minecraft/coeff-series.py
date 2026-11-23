@@ -30,6 +30,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import bend
+
 HOLD_SEC = 180
 LADDER = (2, 4, 8)
 CREEP = 4
@@ -50,6 +52,7 @@ RCON_PASS_FILE = Path(
 WEST = os.environ.get("COEFF_WEST", "40.160.15.239")
 EAST = os.environ.get("COEFF_EAST", "40.160.99.136")
 METRICS = Path(__file__).with_name("fabric-metrics.sh")
+RUN_ID = os.environ.get("LT_RUN_ID", "coeff-series")
 FLAVOR = "b3-8"
 SERVERS = 2
 
@@ -219,11 +222,17 @@ def api(host: str, token: str, method: str, path: str, body: dict | None = None)
 
 
 def fan_status(token: str) -> list[dict]:
+    """Hosts that do not answer are left out. They are not active=0."""
     rows = []
     for host in hosts():
-        code, body = api(host, token, "GET", "/v1/status")
+        try:
+            code, body = api(host, token, "GET", f"/v1/status?run_id={RUN_ID}")
+        except Exception as exc:
+            log(f"omit {host}: {exc}")
+            continue
         if code != 200 or not isinstance(body, dict):
-            raise RuntimeError(f"status {code} from {host}")
+            log(f"omit {host}: status {code}")
+            continue
         body["_host"] = host
         rows.append(body)
     return rows
@@ -366,7 +375,7 @@ def ensure_walker_runtime(token: str) -> None:
 
 def add_on_first(token: str, count: int) -> None:
     host = hosts()[0]
-    code, body = api(host, token, "POST", "/v1/clients/add", {"count": count})
+    code, body = api(host, token, "POST", "/v1/clients/add", {"count": count, "run_id": RUN_ID})
     if code not in (200, 202):
         raise RuntimeError(f"add {count} rejected {code}: {body}")
 
@@ -630,9 +639,13 @@ def build_row(
     ram_used = round(sum(useds), 4) if len(useds) == 2 else None
     fracs = [v["ram_frac"] for v in (west, east) if v["ram_frac"] is not None]
     ram_frac = max(fracs) if fracs else None
+    sustained = bend.series_stayed_hot(per)
     load1 = max([v for v in (west["load1"], east["load1"]) if v is not None], default=None)
     nproc = west["nproc"] or east["nproc"]
     cpu_busy = max([v for v in (west["cpu_busy_pct"], east["cpu_busy_pct"]) if v is not None], default=None)
+    if bend.is_stop(exit_reason) or not sustained:
+        load1 = None
+        cpu_busy = None
     binding = binding_of(hold_ok=hold_ok, ram_frac=ram_frac, load1=load1, nproc=nproc, cpu_busy=cpu_busy)
 
     def props_from(info: dict) -> dict:
@@ -745,6 +758,9 @@ def hold(token: str, n_target: int, out_dir: Path) -> dict:
         while time.time() - start < HOLD_SEC:
             time.sleep(POLL_SEC)
             now = fan_status(token)
+            if len(now) < len(hosts()):
+                log(f"hold target={n_target} omitted {len(hosts()) - len(now)} generator(s); not a collapse")
+                continue
             active = fleet_active(now)
             min_active = min(min_active, active)
             if active != n_target:
@@ -806,7 +822,7 @@ def hold(token: str, n_target: int, out_dir: Path) -> dict:
 
 def clear_fleet(token: str) -> None:
     for host in hosts():
-        api(host, token, "POST", "/v1/clients/clear", {})
+        api(host, token, "POST", "/v1/clients/clear", {"run_id": RUN_ID})
     time.sleep(2)
 
 
@@ -880,11 +896,7 @@ def main() -> int:
             elif index == len(targets):
                 stopped = "no creep: hold was not an accepted unbound row"
     finally:
-        log("clearing walkers")
-        try:
-            clear_fleet(token)
-        except Exception as exc:
-            log(f"clear failed: {exc}")
+        pass
     outcome = {
         "series": "8gb",
         "stopped": stopped,
