@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Progress page for the four-server and 16-server mesh climbs.
+"""Progress page for the mesh climbs, and a map of the nine-server world.
 
-Reads the two climb CSVs and re-reads them. The chart section also shows
+Reads the climb CSVs and re-reads them. The chart section also shows
 the live connected counts on the four-server and 16-server meshes, read
-from harness status. Does not place bots or start a climb. Binds 127.0.0.1:8768 only.
+from harness status. The map reads positions from the nine game servers.
+Does not place bots, clear bots, or start a climb. Binds 127.0.0.1:8768 only.
 """
 
 from __future__ import annotations
@@ -15,11 +16,13 @@ import math
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +48,7 @@ def find_project_root() -> Path:
 ROOT = find_project_root()
 FOUR_CSV = ROOT / "seam-scaling-four-2026-11-19.csv"
 SIXTEEN_CSV = ROOT / "seam-scaling-sixteen-2026-11-19.csv"
+NINE_CSV = ROOT / "seam-scaling-nine-2026-11-23.csv"
 HERE = Path(__file__).resolve().parent
 PID_PATH = HERE / "progress-page.pid"
 BIND = ("127.0.0.1", 8768)
@@ -106,6 +110,7 @@ DOCUMENT = """<!DOCTYPE html>
 <body data-page="mesh-climbs">
 <header>
   <h1>Mesh climbs</h1>
+  <p class="sub"><a href="/map">Nine-server world map</a></p>
   <p class="sub">Four-server climb and 16-server climb. Both are this jar, commit COMMIT_TOKEN, sha256 SHA_TOKEN.</p>
   <p>The nine-server point is a different build. It is the hold of 513 players on nine servers, about 57 per server, on the previous jar.</p>
   <p class="note">C(N) = N*C(1) / (1 + sigma*(N-1) + kappa*N*(N-1)). The curve is drawn after both climbs have a bend row: a hold whose load stays at or above 1.8 for the whole 180 seconds, or whose busiest core stays at or above 90%, and whose next count fails because the game servers refused it. A six-hour walker exit, a harness restart, a full index window, and a load-generator miss are not bends.</p>
@@ -425,12 +430,15 @@ def climb_state(name, servers, color, rows, error, stamp, filename):
 def build():
     four_rows, four_err, four_stamp = load_csv(FOUR_CSV, FOUR_CSV.name)
     sixteen_rows, sixteen_err, sixteen_stamp = load_csv(SIXTEEN_CSV, SIXTEEN_CSV.name)
+    nine_rows, nine_err, nine_stamp = load_csv(NINE_CSV, NINE_CSV.name)
     mark_bend(four_rows)
     mark_bend(sixteen_rows)
+    mark_bend(nine_rows)
     return {
         "fit": try_fit(four_rows, sixteen_rows),
         "four": climb_state("Four-server climb", 4, "#1d4ed8", four_rows, four_err, four_stamp, FOUR_CSV.name),
         "sixteen": climb_state("16-server climb", 16, "#c2410c", sixteen_rows, sixteen_err, sixteen_stamp, SIXTEEN_CSV.name),
+        "nine": climb_state("Nine-server climb", 9, "#0f766e", nine_rows, nine_err, nine_stamp, NINE_CSV.name),
         "read_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -867,14 +875,23 @@ def seam_section() -> str:
     )
 
 
+def nine_section(climb: dict) -> str:
+    extra = ""
+    if not any(row["is_bend"] for row in climb["rows"]):
+        extra = "<p>The climb is in the fast ramp.</p>"
+    link = '<p><a href="/map">Open the nine-server map</a></p>'
+    return climb_section(climb).replace("</h2>", "</h2>" + extra + link, 1)
+
+
 def render_live(state: dict) -> str:
     return "\n".join([
         fit_html(state["fit"]),
+        nine_section(state["nine"]),
         climb_section(state["four"]),
         climb_section(state["sixteen"]),
         capacity_section(state),
         seam_section(),
-        f'<p class="foot">Read both climb files at {esc(state["read_at"])}. Bound to 127.0.0.1:8768.</p>',
+        f'<p class="foot">Read the climb files at {esc(state["read_at"])}. Bound to 127.0.0.1:8768.</p>',
     ])
 
 
@@ -927,6 +944,678 @@ def already_serving() -> bool:
     )
 
 
+# Nine-server mesh. p1 is the southwest cell. Cuts are at 2000 and 4000.
+# (side, host, x0, x1, z0, z1). The high edge is exclusive.
+CELLS = (
+    ("p1", "test-mc-p5-1", 0, 2000, 0, 2000),
+    ("p2", "test-mc-p5-2", 2000, 4000, 0, 2000),
+    ("p3", "test-mc-p5-3", 4000, 6000, 0, 2000),
+    ("p4", "test-mc-p5-4", 0, 2000, 2000, 4000),
+    ("p5", "test-mc-p5-5", 2000, 4000, 2000, 4000),
+    ("p6", "test-mc-p5-6", 4000, 6000, 2000, 4000),
+    ("p7", "test-mc-p5-7", 0, 2000, 4000, 6000),
+    ("p8", "test-mc-p5-8", 2000, 4000, 4000, 6000),
+    ("p9", "test-mc-p5-9", 4000, 6000, 4000, 6000),
+)
+WORLD = 6000
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def redact_public(text: str) -> str:
+    def repl(match):
+        if match.group(0).startswith("127."):
+            return match.group(0)
+        return "<ip>"
+
+    return IP_RE.sub(repl, text)
+
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_]{2,16}$")
+BOT_NUMBER_RE = re.compile(r"^S\d+$")
+_map_lock = threading.Lock()
+_map_ready = threading.Event()
+_map = {"updated": None, "players": [], "failed": []}
+
+REMOTE_SCRIPT = r'''
+import gzip, json, re, socket, struct
+from pathlib import Path
+
+SIDE = "SIDE_TOKEN"
+ROOT = Path("/opt/mc") / SIDE
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+LOGIN_RE = re.compile(
+    r"\]: ([A-Za-z0-9_]{2,16})\[/<ip>:[0-9]+\] logged in with entity id \d+ at "
+    r"\(([-\d.]+), ([-\d.]+), ([-\d.]+)\)"
+)
+LOST_RE = re.compile(r"\]: ([A-Za-z0-9_]{2,16}) lost connection")
+
+def is_bot(name):
+    return name.startswith("Load") or re.fullmatch(r"S\d+", name or "") is not None
+
+def online_from_log(text):
+    text = IP_RE.sub("<ip>", text)
+    online = {}
+    for line in text.splitlines():
+        match = LOGIN_RE.search(line)
+        if match:
+            online[match.group(1)] = [float(match.group(2)), float(match.group(3)), float(match.group(4))]
+            continue
+        lost = LOST_RE.search(line)
+        if lost:
+            online.pop(lost.group(1), None)
+    return online
+
+def open_nbt(path):
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        return gzip.decompress(raw)
+    return raw
+
+def read_pos(path):
+    data = open_nbt(path)
+    pos = [0]
+    def u8():
+        value = data[pos[0]]
+        pos[0] += 1
+        return value
+    def u16():
+        value = struct.unpack_from(">H", data, pos[0])[0]
+        pos[0] += 2
+        return value
+    def i32():
+        value = struct.unpack_from(">i", data, pos[0])[0]
+        pos[0] += 4
+        return value
+    def read_string():
+        size = u16()
+        text = data[pos[0]:pos[0] + size].decode("utf-8", "replace")
+        pos[0] += size
+        return text
+    def skip(tag):
+        if tag == 1:
+            pos[0] += 1
+        elif tag == 2:
+            pos[0] += 2
+        elif tag == 3:
+            pos[0] += 4
+        elif tag == 4:
+            pos[0] += 8
+        elif tag == 5:
+            pos[0] += 4
+        elif tag == 6:
+            pos[0] += 8
+        elif tag == 7:
+            pos[0] += i32()
+        elif tag == 8:
+            pos[0] += u16()
+        elif tag == 9:
+            inner = u8()
+            count = i32()
+            for _ in range(count):
+                skip(inner)
+        elif tag == 10:
+            while True:
+                inner = u8()
+                if inner == 0:
+                    break
+                read_string()
+                skip(inner)
+        elif tag == 11:
+            pos[0] += 4 * i32()
+        elif tag == 12:
+            pos[0] += 8 * i32()
+        else:
+            raise ValueError("tag")
+    if u8() != 10:
+        raise ValueError("root")
+    read_string()
+    while True:
+        tag = u8()
+        if tag == 0:
+            break
+        name = read_string()
+        if name == "Pos" and tag == 9:
+            inner = u8()
+            count = i32()
+            if inner == 6 and count == 3:
+                values = [struct.unpack_from(">d", data, pos[0] + 8 * index)[0] for index in range(3)]
+                return values
+            for _ in range(count):
+                skip(inner)
+        else:
+            skip(tag)
+    return None
+
+def packet(request_id, kind, payload):
+    body = struct.pack("<ii", request_id, kind) + payload.encode() + b"\x00\x00"
+    return struct.pack("<i", len(body)) + body
+
+def recvall(sock, size):
+    buf = b""
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return buf
+
+def recv_packet(sock):
+    size = struct.unpack("<i", recvall(sock, 4))[0]
+    buf = recvall(sock, size)
+    request_id, kind = struct.unpack("<ii", buf[:8])
+    payload = buf[8:-2].decode("utf-8", "replace")
+    return request_id, kind, payload
+
+class LivePos:
+    def __init__(self, secret, port):
+        self._secret = secret
+        self._port = port
+        self._sock = None
+
+    def connect(self):
+        sock = socket.create_connection(("127.0.0.1", self._port), timeout=3)
+        sock.settimeout(2)
+        sock.sendall(packet(1, 3, self._secret))
+        request_id, _kind, _payload = recv_packet(sock)
+        if request_id != 1:
+            sock.close()
+            return False
+        self._sock = sock
+        return True
+
+    def pos(self, name):
+        if self._sock is None:
+            return None
+        self._sock.sendall(packet(2, 2, "data get entity " + name + " Pos"))
+        _request_id, _kind, payload = recv_packet(self._sock)
+        match = re.search(
+            r"\[(-?\d+(?:\.\d+)?)d,\s*(-?\d+(?:\.\d+)?)d,\s*(-?\d+(?:\.\d+)?)d\]",
+            payload,
+        )
+        if not match:
+            return None
+        return [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+
+    def close(self):
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+def live_reader(root):
+    props = {}
+    path = root / "server.properties"
+    if not path.exists():
+        return None
+    for line in path.read_text(errors="replace").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        props[key] = value
+    if props.get("enable-rcon", "").strip().lower() != "true":
+        return None
+    secret = props.get("rcon.password") or ""
+    if not secret:
+        return None
+    try:
+        port = int(props.get("rcon.port") or "25575")
+    except ValueError:
+        return None
+    reader = LivePos(secret, port)
+    try:
+        if not reader.connect():
+            return None
+    except OSError:
+        return None
+    return reader
+
+def main():
+    players = []
+    error = None
+    reader = None
+    try:
+        if SIDE not in {"p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"}:
+            raise RuntimeError("side")
+        log_path = ROOT / "logs" / "latest.log"
+        text = log_path.read_text(errors="replace") if log_path.exists() else ""
+        online = online_from_log(text)
+        by_name = {}
+        cache_path = ROOT / "usercache.json"
+        if cache_path.exists():
+            for item in json.loads(cache_path.read_text()):
+                name = item.get("name")
+                uid = item.get("uuid")
+                if isinstance(name, str) and isinstance(uid, str):
+                    by_name[name] = uid
+        saved = ROOT / "Crowded Kingdoms" / "players" / "data"
+        real_left = 8
+        for name, login in online.items():
+            pos = None
+            uid = by_name.get(name)
+            if uid:
+                path = saved / (uid + ".dat")
+                if path.exists():
+                    try:
+                        pos = read_pos(path)
+                    except Exception:
+                        pos = None
+            if not pos:
+                pos = login
+            live = False
+            if not is_bot(name) and real_left > 0:
+                if reader is None:
+                    reader = live_reader(ROOT)
+                if reader is not None:
+                    real_left -= 1
+                    try:
+                        got = reader.pos(name)
+                    except OSError:
+                        got = None
+                    if got:
+                        pos = got
+                        live = True
+            players.append({"name": name, "x": pos[0], "y": pos[1], "z": pos[2], "live": live})
+    except Exception:
+        error = "read_failed"
+    finally:
+        if reader is not None:
+            reader.close()
+    raw = json.dumps({"side": SIDE, "players": players, "error": error}, separators=(",", ":"))
+    print(IP_RE.sub("<ip>", raw))
+
+main()
+'''
+
+
+def is_bot_name(name: str) -> bool:
+    return name.startswith("Load") or BOT_NUMBER_RE.fullmatch(name) is not None
+
+
+def cell_of(x: float, z: float):
+    if not math.isfinite(x) or not math.isfinite(z):
+        return None
+    if x < 0 or z < 0 or x >= WORLD or z >= WORLD:
+        return None
+    column = 0 if x < 2000 else 1 if x < 4000 else 2
+    row = 0 if z < 2000 else 1 if z < 4000 else 2
+    return f"p{row * 3 + column + 1}"
+
+
+def coord_text(value: float) -> str:
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+def game_hosts() -> dict:
+    path = Path.home() / ".local/state/cks-test-mc-p5/vms.json"
+    found = {}
+    if not path.exists():
+        return found
+    try:
+        climb_mesh.walk_hosts(json.loads(path.read_text()), found)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return found
+
+
+def ssh_text(ip: str, script: str, timeout: int = 22) -> str:
+    key = Path.home() / ".local/state/cks-test-mc-cluster/id_ed25519"
+    known = Path.home() / ".local/state/cks-test-mc-p5/known_hosts"
+    proc = subprocess.run(
+        [
+            "ssh",
+            "-i",
+            str(key),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"UserKnownHostsFile={known}",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=12",
+            "-o",
+            "LogLevel=ERROR",
+            f"ubuntu@{ip}",
+            "sudo",
+            "python3",
+            "-",
+        ],
+        input=script.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+    )
+    text = IP_RE.sub("<ip>", proc.stdout.decode("utf-8", "replace"))
+    if proc.returncode != 0:
+        raise RuntimeError(f"ssh exit {proc.returncode}")
+    return text
+
+
+def parse_side(text: str, side: str):
+    line = ""
+    for row in text.splitlines():
+        row = row.strip()
+        if row.startswith("{") and row.endswith("}"):
+            line = row
+    if not line:
+        raise RuntimeError("no reading")
+    data = json.loads(line)
+    if data.get("side") != side:
+        raise RuntimeError("wrong side")
+    players = []
+    for item in data.get("players") or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or NAME_RE.fullmatch(name) is None:
+            continue
+        try:
+            x = float(item["x"])
+            y = float(item["y"])
+            z = float(item["z"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            continue
+        players.append({
+            "name": name,
+            "x": x,
+            "y": y,
+            "z": z,
+            "live": bool(item.get("live")),
+            "side": side,
+        })
+    error = data.get("error")
+    if error:
+        error = "read_failed"
+    return players, error
+
+
+def prefer_player(current: dict, incoming: dict) -> dict:
+    if current["live"] != incoming["live"]:
+        return current if current["live"] else incoming
+    current_home = cell_of(current["x"], current["z"]) == current["side"]
+    incoming_home = cell_of(incoming["x"], incoming["z"]) == incoming["side"]
+    if current_home != incoming_home:
+        return current if current_home else incoming
+    return incoming
+
+
+def merge_players(players: list[dict]) -> list[dict]:
+    best = {}
+    for player in players:
+        previous = best.get(player["name"])
+        best[player["name"]] = player if previous is None else prefer_player(previous, player)
+    return list(best.values())
+
+
+def positions_from_players(players: list[dict], failed: list[str], updated=None) -> dict:
+    merged = merge_players(players)
+    counts = {side: {"bots": 0, "real": []} for side, *_rest in CELLS}
+    dots = []
+    real = []
+    outside = 0
+    for player in merged:
+        cell = cell_of(player["x"], player["z"])
+        if is_bot_name(player["name"]):
+            if cell is None:
+                outside += 1
+            else:
+                counts[cell]["bots"] += 1
+            dots.append({"x": player["x"], "z": player["z"], "cell": cell})
+            continue
+        entry = {
+            "name": player["name"],
+            "x": player["x"],
+            "y": player["y"],
+            "z": player["z"],
+            "cell": cell,
+            "live": bool(player["live"]),
+            "side": player["side"],
+        }
+        real.append(entry)
+        if cell is None:
+            outside += 1
+        else:
+            counts[cell]["real"].append(player["name"])
+    cells = []
+    for side, host, x0, x1, z0, z1 in CELLS:
+        cells.append({
+            "id": side,
+            "host": host,
+            "x0": x0,
+            "x1": x1,
+            "z0": z0,
+            "z1": z1,
+            "bots": counts[side]["bots"],
+            "real": counts[side]["real"],
+            "ok": side not in failed,
+            "label": "p1 southwest" if side == "p1" else ("p5 center" if side == "p5" else side),
+        })
+    real.sort(key=lambda item: item["name"])
+    return {
+        "updated": updated,
+        "bots": sum(1 for player in merged if is_bot_name(player["name"])),
+        "outside": outside,
+        "real": real,
+        "dots": dots,
+        "cells": cells,
+        "failed": list(failed),
+    }
+
+
+def positions_payload() -> dict:
+    with _map_lock:
+        snapshot = {
+            "updated": _map["updated"],
+            "players": list(_map["players"]),
+            "failed": list(_map["failed"]),
+        }
+    payload = positions_from_players(snapshot["players"], snapshot["failed"], snapshot["updated"])
+    raw = json.dumps(payload)
+    if IP_RE.search(raw):
+        payload = json.loads(IP_RE.sub("<ip>", raw))
+    return payload
+
+
+def refresh_positions():
+    hosts = game_hosts()
+    script_by_side = {side: REMOTE_SCRIPT.replace("SIDE_TOKEN", side) for side, *_rest in CELLS}
+
+    def one(cell):
+        side, host = cell[0], cell[1]
+        ip = hosts.get(host)
+        if not ip:
+            return side, [], "read_failed"
+        try:
+            text = ssh_text(ip, script_by_side[side])
+            return (side, *parse_side(text, side))
+        except Exception:
+            return side, [], "read_failed"
+
+    failed = []
+    found = []
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        for side, players, error in pool.map(one, CELLS):
+            found.extend(players)
+            if error and not players:
+                failed.append(side)
+    snapshot = {
+        "updated": datetime.now().isoformat(timespec="seconds"),
+        "players": merge_players(found),
+        "failed": failed,
+    }
+    with _map_lock:
+        _map.update(snapshot)
+
+
+def map_watch():
+    while True:
+        started = time.time()
+        try:
+            refresh_positions()
+        except Exception as exc:
+            sys.stderr.write(f"position read failed: {type(exc).__name__}\n")
+        finally:
+            _map_ready.set()
+        time.sleep(max(1.0, 8.0 - (time.time() - started)))
+
+
+def map_svg(payload: dict) -> str:
+    left, top, size = 52, 28, 560
+    width, height = 680, 640
+
+    def sx(x):
+        return left + (float(x) / WORLD) * size
+
+    def sz(z):
+        return top + (1.0 - float(z) / WORLD) * size
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Nine-server coordinate grid">',
+        f'<rect x="{left}" y="{top}" width="{size}" height="{size}" fill="#f5f5f4" stroke="#1c1917" stroke-width="1.5"/>',
+    ]
+    for cell in payload["cells"]:
+        x = sx(cell["x0"])
+        y = sz(cell["z1"])
+        w = sx(cell["x1"]) - x
+        h = sz(cell["z0"]) - y
+        parts.append(
+            f'<g data-cell="{esc(cell["id"])}">'
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" fill="#fff" stroke="#a8a29e"/>'
+            f'<text x="{x + w / 2:.1f}" y="{y + 28:.1f}" text-anchor="middle" font-size="16" font-weight="650" fill="#1c1917">{esc(cell["label"])}</text>'
+            f'<text x="{x + w / 2:.1f}" y="{y + 48:.1f}" text-anchor="middle" font-size="12" fill="#57534e">{esc(cell["host"])}</text>'
+            f'<text x="{x + w / 2:.1f}" y="{y + h - 18:.1f}" text-anchor="middle" font-size="13" fill="#44403c">{esc(str(cell["bots"]))} bots</text>'
+            + ("" if cell["ok"] else f'<text x="{x + w / 2:.1f}" y="{y + h / 2:.1f}" text-anchor="middle" font-size="13" fill="#9f1239">no reading</text>')
+            + "</g>"
+        )
+    for cut in (2000, 4000):
+        parts.append(
+            f'<line data-cut="{cut}" x1="{sx(cut):.1f}" y1="{top}" x2="{sx(cut):.1f}" y2="{top + size}" stroke="#1c1917" stroke-width="1.5"/>'
+        )
+        parts.append(
+            f'<line data-cut="{cut}" x1="{left}" y1="{sz(cut):.1f}" x2="{left + size}" y2="{sz(cut):.1f}" stroke="#1c1917" stroke-width="1.5"/>'
+        )
+        parts.append(
+            f'<text x="{sx(cut):.1f}" y="{top - 8}" text-anchor="middle" font-size="11" fill="#57534e">{cut}</text>'
+        )
+        parts.append(
+            f'<text x="{left - 8}" y="{sz(cut) + 4:.1f}" text-anchor="end" font-size="11" fill="#57534e">{cut}</text>'
+        )
+    parts.append(f'<text x="{left}" y="{height - 8}" font-size="12" fill="#57534e">Z increases up. X increases right. Southwest is p1.</text>')
+    for dot in payload["dots"]:
+        if dot["cell"] is None:
+            continue
+        parts.append(
+            f'<circle data-bot="1" cx="{sx(dot["x"]):.1f}" cy="{sz(dot["z"]):.1f}" r="2.6" fill="#44403c" fill-opacity="0.85"/>'
+        )
+    for player in payload["real"]:
+        x = min(max(player["x"], 0), WORLD)
+        z = min(max(player["z"], 0), WORLD)
+        px, py = sx(x), sz(z)
+        kind = "live" if player["live"] else "saved"
+        parts.append(
+            f'<g data-player="{esc(player["name"])}">'
+            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="6" fill="#c2410c" stroke="#fff" stroke-width="1.5"/>'
+            f'<text x="{px + 8:.1f}" y="{py - 8:.1f}" font-size="13" font-weight="650" fill="#7c2d12" stroke="#fff" stroke-width="3" paint-order="stroke">{esc(player["name"])}</text>'
+            f'<title>{esc(player["name"])} {esc(kind)} {esc(coord_text(player["x"]))}, {esc(coord_text(player["y"]))}, {esc(coord_text(player["z"]))}</title>'
+            "</g>"
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def map_body(payload: dict) -> str:
+    names = [player["name"] for player in payload["real"]]
+    named = ", ".join(names) if names else "none online"
+    rows = []
+    for player in payload["real"]:
+        where = player["cell"] or "outside the grid"
+        kind = "live" if player["live"] else "saved"
+        rows.append(
+            "<li>"
+            f"{esc(player['name'])} on {esc(where)} at "
+            f"{esc(coord_text(player['x']))}, {esc(coord_text(player['y']))}, {esc(coord_text(player['z']))}"
+            f", {kind}</li>"
+        )
+    if not rows:
+        rows.append("<li>No real player is online.</li>")
+    failed = ""
+    if payload["failed"]:
+        failed = f'<p class="note">No reading from {esc(", ".join(payload["failed"]))}.</p>'
+    updated = payload["updated"] or "not yet"
+    return (
+        f'<p id="counts" class="status">{payload["bots"]} bots. Real players: {esc(named)}.</p>'
+        f'<p class="note">Read {esc(updated)}. Named players are read live. Bot dots are the latest saved position. '
+        "A bot name starts with Load, or is an S-numbered walker. "
+        f'{payload["outside"]} outside the 0–6000 grid.</p>'
+        f"{failed}"
+        f'<div id="grid">{map_svg(payload)}</div>'
+        "<h2>Real players</h2>"
+        f'<ul>{"".join(rows)}</ul>'
+    )
+
+
+MAP_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nine-server mesh</title>
+<style>
+  :root { color-scheme: light; --ink:#1c1917; --muted:#57534e; --line:#e7e5e4; --paper:#f7f6f3; --card:#fff; --ok:#14532d; --okbg:#ecfdf3; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: var(--ink); background: var(--paper); }
+  header, main { max-width: 760px; margin: 0 auto; padding: 0 20px; }
+  header { padding-top: 20px; }
+  h1 { font-size: 1.45rem; margin: 0 0 8px; }
+  h2 { font-size: 1.05rem; margin: 16px 0 8px; }
+  a { color: #1d4ed8; }
+  .sub, .note, .foot { color: var(--muted); }
+  .status { margin: 0 0 12px; padding: 10px 12px; background: var(--okbg); border: 1px solid #bbf7d0; border-radius: 10px; color: var(--ok); font-weight: 650; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin: 0 0 14px; }
+  svg { width: 100%; height: auto; display: block; }
+  ul { margin: 0; padding-left: 18px; }
+  .foot { font-size: 12.5px; padding-bottom: 28px; }
+</style>
+</head>
+<body data-page="nine-map">
+<header>
+  <h1>Nine-server mesh</h1>
+  <p class="sub">3×3 grid. Cuts at block 2000 and 4000 on X and Z. <a href="/">Climb progress</a></p>
+</header>
+<main>
+<section id="board">
+<!--BOARD-->
+</section>
+</main>
+<p class="foot">Bound to 127.0.0.1:8768. Refreshes about every 8 seconds.</p>
+<script>
+async function tick() {
+  try {
+    const res = await fetch("/map/live", {cache: "no-store"});
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    document.getElementById("board").innerHTML = await res.text();
+  } catch (err) {
+    const board = document.getElementById("board");
+    if (board && !board.textContent.trim()) board.textContent = "Could not read positions.";
+  }
+}
+setInterval(tick, 6000);
+</script>
+<noscript><meta http-equiv="refresh" content="6"></noscript>
+</body>
+</html>
+"""
+
+
+def render_map_page() -> str:
+    return MAP_PAGE.replace("<!--BOARD-->", map_body(positions_payload()), 1)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -937,6 +1626,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path == "/positions.json":
+            body = redact_public(json.dumps(positions_payload())).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+            return
+        if path in {"/map", "/map/"}:
+            self._send(200, "text/html; charset=utf-8", redact_public(render_map_page()).encode("utf-8"))
+            return
+        if path == "/map/live":
+            self._send(200, "text/html; charset=utf-8", redact_public(map_body(positions_payload())).encode("utf-8"))
+            return
         try:
             state = build()
         except Exception:
@@ -964,7 +1663,9 @@ class Handler(BaseHTTPRequestHandler):
 def serve():
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     threading.Thread(target=watch, name="csv-watch", daemon=True).start()
+    threading.Thread(target=map_watch, name="positions", daemon=True).start()
     _pop_ready.wait(timeout=30)
+    _map_ready.wait(timeout=25)
     try:
         httpd = ThreadingHTTPServer(BIND, Handler)
     except OSError:
@@ -972,6 +1673,7 @@ def serve():
     httpd.daemon_threads = True
     PID_PATH.write_text(f"{os.getpid()}\n")
     print("http://127.0.0.1:8768/", flush=True)
+    print("http://127.0.0.1:8768/map", flush=True)
     print("watching seam-scaling-four-2026-11-19.csv and seam-scaling-sixteen-2026-11-19.csv", flush=True)
     try:
         httpd.serve_forever()
@@ -1165,6 +1867,35 @@ def self_check():
     mixed["test-mc-west3"] = {"active": 50}
     four_total, four_answered = sum_answered_active(mixed, got_names)
     expect(four_total == 24 and four_answered == 8, "four-server sum counted a host outside the four-server generators")
+    expect("Nine-server climb" in page, "nine climb is missing")
+    expect('href="/map"' in page, "map link is missing")
+    if not any(row["is_bend"] for row in state["nine"]["rows"]):
+        expect("The climb is in the fast ramp." in page, "nine climb should say it is in the fast ramp")
+    expect(cell_of(98, 705) == "p1", "p1 is the southwest cell")
+    expect(cell_of(2000, 0) == "p2", "the cut at 2000 belongs to the next cell")
+    expect(cell_of(2500, 2500) == "p5", "p5 is the center cell")
+    expect(cell_of(4100, 4100) == "p9", "p9 is the northeast cell")
+    expect(cell_of(6000, 10) is None, "6000 is outside the grid")
+    expect(is_bot_name("Load12") and is_bot_name("S161") and not is_bot_name("BenScholtens") and not is_bot_name("Hiirukai"), "bot names")
+    compile(REMOTE_SCRIPT.replace("SIDE_TOKEN", "p1"), "<remote>", "exec")
+    sample = positions_from_players(
+        [
+            {"name": "BenScholtens", "x": 98, "y": 125, "z": 705, "live": True, "side": "p1"},
+            {"name": "Load1", "x": 10, "y": 64, "z": 10, "live": False, "side": "p1"},
+            {"name": "S161", "x": 2500, "y": 70, "z": 100, "live": False, "side": "p2"},
+            {"name": "Hiirukai", "x": 4100, "y": 80, "z": 4100, "live": True, "side": "p9"},
+        ],
+        [],
+        "sample",
+    )
+    drawn = map_body(sample)
+    expect("BenScholtens" in drawn and "Hiirukai" in drawn, "real names missing from the map")
+    expect("Load1" not in drawn and "S161" not in drawn, "a bot was given a name tag")
+    expect("2 bots" in drawn, "bot count missing")
+    expect('data-cell="p1"' in drawn and 'data-cell="p9"' in drawn and "p1 southwest" in drawn and "p5 center" in drawn, "grid labels missing")
+    expect('data-cut="2000"' in drawn and 'data-cut="4000"' in drawn, "cut lines missing")
+    expect(IP_RE.search(drawn) is None, "map contains an address")
+    expect(IP_RE.search(json.dumps(sample)) is None, "positions contain an address")
 
 
 def read_changeable_text(text: str) -> str:
