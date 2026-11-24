@@ -26,12 +26,16 @@ STATE = Path.home() / ".local/state/cks-test-mc-p5/nine-climb"
 CLIMB_LOG = STATE / "climb-nine.log"
 WATCH_LOG = STATE / "hold-watch.log"
 PID_PATH = STATE / "hold-watch.pid"
-CSV_PATH = Path(
-    os.environ.get(
-        "CK_PROJECT_ROOT",
-        "/Users/benjaminscholtens/Documents/CrowdedKingdoms/cks-project-root",
-    )
-) / "seam-scaling-nine-2026-11-23.csv"
+
+
+def seam_csv_path() -> Path | None:
+    root = os.environ.get("CK_PROJECT_ROOT", "").strip()
+    if not root:
+        return None
+    return Path(root).expanduser() / "seam-scaling-nine-2026-11-23.csv"
+
+
+CSV_PATH = seam_csv_path()
 
 HOLD_SEC = 180
 GAP_LIMIT_SEC = 5
@@ -118,8 +122,8 @@ def sample_is_hot(load) -> bool:
     return bend.sample_hot(load, None)
 
 
-def read_header(path: Path):
-    if not path.exists():
+def read_header(path: Path | None):
+    if path is None or not path.exists():
         return None
     with path.open(newline="") as fh:
         return next(csv.reader(fh), None)

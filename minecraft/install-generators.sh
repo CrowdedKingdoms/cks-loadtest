@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SoftMax-style install / verify / collect for Minecraft LoadWalker generators.
 #
-# Mirrors infra-control-plane/scripts/ops/loadtest-generators.sh:
+# Same shape as the UDP loadgen install:
 #   - one harness process per bare OVH VM (no containers)
 #   - disjoint LT_INDEX_BASE / LT_INDEX_LIMIT slices from fleet order
 #   - control bind on the host's OWN tailnet address :9109 (never 0.0.0.0)
