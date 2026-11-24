@@ -14,6 +14,7 @@
  */
 "use strict";
 
+const fs = require("fs");
 const INSET = 32;
 const ATTEMPTS = 80;
 
@@ -75,6 +76,37 @@ function sectionSlot(index, count) {
   return ((i % count) + count) % count;
 }
 
+/**
+ * A wave file lists indexes that should spawn. Indexes inside its window
+ * that are not listed stay unplaced, so one section can be skipped while
+ * the others still receive bots. No file means every index is admitted.
+ * Column selection for an admitted index is unchanged.
+ */
+function admitSkipped(index) {
+  const file = process.env.LT_SECTION_ADMIT || "/opt/ck-mc-harness/section-admit.json";
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    return false;
+  }
+  let spec;
+  try {
+    spec = JSON.parse(raw);
+  } catch (err) {
+    return false;
+  }
+  if (!spec || !Array.isArray(spec.place)) return false;
+  const from = Number(spec.from);
+  const until = Number(spec.until);
+  const i = Number(index) | 0;
+  if (!Number.isFinite(from) || !Number.isFinite(until) || i < from || i >= until) return false;
+  for (let n = 0; n < spec.place.length; n++) {
+    if ((Number(spec.place[n]) | 0) === i) return false;
+  }
+  return true;
+}
+
 function mulberry32(seed) {
   let a = seed >>> 0;
   return () => {
@@ -130,6 +162,16 @@ function sectionSpawn(index, sections, options) {
   if (!sections || !sections.length) throw new Error("no sections");
   const i = Number(index) | 0;
   const cell = sections[sectionSlot(i, sections.length)];
+  if (admitSkipped(i)) {
+    return {
+      server: cell.id,
+      x: null,
+      y: null,
+      z: null,
+      pending: true,
+      reason: "not-admitted",
+    };
+  }
   const inset = opts.inset == null ? INSET : opts.inset;
   const x0 = cell.x0 + inset;
   const z0 = cell.z0 + inset;
@@ -243,6 +285,28 @@ function selfTest() {
   check("p1 origin", P16_SECTIONS[0].id === "p1" && P16_SECTIONS[0].x0 === 0 && P16_SECTIONS[0].z0 === 0);
   check("p16 corner", P16_SECTIONS[15].id === "p16" && P16_SECTIONS[15].x0 === 6144 && P16_SECTIONS[15].z0 === 6144);
   check("ne chunks", fourOwner(2000, 2000) === "ne" && fourOwner(1999, 2000) === "north" && fourOwner(2000, 1999) === "east");
+  const os = require("os");
+  const path = require("path");
+  const admitPath = path.join(os.tmpdir(), "section-admit-self-test.json");
+  const prevAdmit = process.env.LT_SECTION_ADMIT;
+  process.env.LT_SECTION_ADMIT = admitPath;
+  try {
+    fs.writeFileSync(admitPath, JSON.stringify({ from: 10, until: 13, place: [10, 12] }));
+    const skipped = sectionSpawn(11, NINE_SECTIONS, { column: dry });
+    check("admit skip", skipped.pending === true && skipped.reason === "not-admitted" && skipped.y == null && skipped.server === "p3");
+    const kept = sectionSpawn(10, NINE_SECTIONS, { column: dry });
+    check("admit keeps column", kept.pending === false && kept.y === kept.ground + 1 && kept.server === "p2");
+    const outside = sectionSpawn(13, NINE_SECTIONS, { column: dry });
+    check("admit window", outside.pending === false && outside.server === NINE_SECTIONS[13 % 9].id && outside.y === outside.ground + 1);
+  } finally {
+    if (prevAdmit === undefined) delete process.env.LT_SECTION_ADMIT;
+    else process.env.LT_SECTION_ADMIT = prevAdmit;
+    try {
+      fs.unlinkSync(admitPath);
+    } catch (err) {
+      /* the temp file is only for this test */
+    }
+  }
   if (fails.length) {
     for (const line of fails) console.error("FAIL " + line);
     console.error(fails.length + " failed");

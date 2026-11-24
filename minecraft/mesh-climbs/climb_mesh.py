@@ -1085,7 +1085,7 @@ def wait_settled(mesh, loads, want):
 
 def sample_game(mesh, name, side, ip):
     remote = r"""python3 - << 'PY'
-import json, pathlib, socket, subprocess
+import json, pathlib, socket, struct, subprocess
 load = pathlib.Path("/proc/loadavg").read_text().split()
 mem = {}
 for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
@@ -1112,7 +1112,68 @@ try:
     unit = subprocess.check_output(["systemctl", "is-active", "mc-%s"], text=True).strip()
 except subprocess.CalledProcessError as exc:
     unit = (exc.output or "inactive").strip()
-print(json.dumps({"load1": float(load[0]), "mem_avail_kb": mem.get("MemAvailable"), "cpu": cpu, "cores": cores, "port_25565": port, "unit": unit}))
+
+def _varint(n):
+    out = bytearray()
+    n = int(n)
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        out.append(byte | (0x80 if n else 0))
+        if n == 0:
+            break
+    return bytes(out)
+
+def _take_varint(buf, pos):
+    num = 0
+    shift = 0
+    while pos < len(buf):
+        val = buf[pos]
+        pos += 1
+        num |= (val & 0x7F) << shift
+        if not val & 0x80:
+            return num, pos
+        shift += 7
+    raise OSError("varint")
+
+def status_players():
+    host = b"127.0.0.1"
+    port_n = 25565
+    sock = socket.create_connection((host.decode(), port_n), 2)
+    try:
+        handshake = b"\x00" + _varint(47) + _varint(len(host)) + host + struct.pack(">H", port_n) + b"\x01"
+        sock.sendall(_varint(len(handshake)) + handshake)
+        sock.sendall(_varint(1) + b"\x00")
+        num = 0
+        for i in range(5):
+            raw = sock.recv(1)
+            if not raw:
+                raise OSError("eof")
+            val = raw[0]
+            num |= (val & 0x7F) << (7 * i)
+            if not val & 0x80:
+                break
+        else:
+            raise OSError("varint")
+        data = b""
+        while len(data) < num:
+            chunk = sock.recv(num - len(data))
+            if not chunk:
+                break
+            data += chunk
+        _, pos = _take_varint(data, 0)
+        slen, pos = _take_varint(data, pos)
+        info = json.loads(data[pos:pos + slen].decode("utf-8", "replace"))
+        return int(info["players"]["online"])
+    finally:
+        sock.close()
+
+players = None
+try:
+    players = status_players()
+except Exception:
+    players = None
+print(json.dumps({"load1": float(load[0]), "mem_avail_kb": mem.get("MemAvailable"), "cpu": cpu, "cores": cores, "port_25565": port, "unit": unit, "players": players}))
 PY""" % side
     row = json.loads(ssh(mesh, ip, remote, timeout=30))
     row["side"] = side
@@ -1881,6 +1942,408 @@ def write_holds(mesh, bend, needs_loadgen):
     refresh_note(mesh, "\n".join(lines) + "\n")
 
 
+MC_MAX_PLAYERS = 200
+LINE_CPU = 70.0
+LINE_LOAD = 1.8
+ADMIT_PATH = "/opt/ck-mc-harness/section-admit.json"
+
+
+def server_over_line(cpu, load1):
+    """This server's own sample. A missing number is not over the line."""
+    over = False
+    if cpu not in (None, ""):
+        if float(cpu) >= LINE_CPU:
+            over = True
+    if load1 not in (None, ""):
+        if float(load1) >= LINE_LOAD:
+            over = True
+    return over
+
+
+def plan_server_wave(step, seated, over):
+    """Bots to add this cycle, and the step held until that add is judged.
+
+    Over the line adds nothing and the next step is 1.
+    Under the line adds the current step, capped by room under 200 players.
+    An unknown seated count adds nothing and leaves the step alone.
+    """
+    step = max(1, int(step))
+    if over:
+        return 0, 1
+    if seated is None:
+        return 0, step
+    room = max(0, MC_MAX_PLAYERS - int(seated))
+    return min(step, room), step
+
+
+def judge_server_wave(step, added, gained, over_after):
+    """Next step after an add that was actually sent.
+
+    A short seat, or a following sample that is over the line, sets the
+    next step to 1. A full seat that is still under the line grows by one.
+    """
+    if int(added) <= 0:
+        return int(step)
+    if gained is None or int(gained) < int(added) or over_after:
+        return 1
+    return int(step) + 1
+
+
+def memory_seats(mem, by_index):
+    """New bots that fit under the generator memory line.
+
+    At or above 9216 MiB, within 2 GiB of the cap, or a non-numeric cap,
+    takes none. The 9-bot pack size is not a ceiling here.
+    """
+    if by_index <= 0 or not isinstance(mem, tuple) or len(mem) != 2:
+        return 0
+    try:
+        cur = int(mem[0])
+        cap = int(mem[1])
+    except (TypeError, ValueError):
+        return 0
+    if cap <= 0 or cur >= GIB9_MIB or cur >= cap - 2048:
+        return 0
+    budget = (cap - 2048) - cur
+    n = 0
+    while n < by_index:
+        cost = ADD_PACK_MIB + n * ADD_EACH_MIB
+        if cost > budget:
+            break
+        n += 1
+    return n
+
+
+def section_at(index, sections):
+    return sections[int(index) % len(sections)]
+
+
+def assign_section_wave(generators, sections, wants):
+    """Give each section its own count by walking generator index cursors.
+
+    An index whose section is not still owed is left out of `place`. The
+    admit file then keeps that index unplaced, so a hot section takes no bot.
+    Generators that place nothing are omitted.
+    """
+    owed = {key: int(value) for key, value in wants.items() if int(value) > 0}
+    state = []
+    for gen in generators:
+        state.append({
+            "name": gen["name"],
+            "cursor": int(gen["base"]) + int(gen["used"]),
+            "room": int(gen["index_room"]),
+            "seats_left": int(gen["seat_budget"]),
+            "place": [],
+            "seats": {},
+            "span": 0,
+        })
+    guard = 0
+    bound = (sum(owed.values()) + 1) * max(1, len(sections)) * max(1, len(state))
+    while any(owed.values()) and guard < bound:
+        guard += 1
+        moved = False
+        for gen in state:
+            if gen["seats_left"] <= 0 or gen["span"] >= gen["room"]:
+                continue
+            if not any(owed.values()):
+                break
+            idx = gen["cursor"] + gen["span"]
+            sec = section_at(idx, sections)
+            gen["span"] += 1
+            moved = True
+            if owed.get(sec, 0) > 0:
+                owed[sec] -= 1
+                if owed[sec] <= 0:
+                    owed.pop(sec, None)
+                gen["seats_left"] -= 1
+                gen["place"].append(idx)
+                gen["seats"][sec] = gen["seats"].get(sec, 0) + 1
+        if not moved:
+            break
+    plans = {}
+    for gen in state:
+        if not gen["place"]:
+            continue
+        start = gen["cursor"]
+        plans[gen["name"]] = {
+            "from": start,
+            "until": gen["place"][-1] + 1,
+            "place": list(gen["place"]),
+            "seats": dict(gen["seats"]),
+        }
+    return plans
+
+
+def sample_server_line(mesh, games):
+    """Cpu, load, and seated players for every game server, from that server alone."""
+    start = fan(mesh.games, lambda pair: sample_game(mesh, pair[0], pair[1], games[pair[0]]), 8)
+    time.sleep(5)
+    end = fan(mesh.games, lambda pair: sample_game(mesh, pair[0], pair[1], games[pair[0]]), 8)
+    out = {}
+    for name, side in mesh.games:
+        cpu = cpu_pct(start.get(name), end.get(name))
+        row = end.get(name) if isinstance(end.get(name), dict) else {}
+        if not isinstance(row, dict) or row.get("error"):
+            row = {}
+        load1 = row.get("load1")
+        players = row.get("players")
+        if isinstance(players, bool) or not isinstance(players, int):
+            players = None
+        known = cpu is not None or load1 not in (None, "")
+        out[side] = {
+            "cpu": cpu,
+            "load1": load1,
+            "players": players,
+            "known": known,
+            "over": server_over_line(cpu, load1) if known else False,
+        }
+    return out
+
+
+def generator_slots(mesh, loads, caps):
+    """Generators that can still take bots. A full or non-numeric cap is omitted."""
+    status = poll_status(mesh, loads)
+    mems = fan(loads, lambda pair: harness_memory(mesh, pair[1]), 8)
+    gens = []
+    for name, _ip in loads:
+        if caps.get(name) is not None:
+            continue
+        st = status.get(name) or {}
+        if not isinstance(st, dict) or st.get("error"):
+            log(mesh, f"{name} status missing; skipped this wave")
+            continue
+        if st.get("busy"):
+            log(mesh, f"{name} busy; skipped this wave")
+            continue
+        mem = mems.get(name)
+        if not isinstance(mem, tuple):
+            log(mesh, f"{name} memory unread; skipped this wave")
+            continue
+        limit = int(st.get("index_limit") or 0)
+        used = int(st.get("index_used") or 0)
+        base = int(st.get("index_base") or 0)
+        index_room = max(0, limit - used) if limit > 0 else 0
+        seats = memory_seats(mem, index_room)
+        if seats <= 0 or index_room <= 0:
+            continue
+        gens.append({
+            "name": name,
+            "base": base,
+            "used": used,
+            "index_room": index_room,
+            "seat_budget": seats,
+        })
+    return gens
+
+
+def write_admit(mesh, ip, plan):
+    body = json.dumps({
+        "from": int(plan["from"]),
+        "until": int(plan["until"]),
+        "place": [int(item) for item in plan["place"]],
+    }).encode()
+    remote = (
+        "python3 -c 'import pathlib,sys; "
+        'pathlib.Path("/opt/ck-mc-harness/section-admit.json").write_bytes(sys.stdin.buffer.read())\''
+    )
+    ssh(mesh, ip, remote, body, timeout=20)
+
+
+def clear_admit(mesh, loads):
+    for name, ip in loads:
+        try:
+            ssh(mesh, ip, "rm -f /opt/ck-mc-harness/section-admit.json", timeout=20)
+        except Exception as exc:
+            log(mesh, f"admit clear {name} {redact(str(exc))[-80:]}")
+
+
+def add_admitted(mesh, loads, plans):
+    """POST each generator's span. Indexes outside its place list stay unplaced.
+
+    Never clears a bot. A generator with no plan is not touched.
+    """
+    errors = {}
+    ips = {name: ip for name, ip in loads}
+    for name, plan in plans.items():
+        ip = ips.get(name)
+        if ip is None or not plan.get("place"):
+            continue
+        count = int(plan["until"]) - int(plan["from"])
+        if count <= 0:
+            continue
+        seats = ",".join(f"{side}:{n}" for side, n in sorted(plan["seats"].items()))
+        log(mesh, f"admit {name} place={len(plan['place'])} span={count} {seats}")
+        try:
+            write_admit(mesh, ip, plan)
+            resp = api(mesh, ip, "POST", "/v1/clients/add", {"count": count, "run_id": mesh.name})
+        except Exception as exc:
+            errors[name] = redact(str(exc))[-160:]
+            continue
+        if isinstance(resp, dict) and resp.get("error"):
+            errors[name] = str(resp.get("error"))[:240]
+    return errors
+
+
+def memory_refusal(text):
+    low = (text or "").lower()
+    return any(word in low for word in ("memory", "mib", "cap is not", "not a number", "unread"))
+
+
+def wave_stop_reason(mesh, games, marks):
+    """A 60s tick or an OOM stops the climb. One hot sample is not a bend."""
+    if not marks:
+        return ""
+    for name, side in mesh.games:
+        mark = marks.get(name)
+        mark = mark[1] if isinstance(mark, tuple) else mark
+        if not isinstance(mark, dict):
+            continue
+        try:
+            delta = log_delta(mesh, side, games[name], mark)
+        except Exception as exc:
+            log(mesh, f"log {side} {redact(str(exc))[-120:]}")
+            continue
+        if isinstance(delta, dict) and delta.get("tick"):
+            return "60s tick"
+        if isinstance(delta, dict) and delta.get("oom"):
+            return "oom"
+    return ""
+
+
+def run_nine_waves(mesh, loads, games, caps):
+    """Add per game server. A hot server does not shrink the others.
+
+    Each server starts at a step of 9. Under the line the step grows by one
+    after a wave that seats. Over the line, that server's next add is one
+    bot, then two, and so on. This ramp does not take a 180s hold, and a
+    progressive step is not a bend: holding one server would make the others
+    wait. A 60s tick or an OOM still stops the climb and leaves every bot up.
+    Nothing here clears bots.
+    """
+    steps = {side: 9 for side in mesh.sections}
+    log(
+        mesh,
+        "per-server steps start at 9; a hot server does not shrink the others; "
+        "no 180s hold on this ramp; a progressive step is not a bend",
+    )
+    marks = None
+    while True:
+        loads = attach_new_generators(mesh, loads)
+        reason = wave_stop_reason(mesh, games, marks)
+        if reason:
+            log(mesh, f"stopped this climb; not a bend; {reason}")
+            note_stopped(mesh, reason)
+            return
+        try:
+            marks = fan(
+                mesh.games,
+                lambda pair: (pair[0], log_mark(mesh, pair[1], games[pair[0]])),
+                8,
+            )
+        except Exception as exc:
+            log(mesh, f"log mark {redact(str(exc))[-120:]}")
+            marks = None
+        seated, _room = keeper_room(mesh, loads, caps)
+        if seated is None:
+            log(mesh, "no generator answered; not adding")
+            time.sleep(20)
+            continue
+        if seated >= 4000:
+            log(mesh, f"seated {seated} reached the climb ceiling; leaving bots up; not a bend")
+            return
+        samples = sample_server_line(mesh, games)
+        wanted = {}
+        for side in mesh.sections:
+            sample = samples.get(side) or {}
+            before = steps.get(side, 9)
+            if not sample.get("known"):
+                log(mesh, f"wave {side} sample missing; step stays {before}; not adding")
+                wanted[side] = 0
+                continue
+            add, steps[side] = plan_server_wave(before, sample.get("players"), bool(sample.get("over")))
+            wanted[side] = add
+            log(
+                mesh,
+                f"wave {side} cpu={sample.get('cpu')} load={sample.get('load1')} "
+                f"players={sample.get('players')} over={int(bool(sample.get('over')))} "
+                f"step={before} next={steps[side]} add={add}",
+            )
+        if sum(wanted.values()) <= 0:
+            log(mesh, f"wave nothing to add; seated {seated}")
+            time.sleep(20)
+            continue
+        plans = assign_section_wave(generator_slots(mesh, loads, caps), list(mesh.sections), wanted)
+        placed = {side: 0 for side in mesh.sections}
+        for plan in plans.values():
+            for side, count in plan["seats"].items():
+                placed[side] = placed.get(side, 0) + int(count)
+        if sum(placed.values()) <= 0:
+            log(mesh, f"fast pack found no generator under the memory line; seated {seated}")
+            time.sleep(20)
+            continue
+        for side, ask in wanted.items():
+            got = placed.get(side, 0)
+            if ask > got:
+                log(mesh, f"wave {side} wanted {ask} placed {got}; generator room")
+        before_players = {side: (samples.get(side) or {}).get("players") for side in mesh.sections}
+        errors = add_admitted(mesh, loads, plans)
+        if errors:
+            log(mesh, "wave errors " + ",".join(f"{name}:{err}" for name, err in sorted(errors.items())))
+        refused = {name for name, err in errors.items() if memory_refusal(err)}
+        aimed_sides = {side: 0 for side in mesh.sections}
+        for name, plan in plans.items():
+            if name in refused:
+                continue
+            for side, count in plan["seats"].items():
+                aimed_sides[side] += int(count)
+        aimed = sum(aimed_sides.values())
+        if aimed <= 0:
+            clear_admit(mesh, loads)
+            log(mesh, f"fast pack found no generator under the memory line; seated {seated}")
+            time.sleep(20)
+            continue
+        _status, active, _ready = wait_settled(mesh, loads, seated + aimed)
+        clear_admit(mesh, loads)
+        if active is None:
+            log(mesh, "fast pack status missing; stopping this climb")
+            note_stopped(mesh, "spawn status missing")
+            return
+        if active <= 0:
+            log(mesh, "fast pack seated nobody; stopping this climb; not a bend")
+            note_stopped(mesh, "no bot seated; unplaced indexes were spawn misses")
+            return
+        after = sample_server_line(mesh, games)
+        harness_full = isinstance(active, int) and active >= seated + aimed
+        for side, sent in aimed_sides.items():
+            if sent <= 0:
+                continue
+            sample = after.get(side) or {}
+            if not sample.get("known"):
+                log(mesh, f"wave {side} follow-up sample missing; step stays {steps[side]}")
+                continue
+            before_n = before_players.get(side)
+            after_n = sample.get("players")
+            # The harness count is the seat. Player totals name which server
+            # came up short when the harness itself is short.
+            if harness_full:
+                gained = sent
+            elif isinstance(before_n, int) and isinstance(after_n, int):
+                gained = max(0, after_n - before_n)
+            else:
+                log(mesh, f"wave {side} player count unread; step stays {steps[side]}")
+                continue
+            previous = steps[side]
+            steps[side] = judge_server_wave(previous, sent, gained, bool(sample.get("over")))
+            log(
+                mesh,
+                f"wave {side} gained={gained} over={int(bool(sample.get('over')))} "
+                f"step {previous} -> {steps[side]}",
+            )
+        fresh, _room = keeper_room(mesh, loads, caps)
+        shown = " ".join(f"{side}:{steps[side]}" for side in mesh.sections)
+        log(mesh, f"wave seated={fresh if fresh is not None else seated} steps {shown}")
+
+
 def resume_target(mesh):
     target = PACK_SIZE
     if not mesh.csv_path.exists():
@@ -1971,6 +2434,9 @@ def run(mesh):
     if seated is None:
         raise SystemExit("no generator answered; not treating that as zero seated")
     note_started(mesh)
+    if mesh.name == "nine":
+        run_nine_waves(mesh, loads, games, caps)
+        return
     if (clean_held and seated < clean_held) or target < seated:
         jump, side, cpu, load1 = fresh_jump(mesh, games)
         target = seated + jump
