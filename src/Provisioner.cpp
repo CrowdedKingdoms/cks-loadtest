@@ -32,6 +32,14 @@ mutation Consents {
   recordPlayerConsents(acceptLegal: true, attestAgeOfMajority: true)
 })";
 
+// ck-api refuses a gameplay token (AGE_REQUIRED) until the account has a birth date and
+// a country. The derived accounts are adults in the US, the same answers the SDKs' e2e
+// suites give.
+constexpr const char* RECORD_AGE_MUTATION = R"(
+mutation RecordAge {
+  recordPlayerAge(input: { birthDate: "1990-01-01", country: "US" }) { userId }
+})";
+
 // The refresh names the Buddy the client is on so the API authorizes the NEW token
 // there; `authorizedServer` set means "keep your session, switch tokens", null means
 // "re-place" (the node is gone, draining, Full or not local to the app).
@@ -352,16 +360,27 @@ void Provisioner::mintAppToken(GraphQLClient& mgmt, ClientCredentials& c) {
     nlohmann::json vars = {{"input", {{"appId", std::to_string(config_.appId)}}}};
     nlohmann::json data;
     try {
-        try {
-            data = requestWithRetry(mgmt, MINT_MUTATION, vars, c.sessionToken);
-        } catch (const GraphQLError& e) {
-            if (e.isTransport() || e.code() != "LEGAL_ACCEPTANCE_REQUIRED") throw;
-            // The derived accounts are this tool's own, so it stores their consents and
-            // mints again. Asked only on the refusal: an account that has them already
-            // pays nothing, and an API older than the gate never refuses this way.
-            requestWithRetry(mgmt, CONSENTS_MUTATION, nlohmann::json::object(),
-                             c.sessionToken);
-            data = requestWithRetry(mgmt, MINT_MUTATION, vars, c.sessionToken);
+        // The derived accounts are this tool's own, so it answers the mint's two
+        // account refusals itself and mints again: the stored consents
+        // (LEGAL_ACCEPTANCE_REQUIRED) and the birth date and country (AGE_REQUIRED).
+        // Asked only on the refusal: an account that has them already pays nothing,
+        // and an API older than a gate never refuses that way.
+        for (int attempt = 0;; ++attempt) {
+            try {
+                data = requestWithRetry(mgmt, MINT_MUTATION, vars, c.sessionToken);
+                break;
+            } catch (const GraphQLError& e) {
+                if (e.isTransport() || attempt >= 2) throw;
+                if (e.code() == "LEGAL_ACCEPTANCE_REQUIRED") {
+                    requestWithRetry(mgmt, CONSENTS_MUTATION, nlohmann::json::object(),
+                                     c.sessionToken);
+                } else if (e.code() == "AGE_REQUIRED") {
+                    requestWithRetry(mgmt, RECORD_AGE_MUTATION, nlohmann::json::object(),
+                                     c.sessionToken);
+                } else {
+                    throw;
+                }
+            }
         }
     } catch (const GraphQLError& e) {
         if (!e.isTransport() && e.code() == "FORBIDDEN") {

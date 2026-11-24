@@ -4,6 +4,8 @@ This directory is the **Minecraft** worker for the SoftMax-style ladder. It spea
 the same HTTP control API as `cks-loadtest` (`/health`, `/v1/status`, `/v1/stats`,
 `/v1/clients/add`, `/v1/rung/open`, `/v1/rung/close`, `/v1/shutdown`) but each
 client is a **LoadWalker** JVM process (offline Minecraft 26.3 TCP), not Buddy UDP.
+Set `LT_MC_ENGINE=cpp` to run those clients inside one `ck-mc-load` process instead
+(see [cpp/README.md](cpp/README.md)). The default remains `java`.
 
 ## Locked movement
 
