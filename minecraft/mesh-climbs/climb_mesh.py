@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import sys
@@ -227,6 +228,12 @@ def snapshot_wave_seated(mesh, seated, steps):
 
 
 def four_mesh():
+    # Only the generators named for this climb. The nine climb's generators are not a fallback.
+    loads = tuple(
+        name.strip()
+        for name in os.environ.get("CK_FOUR_LOADS", "").split(",")
+        if name.strip()
+    )
     return Mesh(
         name="four",
         title="Four-server mesh",
@@ -237,7 +244,7 @@ def four_mesh():
             ("test-mc-north3", "north"),
             ("test-mc-ne3", "ne"),
         ),
-        loads=tuple(f"test-mc-lg-{i}" for i in range(1, 6)) + ("test-mc-loadgen-1", "test-mc-f4-lg-1", "test-mc-f4-lg-2", "test-mc-f4-lg-3", "test-mc-f4-lg-4", "test-mc-f4-lg-5", "test-mc-f4-lg-6", "test-mc-f4-lg-7", "test-mc-f4-lg-8", "test-mc-f4-lg-9", "test-mc-f4-lg-10", "test-mc-f4-lg-11", "test-mc-f4-lg-12", "test-mc-f4-lg-13", "test-mc-f4-lg-14", "test-mc-f4-lg-15", "test-mc-f4-lg-16", "test-mc-f4-lg-17", "test-mc-f4-lg-18", "test-mc-f4-lg-19", "test-mc-f4-lg-20", "test-mc-f4-lg-21", "test-mc-f4-lg-22", "test-mc-f4-lg-23", "test-mc-f4-lg-24", "test-mc-f4-lg-25"),
+        loads=loads,
         prefix="F4",
         # Walker logs are named LoadN. F4 is only the climb label.
         bot_prefix="Load",
@@ -256,7 +263,7 @@ def four_mesh():
         csv_path=climb_file("seam-scaling-four-2026-11-19.csv"),
         log_path=DIR / "climb-four.log",
         token_path=optional_env_path("CK_FOUR_TOKEN_FILE"),
-        app_path=None,
+        app_path=optional_env_path("CK_FOUR_APP_FILE"),
         reject_app_paths=tuple(
             Path(item).expanduser()
             for item in os.environ.get("CK_FOUR_REJECT_APP_FILES", "").split(os.pathsep)
@@ -804,7 +811,72 @@ PY"""
     return "script-staged-for-next-pack"
 
 
-def write_env(mesh, ip, base, limit, hosts_for_sections):
+def point_four_app(mesh, ip):
+    """Point one idle generator at the four-server app.
+
+    The p5 and p16 app files are refused. Nothing here is logged.
+    """
+    if getattr(mesh, "name", "") != "four":
+        raise RuntimeError("refusing to point a generator at the four app")
+    expect = app_id(mesh.app_path)
+    reject = [app_id(path) for path in mesh.reject_app_paths if app_id(path)]
+    if not expect or expect in reject:
+        raise RuntimeError("four app file is missing or is a rejected app")
+    secrets = {}
+    for line in FOUR_APP_SECRETS.read_text().splitlines():
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key in ("CROWDY_ORG_TOKEN", "CROWDY_ID_PEPPER", "CROWDY_CLUSTER_SECRET"):
+            secrets[key] = value.strip().strip('"').strip("'")
+    if len(secrets) != 3 or any(not value for value in secrets.values()):
+        raise RuntimeError("four app secrets are incomplete")
+    control = token(mesh)
+    if not control:
+        raise RuntimeError("four control token is empty")
+    payload = json.dumps({
+        "expect": expect,
+        "reject": reject,
+        "secrets": secrets,
+        "control": control,
+    })
+    program = "import json\nfrom pathlib import Path\nspec = json.loads(%r)\n" % payload
+    program += """path = Path("/opt/ck-mc-harness/lt.env")
+text = path.read_text() if path.exists() else ""
+updates = {
+    "CROWDY_APP_ID": spec["expect"],
+    "CROWDY_ORG_TOKEN": spec["secrets"]["CROWDY_ORG_TOKEN"],
+    "CROWDY_ID_PEPPER": spec["secrets"]["CROWDY_ID_PEPPER"],
+    "CROWDY_CLUSTER_SECRET": spec["secrets"]["CROWDY_CLUSTER_SECRET"],
+    "LT_CONTROL_TOKEN": spec["control"],
+}
+reject = set(spec["reject"])
+if not updates["CROWDY_APP_ID"] or updates["CROWDY_APP_ID"] in reject:
+    raise SystemExit("refusing this mesh app")
+kept = []
+for line in text.splitlines():
+    if not line or line.lstrip().startswith("#") or "=" not in line:
+        kept.append(line)
+        continue
+    key, _, value = line.partition("=")
+    if key in updates:
+        continue
+    if key == "CROWDY_APP_ID" and value in reject:
+        raise SystemExit("refusing this mesh app")
+    kept.append(line)
+for key, value in updates.items():
+    kept.append("%s=%s" % (key, value))
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("\\n".join(kept).rstrip() + "\\n")
+path.chmod(0o600)
+print("four-app-set")
+"""
+    text = ssh(mesh, ip, "python3 -", program.encode(), timeout=30)
+    if "four-app-set" not in text:
+        raise RuntimeError(redact(text)[-200:])
+
+
+def write_env(mesh, ip, base, limit, hosts_for_sections, extra=None):
     updates = {
         "LT_INDEX_BASE": str(base),
         "LT_INDEX_LIMIT": str(limit),
@@ -824,6 +896,17 @@ def write_env(mesh, ip, base, limit, hosts_for_sections):
         "LT_SECTION_MESH": mesh.name,
         "LT_SECTION_COLUMNS": "/opt/ck-mc-harness/section-columns.json",
     }
+    for key, value in (extra or {}).items():
+        if not isinstance(key, str) or not re.fullmatch(r"LT_[A-Z0-9_]+", key):
+            raise RuntimeError("refusing an env key")
+        text_value = str(value)
+        if text_value == "" or any(ch in text_value for ch in "\n\r\t "):
+            raise RuntimeError("refusing an env value")
+        updates[key] = text_value
+    if getattr(mesh, "name", "") == "four":
+        # One JVM per bot. The heap stays 512m, and admission still refuses at 9216 MiB.
+        updates["LT_MC_PACK_XMX"] = "512m"
+        updates["LT_MC_NAME_PREFIX"] = getattr(mesh, "bot_prefix", None) or "Load"
     for side, host in hosts_for_sections.items():
         updates["LT_MC_HOST_" + side.upper()] = host
     payload = json.dumps({
@@ -937,6 +1020,8 @@ def prepare_idle(mesh, loads, games_by_name):
         harness = harness_text(mesh, ip)
         copy_place_files(mesh, ip, harness)
         patched = patch_harness(mesh, ip, harness)
+        if mesh.name == "four":
+            point_four_app(mesh, ip)
         write_env(mesh, ip, index * PIN_SPAN, PIN_SPAN, section_hosts)
         staged = stage_wander(mesh, ip)
         log(mesh, f"{name} {patched}; {staged}; pinned {index * PIN_SPAN}+{PIN_SPAN}")
@@ -2091,18 +2176,27 @@ def server_over_line(cpu, load1):
     return over
 
 
+def push_through_heat():
+    """True only when this process was started with CK_PUSH_THROUGH_HEAT=1.
+
+    The nine driver sets that flag. Unset, including the four driver, a hot
+    sample still adds nothing and steps down by one.
+    """
+    return os.environ.get("CK_PUSH_THROUGH_HEAT", "").strip() == "1"
+
+
 def plan_server_wave(step, seated, over):
     """Bots to add this cycle, and the step held until that add is judged.
 
-    Over the line adds nothing and steps down by one. It does not reset
-    the step to 1. Under the line adds the current step, capped by room
-    under 200 players, and leaves the step for the judge. No room under
-    that cap grows the step by one: the server was offered nothing only
-    because it was full. An unknown seated count adds nothing and leaves
-    the step alone.
+    Over the line adds nothing and steps down by one, unless
+    CK_PUSH_THROUGH_HEAT=1. That flag keeps offering the current step while
+    the server is still accepting. It does not reset the step to 1. The add
+    is capped by room under 200 players. No room under that cap grows the
+    step by one: the server was offered nothing only because it was full.
+    An unknown seated count adds nothing and leaves the step alone.
     """
     step = max(1, int(step))
-    if over:
+    if over and not push_through_heat():
         return 0, max(1, step - 1)
     if seated is None:
         return 0, step
@@ -2115,17 +2209,18 @@ def plan_server_wave(step, seated, over):
 def judge_server_wave(step, added, gained, over_after, harness_miss=0):
     """Next step after an add that was actually sent.
 
-    Over the line steps down by one. A game server that was offered bots
-    and gained none steps down by one, unless the harness itself missed
-    only a bot or two: that short is not this server refusing. Any other
-    short seat holds the step. A full seat under the line grows by one.
-    The step is never reset to 1. This ramp does not take a 180 second
-    hold, and a progressive step is not a bend.
+    Over the line steps down by one, unless CK_PUSH_THROUGH_HEAT=1. With
+    that flag a hot sample does not step down, and a full seat still grows
+    by one. A game server that was offered bots and gained none steps down
+    by one, unless the harness itself missed only a bot or two: that short
+    is not this server refusing. Any other short seat holds the step. The
+    step is never reset to 1. This ramp does not take a 180 second hold,
+    and a progressive step is not a bend.
     """
     step = max(1, int(step))
     if int(added) <= 0:
         return step
-    if over_after:
+    if over_after and not push_through_heat():
         return max(1, step - 1)
     if gained is not None and int(gained) >= int(added):
         return step + 1
@@ -2135,6 +2230,73 @@ def judge_server_wave(step, added, gained, over_after, harness_miss=0):
     if gained is not None and int(gained) <= 0 and int(harness_miss) > 2:
         return max(1, step - 1)
     return step
+
+
+def jvm_is_dead(unit):
+    """A sampled unit that is not running. A missing sample is not a death."""
+    if not isinstance(unit, str):
+        return False
+    unit = unit.strip()
+    return unit not in ("", "unknown", "active", "activating", "reloading")
+
+
+def server_fall_reason(sample, before, sent=0, gained=None, harness_miss=0):
+    """Why this server fell, or empty.
+
+    Heat is not a fall. A drop of eight or fewer is the sample wobble this
+    climb already shows between waves, so it is not a fall. Generator memory
+    is not decided here.
+    """
+    sample = sample or {}
+    if sample.get("jvm_dead"):
+        return "jvm dead"
+    after = sample.get("players")
+    if (
+        isinstance(before, int)
+        and not isinstance(before, bool)
+        and isinstance(after, int)
+        and not isinstance(after, bool)
+        and before - after > 8
+    ):
+        return f"seated dropped {before} -> {after}"
+    if int(sent) > 0 and gained is not None and int(gained) <= 0 and int(harness_miss) > 2:
+        return "game server refused"
+    return ""
+
+
+def first_server_fall(sides, samples, baselines, aimed=None, gained=None, harness_miss=0):
+    """The first side in climb order that fell, and why."""
+    aimed = aimed or {}
+    gained = gained or {}
+    for side in sides:
+        reason = server_fall_reason(
+            (samples or {}).get(side),
+            (baselines or {}).get(side),
+            int((aimed or {}).get(side) or 0),
+            gained.get(side),
+            harness_miss,
+        )
+        if reason:
+            return side, reason
+    return "", ""
+
+
+def remember_players(baselines, samples):
+    for side, sample in (samples or {}).items():
+        players = (sample or {}).get("players")
+        if isinstance(players, int) and not isinstance(players, bool):
+            baselines[side] = players
+
+
+def log_first_fall(mesh, detail, seated):
+    """Stop offering to every server. Leave seated bots and the other JVMs."""
+    shown = seated if isinstance(seated, int) and not isinstance(seated, bool) else "unread"
+    log(
+        mesh,
+        f"wave stop first fall {detail}; mesh seated {shown}; "
+        "other servers left running; bots left in place",
+    )
+    note_stopped(mesh, f"{detail}; mesh seated {shown}; other servers left running")
 
 
 def memory_seats(mem, by_index):
@@ -2238,12 +2400,14 @@ def sample_server_line(mesh, games):
         if isinstance(players, bool) or not isinstance(players, int):
             players = None
         known = cpu is not None or load1 not in (None, "")
+        unit = row.get("unit") if isinstance(row.get("unit"), str) else ""
         out[side] = {
             "cpu": cpu,
             "load1": load1,
             "players": players,
             "known": known,
             "over": server_over_line(cpu, load1) if known else False,
+            "jvm_dead": jvm_is_dead(unit),
         }
     return out
 
@@ -2338,6 +2502,534 @@ def memory_refusal(text):
     return any(word in low for word in ("memory", "mib", "cap is not", "not a number", "unread"))
 
 
+NINE_STATE = Path.home() / ".local/state/cks-test-mc-p5/nine-climb"
+NINE_GENERATORS = NINE_STATE / "generators.txt"
+NINE_NEXT_BASE = NINE_STATE / "next-base.txt"
+NINE_COLUMNS = NINE_STATE / "section-columns.json"
+FOUR_STATE = Path.home() / ".local/state/cks-test-mc-f4/four-climb"
+FOUR_APP_SECRETS = Path.home() / ".local/state/cks-test-mc-cluster/stage/secrets"
+P16_COLUMNS = Path.home() / ".local/state/cks-test-mc-p16/mesh-climbs/section-columns.json"
+
+
+def climb_dir(mesh=None):
+    if mesh is not None and getattr(mesh, "name", "") == "four":
+        return FOUR_STATE
+    return NINE_STATE
+
+
+def generator_file(mesh=None):
+    return climb_dir(mesh) / "generators.txt"
+
+
+def next_base_file(mesh=None):
+    return climb_dir(mesh) / "next-base.txt"
+
+
+def protected_generator_names():
+    """Names the nine climb already recorded. A four wave must not unshelve these."""
+    if not NINE_GENERATORS.exists():
+        return set()
+    names = set()
+    for line in NINE_GENERATORS.read_text().splitlines():
+        name = line.strip()
+        if name:
+            names.add(name)
+    return names
+POINT_BATCH = NINE_STATE / "point-batch.py"
+SHELVE_HELPER = Path.home() / ".local/state/cks-test-mc-p5/list-or-shelve-mc.mjs"
+LOAD_GENERATOR_NAME = re.compile(r"^test-mc-(?:p5-lg-(?:[1-9]|1[0-9])|f4-lg-(?:[1-9]|1\d|2[0-6]))$")
+SEEDED_GENERATORS = (
+    tuple(f"test-mc-p5-lg-{i}" for i in range(1, 10))
+    + tuple(f"test-mc-p5-lg-{i}" for i in range(10, 20))
+    + tuple(f"test-mc-f4-lg-{i}" for i in range(1, 12))
+)
+_BROUGHT_HOSTS = {}
+
+
+def load_generator_name(name):
+    return bool(LOAD_GENERATOR_NAME.fullmatch(name or ""))
+
+
+def ensure_generator_files(mesh=None):
+    """Seed the climb's generator list and the next 800-wide index base.
+
+    The list lives outside the repo. A later wave appends one name; it does
+    not rewrite the names already recorded. The four climb keeps its own files
+    and does not seed or rewrite the nine climb's list.
+    """
+    if mesh is not None and getattr(mesh, "name", "") == "four":
+        FOUR_STATE.mkdir(parents=True, exist_ok=True)
+        glist = generator_file(mesh)
+        nbase = next_base_file(mesh)
+        if not glist.exists():
+            glist.write_text("")
+            glist.chmod(0o600)
+        if not nbase.exists() or not nbase.read_text().strip():
+            nbase.write_text("0\n")
+            nbase.chmod(0o600)
+        return
+    NINE_STATE.mkdir(parents=True, exist_ok=True)
+    if not NINE_GENERATORS.exists() or not NINE_GENERATORS.read_text().strip():
+        NINE_GENERATORS.write_text("\n".join(SEEDED_GENERATORS) + "\n")
+        NINE_GENERATORS.chmod(0o600)
+    if not NINE_NEXT_BASE.exists() or not NINE_NEXT_BASE.read_text().strip():
+        NINE_NEXT_BASE.write_text("24000\n")
+        NINE_NEXT_BASE.chmod(0o600)
+
+
+def read_generator_names(mesh=None):
+    ensure_generator_files(mesh)
+    names = []
+    for line in generator_file(mesh).read_text().splitlines():
+        name = line.strip()
+        if load_generator_name(name) and name not in names:
+            if name in protected_generator_names() and mesh is not None and getattr(mesh, "name", "") == "four":
+                continue
+            names.append(name)
+    return names
+
+
+def read_next_base(mesh=None):
+    ensure_generator_files(mesh)
+    base = int(next_base_file(mesh).read_text().strip())
+    if mesh is not None and getattr(mesh, "name", "") == "four":
+        if base < 0 or base % PIN_SPAN != 0:
+            raise RuntimeError("four next index base is not an 800-wide span")
+        return base
+    if base < 24000 or base % PIN_SPAN != 0:
+        raise RuntimeError("next index base is not an 800-wide span at or after 24000")
+    return base
+
+
+def store_next_base(base, mesh=None):
+    next_base_file(mesh).write_text(str(int(base)) + "\n")
+
+
+def append_generator_name(name, mesh=None):
+    if not load_generator_name(name):
+        raise RuntimeError("refusing to record a generator")
+    if mesh is not None and getattr(mesh, "name", "") == "four" and name in protected_generator_names():
+        raise RuntimeError("refusing to record a nine-climb generator")
+    names = read_generator_names(mesh)
+    if name in names:
+        return
+    with generator_file(mesh).open("a") as fh:
+        fh.write(name + "\n")
+
+
+def loads_for_nine(mesh):
+    """Re-read this climb's generator list. Names missing from inventory are left out."""
+    found = inventory()
+    found.update(_BROUGHT_HOSTS)
+    loads = []
+    for name in read_generator_names(mesh):
+        ip = found.get(name)
+        if isinstance(ip, str) and ip:
+            loads.append((name, ip))
+        else:
+            log(mesh, f"{name} not in inventory; skipped this wave")
+    return loads
+
+
+def remember_brought_host(name, ip):
+    """Keep a generator the inventory file did not list yet. The address is not logged."""
+    if not load_generator_name(name) or not isinstance(ip, str) or not ip:
+        return
+    _BROUGHT_HOSTS[name] = ip
+    raw = os.environ.get("CK_INVENTORY_FILES", "").split(os.pathsep)
+    path = Path(raw[0]).expanduser() if raw and raw[0].strip() else None
+    if path is None or not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text())
+        vms = data.get("vms") if isinstance(data, dict) else None
+        if not isinstance(vms, list):
+            return
+        for row in vms:
+            if isinstance(row, dict) and row.get("name") == name:
+                row["ip"] = ip
+                row["status"] = "ACTIVE"
+                row["role"] = row.get("role") or "loadgen"
+                break
+        else:
+            vms.append({
+                "name": name,
+                "ip": ip,
+                "status": "ACTIVE",
+                "role": "loadgen",
+                "created": True,
+            })
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return
+
+
+def list_mc_status():
+    """Names and statuses only. The helper does not print addresses."""
+    proc = subprocess.run(
+        ["node", str(SHELVE_HELPER)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=90,
+        check=False,
+    )
+    rows = []
+    for line in proc.stdout.decode(errors="replace").splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        name, status = parts
+        if not name.startswith("test-mc-") or not status.isupper():
+            continue
+        if IP_RE.search(name) or IP_RE.search(status):
+            continue
+        rows.append((name, status))
+    if proc.returncode != 0 and not rows:
+        raise RuntimeError("instance list failed")
+    return rows
+
+
+def shelved_load_pool(exclude):
+    """Shelved p5 and f4 load generators that are not already in the climb.
+
+    Game servers, the sixteen-server mesh, the regular test tier, and a host
+    that is still SHELVING are not candidates. This does not create an instance.
+    """
+    names = []
+    for name, status in list_mc_status():
+        if name in exclude or not load_generator_name(name):
+            continue
+        if "p16" in name or re.fullmatch(r"test-mc-p5-[1-9]", name):
+            continue
+        if status == "SHELVING":
+            continue
+        if status in {"SHELVED", "SHELVED_OFFLOADED"}:
+            names.append(name)
+    names.sort()
+    return names
+
+
+def generators_held_elsewhere():
+    """Load generators this nine climb must not unshelve.
+
+    The four climb holds f4-lg-12/14/15/17/18/19. The add-rate pair holds
+    f4-lg-16 and f4-lg-26.
+    """
+    return {
+        "test-mc-f4-lg-12",
+        "test-mc-f4-lg-14",
+        "test-mc-f4-lg-15",
+        "test-mc-f4-lg-16",
+        "test-mc-f4-lg-17",
+        "test-mc-f4-lg-18",
+        "test-mc-f4-lg-19",
+        "test-mc-f4-lg-26",
+    }
+
+
+def unshelve_named(name):
+    if (
+        not load_generator_name(name)
+        or "p16" in name
+        or re.fullmatch(r"test-mc-p5-[1-9]", name)
+        or name in generators_held_elsewhere()
+    ):
+        raise RuntimeError("refusing to unshelve " + name)
+    proc = subprocess.run(
+        ["node", str(SHELVE_HELPER), "unshelve-named", name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=26 * 60,
+        check=False,
+    )
+    text = proc.stdout.decode(errors="replace")
+    if f"skip shelving {name}" in text or f"final {name} SHELVING" in text:
+        return "shelving"
+    if proc.returncode == 0 and f"final {name} ACTIVE" in text:
+        return "active"
+    return "failed"
+
+
+def load_point_batch():
+    if not POINT_BATCH.exists():
+        return None
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("nine_point_batch", POINT_BATCH)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.BATCH_KNOWN = KNOWN if KNOWN is not None else (NINE_STATE / "known_hosts")
+    mod.FILES = [
+        (HERE.parent / "mc-harness.mjs", "mc-harness.mjs"),
+        (HERE.parent / "seam-pose.mjs", "seam-pose.mjs"),
+        (HERE / "section-place.mjs", "section-place.mjs"),
+        (HERE / "section-spawn.cjs", "section-spawn.cjs"),
+    ]
+    return mod
+
+
+def active_ip(name):
+    """Address of one ACTIVE load generator. The address is not logged."""
+    mod = load_point_batch()
+    if mod is None:
+        return None
+    row = mod.ovh_instances().get(name) or {}
+    if row.get("status") != "ACTIVE":
+        return None
+    ip = row.get("ip") or ""
+    if not isinstance(ip, str) or not IP_RE.fullmatch(ip):
+        return None
+    return ip
+
+
+def offline_uuid(name):
+    digest = hashlib.md5(("OfflinePlayer:" + name).encode()).digest()
+    raw = bytearray(digest)
+    raw[6] = (raw[6] & 0x0F) | 0x30
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def seed_player_ages(mesh, games, base, limit):
+    """Write PlayerAge files for one index span on every nine-server game host.
+
+    This happens before that span's first admit. Existing files are left as they are.
+    """
+    if limit != PIN_SPAN or base < 0:
+        raise RuntimeError("refusing an age span")
+    if getattr(mesh, "name", "") == "four":
+        name_prefix = getattr(mesh, "bot_prefix", None) or "Load"
+        side_ok = re.compile(r"west|east|north|ne")
+    else:
+        name_prefix = "S16"
+        side_ok = re.compile(r"p[1-9]")
+    uuids = [offline_uuid(f"{name_prefix}{index + 1}") for index in range(int(base), int(base) + int(limit))]
+    payload = json.dumps(
+        {"born": "1990-01", "answered": time.strftime("%Y-%m-%d")},
+        separators=(",", ":"),
+    ) + "\n"
+    script = """import os, pwd, grp
+payload = %r
+uuids = %r
+side = %r
+uid = pwd.getpwnam("minecraft").pw_uid
+gid = grp.getgrnam("minecraft").gr_gid
+folders = ["/opt/mc/shared/ages", "/opt/mc/%%s/Crowded Kingdoms/crowdedkingdoms/ages" %% side]
+added = 0
+kept = 0
+for folder in folders:
+    os.makedirs(folder, exist_ok=True)
+    os.chown(folder, uid, gid)
+    for item in uuids:
+        path = os.path.join(folder, item + ".json")
+        if os.path.exists(path):
+            kept += 1
+            continue
+        with open(path, "w") as fh:
+            fh.write(payload)
+        os.chmod(path, 0o600)
+        os.chown(path, uid, gid)
+        added += 1
+print("added %%d kept %%d" %% (added, kept))
+""" % (payload, uuids, "SIDE")
+
+    def one(pair):
+        name, side = pair
+        if not side_ok.fullmatch(side):
+            raise RuntimeError("refusing an age path")
+        ip = games[name]
+        text = ssh(mesh, ip, "sudo -n python3 -", script.replace("SIDE", side).encode(), timeout=120)
+        last = text.strip().splitlines()[-1] if text.strip() else ""
+        if not last.startswith("added "):
+            raise RuntimeError("age seed failed on " + name)
+        return last
+
+    results = fan(mesh.games, one, 8)
+    failed = [name for name, value in results.items() if not isinstance(value, str)]
+    if failed:
+        raise RuntimeError("age seed failed on " + " ".join(sorted(failed)))
+    log(mesh, f"ages {base}+{limit} on {len(mesh.games)} game servers")
+
+
+def copy_worktree_harness(mesh, ip):
+    """Copy this worktree's harness, including columnSeed, onto one new generator.
+
+    The nine-climb column table is copied onto that host. The sixteen-server
+    column file is not written.
+    """
+    remote_dir = "/opt/ck-mc-harness/minecraft"
+    try:
+        found = harness_text(mesh, ip)
+    except Exception:
+        found = "MISSING"
+    if found != "MISSING" and found.startswith("/opt/ck-mc-harness/"):
+        remote_dir = str(Path(found).parent)
+    ssh(mesh, ip, "mkdir -p " + remote_dir, timeout=20)
+    for local, filename in (
+        (HERE.parent / "mc-harness.mjs", "mc-harness.mjs"),
+        (HERE.parent / "seam-pose.mjs", "seam-pose.mjs"),
+        (HERE / "section-place.mjs", "section-place.mjs"),
+        (HERE / "section-spawn.cjs", "section-spawn.cjs"),
+    ):
+        scp_to(ip, local, f"ubuntu@{ip}:{remote_dir}/{filename}")
+    columns = NINE_COLUMNS
+    if getattr(mesh, "name", "") == "four":
+        columns = LOCAL_COLUMNS
+        banned = {NINE_COLUMNS.resolve(), P16_COLUMNS.resolve()}
+        if columns.resolve() in banned:
+            raise RuntimeError("refusing another climb's column table")
+    if not columns.exists():
+        raise RuntimeError("column table is missing")
+    scp_to(ip, columns, f"ubuntu@{ip}:/opt/ck-mc-harness/section-columns.json")
+    probe = (
+        "python3 -c \"import pathlib; "
+        "text=pathlib.Path(%r).read_text(); "
+        "print('columnSeed' if 'function columnSeed' in text else 'missing')\""
+        % (remote_dir + "/section-spawn.cjs")
+    )
+    text = ssh(mesh, ip, probe, timeout=20)
+    if "columnSeed" not in text.split():
+        raise RuntimeError("columnSeed missing on the new generator")
+    log(mesh, "columnSeed present on the new generator")
+
+
+def generator_bot_count(mesh, ip):
+    try:
+        if java_count(mesh, ip) > 0:
+            return 1
+    except Exception:
+        return None
+    try:
+        st = api(mesh, ip, "GET", "/v1/status?run_id=" + mesh.name)
+    except Exception:
+        return 0
+    if not isinstance(st, dict) or st.get("error"):
+        return 0
+    active = st.get("active")
+    if isinstance(active, bool) or not isinstance(active, int):
+        return 0
+    return active
+
+
+def start_new_harness(mesh, ip, name, base):
+    """Start the harness on this generator. A seated bot blocks the restart."""
+    seated = generator_bot_count(mesh, ip)
+    if seated is None or seated > 0:
+        raise RuntimeError(name + " has seated bots; not restarting")
+    ssh(mesh, ip, "sudo systemctl restart ck-mc-harness.service", timeout=40)
+    deadline = time.time() + 90
+    ready = False
+    while time.time() < deadline:
+        try:
+            text = ssh(
+                mesh,
+                ip,
+                "systemctl is-active ck-mc-harness; curl -sf -m 5 http://127.0.0.1:9109/health || true",
+                timeout=25,
+            )
+        except Exception:
+            time.sleep(2)
+            continue
+        lines = [line for line in text.splitlines() if line.strip()]
+        if lines and lines[0].strip() == "active" and '"ok":true' in text.replace(" ", ""):
+            ready = True
+            break
+        time.sleep(2)
+    if not ready:
+        raise RuntimeError("harness did not return")
+    st = api(mesh, ip, "GET", "/v1/status?run_id=" + mesh.name)
+    if not isinstance(st, dict) or st.get("error"):
+        raise RuntimeError("harness status unread")
+    active = st.get("active")
+    if isinstance(active, bool) or not isinstance(active, int) or active != 0:
+        raise RuntimeError("new generator reported seated bots")
+    if int(st.get("index_base") or -1) != int(base) or int(st.get("index_limit") or 0) < PIN_SPAN:
+        raise RuntimeError("harness index window mismatch")
+    log(mesh, f"{name} harness up base={base} limit={PIN_SPAN} active=0")
+
+
+def bring_up_generator(mesh, games, name, base):
+    """Point one unshelved generator at the next index span and start only its harness.
+
+    PlayerAge files are written before this generator can be admitted. Nothing
+    here clears a client or restarts a generator that already has bots.
+    """
+    if load_point_batch() is None:
+        log(mesh, "point-batch missing; not bringing a generator up")
+        return False
+    ip = active_ip(name)
+    if not ip:
+        log(mesh, f"{name} is not active; not bringing it up")
+        return False
+    section_hosts = {side: games[game] for game, side in mesh.games}
+    try:
+        seed_player_ages(mesh, games, base, PIN_SPAN)
+        if generator_bot_count(mesh, ip) not in (0,):
+            log(mesh, f"{name} has seated bots; not restarting")
+            return False
+        copy_worktree_harness(mesh, ip)
+        if mesh.name == "four":
+            point_four_app(mesh, ip)
+        prefix = "S16" if mesh.name != "four" else (getattr(mesh, "bot_prefix", None) or "Load")
+        write_env(
+            mesh,
+            ip,
+            base,
+            PIN_SPAN,
+            section_hosts,
+            extra={"LT_MC_NAME_PREFIX": prefix, "LT_INSTANCE_ID": name},
+        )
+        start_new_harness(mesh, ip, name, base)
+    except Exception as exc:
+        log(mesh, f"{name} bring-up failed; {redact(str(exc))[-180:]}")
+        return False
+    append_generator_name(name, mesh)
+    store_next_base(base + PIN_SPAN, mesh)
+    remember_brought_host(name, ip)
+    log(mesh, f"{name} joined generators base={base}+{PIN_SPAN}")
+    return True
+
+
+def open_generator_for_shortfall(mesh, games, room, need):
+    """Unshelve one shelved load generator when this wave cannot be covered.
+
+    Room enough is handled by the caller, which does not call this. An empty
+    pool is logged and the wave continues on the generators already in the climb.
+    """
+    try:
+        banned = set(read_generator_names(mesh))
+        if getattr(mesh, "name", "") == "four":
+            banned |= protected_generator_names()
+        if getattr(mesh, "name", "") == "nine":
+            banned |= generators_held_elsewhere()
+        pool = shelved_load_pool(banned)
+    except Exception as exc:
+        log(mesh, "generator pool list failed; continuing " + redact(str(exc))[-80:])
+        return False
+    if not pool:
+        log(mesh, "generator pool empty; continuing")
+        return False
+    for name in pool[:3]:
+        log(mesh, f"unshelving {name} because room {room} <need {need}")
+        try:
+            state = unshelve_named(name)
+        except Exception as exc:
+            log(mesh, f"{name} unshelve failed; {redact(str(exc))[-120:]}")
+            return False
+        if state == "shelving":
+            log(mesh, f"skip shelving {name}")
+            continue
+        if state != "active":
+            log(mesh, f"{name} did not become active; continuing")
+            return False
+        base = read_next_base(mesh)
+        return bring_up_generator(mesh, games, name, base)
+    log(mesh, "generator pool empty; continuing")
+    return False
+
+
 def wave_stop_reason(mesh, games, marks):
     """A 60s tick or an OOM stops the climb. One hot sample is not a bend."""
     if not marks:
@@ -2353,37 +3045,51 @@ def wave_stop_reason(mesh, games, marks):
             log(mesh, f"log {side} {redact(str(exc))[-120:]}")
             continue
         if isinstance(delta, dict) and delta.get("tick"):
-            return "60s tick"
+            return f"60s tick on {side}"
         if isinstance(delta, dict) and delta.get("oom"):
-            return "oom"
+            return f"oom on {side}"
     return ""
 
 
 def run_nine_waves(mesh, loads, games, caps):
     """Add per game server. One server's result does not change another step.
 
-    Each server starts at a step of 9. Under the line, a full seat grows
-    that server's step by one. A short seat, including a one or two bot
-    harness miss, a generator memory refusal, or a spawn miss, holds the
-    step. Over the line, or a refusal that is this game server, adds
-    nothing and steps down by one. This ramp does not take a 180s hold,
-    and a progressive step is not a bend: holding one server would make
-    the others wait. A 60s tick or an OOM still stops the climb and leaves
-    every bot up. Nothing here clears bots.
+    Each server starts at a step of 9. A full seat grows that server's step
+    by one. A short seat, including a one or two bot harness miss, a
+    generator memory refusal, or a spawn miss, holds the step. Over the
+    line adds nothing and steps down by one, unless CK_PUSH_THROUGH_HEAT=1.
+    With that flag a hot sample keeps the offer and the step grows on a
+    full seat. The first server that falls — JVM dead, seated down by more
+    than eight, or a game-server refusal — stops offers to every server.
+    Generator memory is not a fall. This ramp does not take a 180s hold,
+    and a progressive step is not a bend. A 60s tick or an OOM still stops
+    the climb and leaves every bot up. Nothing here clears bots.
     """
     steps = {side: STEP_START for side in mesh.sections}
-    log(
-        mesh,
-        "per-server steps start at 9; only a hot or refusing server steps down by one; "
-        "a short seat holds; no 180s hold on this ramp; a progressive step is not a bend",
-    )
+    if push_through_heat():
+        log(
+            mesh,
+            "per-server steps start at 9; push through heat; a hot sample does not add 0 or step down; "
+            "a full seat still grows by one; the first fall stops every server; bots stay",
+        )
+    else:
+        log(
+            mesh,
+            "per-server steps start at 9; only a hot or refusing server steps down by one; "
+            "a short seat holds; no 180s hold on this ramp; a progressive step is not a bend",
+        )
     marks = None
+    last_players = {}
     while True:
-        loads = attach_new_generators(mesh, loads)
+        loads = loads_for_nine(mesh)
         reason = wave_stop_reason(mesh, games, marks)
         if reason:
-            log(mesh, f"stopped this climb; not a bend; {reason}")
-            note_stopped(mesh, reason)
+            if push_through_heat():
+                seated_now, _room = keeper_room(mesh, loads, caps)
+                log_first_fall(mesh, reason, seated_now)
+            else:
+                log(mesh, f"stopped this climb; not a bend; {reason}")
+                note_stopped(mesh, reason)
             return
         try:
             marks = fan(
@@ -2403,6 +3109,12 @@ def run_nine_waves(mesh, loads, games, caps):
             log(mesh, f"seated {seated} reached the climb ceiling; leaving bots up; not a bend")
             return
         samples = sample_server_line(mesh, games)
+        if push_through_heat():
+            fell_side, fell_why = first_server_fall(mesh.sections, samples, last_players)
+            if fell_side:
+                log_first_fall(mesh, f"{fell_side} {fell_why}", seated)
+                return
+        remember_players(last_players, samples)
         wanted = {}
         wave_rows = {}
         for side in mesh.sections:
@@ -2431,11 +3143,21 @@ def run_nine_waves(mesh, loads, games, caps):
                 "add": add,
             }
         snapshot_wave_sample(mesh, wave_rows)
-        if sum(wanted.values()) <= 0:
+        need = sum(int(count) for count in wanted.values())
+        if need <= 0:
+            log(mesh, "generator pool armed, room enough, no unshelve")
             log(mesh, f"wave nothing to add; seated {seated}")
             time.sleep(20)
             continue
-        plans = assign_section_wave(generator_slots(mesh, loads, caps), list(mesh.sections), wanted)
+        slots = generator_slots(mesh, loads, caps)
+        plans = assign_section_wave(slots, list(mesh.sections), wanted)
+        placed_n = sum(sum(int(count) for count in plan["seats"].values()) for plan in plans.values())
+        if placed_n >= need:
+            log(mesh, "generator pool armed, room enough, no unshelve")
+        elif open_generator_for_shortfall(mesh, games, placed_n, need):
+            loads = loads_for_nine(mesh)
+            slots = generator_slots(mesh, loads, caps)
+            plans = assign_section_wave(slots, list(mesh.sections), wanted)
         placed = {side: 0 for side in mesh.sections}
         for plan in plans.values():
             for side, count in plan["seats"].items():
@@ -2480,6 +3202,7 @@ def run_nine_waves(mesh, loads, games, caps):
         harness_miss = (seated + aimed - active) if isinstance(active, int) and active < seated + aimed else 0
         if harness_miss:
             log(mesh, f"wave harness missed {harness_miss}")
+        gained_by_side = {}
         for side, sent in aimed_sides.items():
             if sent <= 0:
                 continue
@@ -2498,6 +3221,7 @@ def run_nine_waves(mesh, loads, games, caps):
             else:
                 log(mesh, f"wave {side} player count unread; step stays {steps[side]}")
                 continue
+            gained_by_side[side] = gained
             previous = steps[side]
             steps[side] = judge_server_wave(
                 previous, sent, gained, bool(sample.get("over")), harness_miss
@@ -2513,6 +3237,14 @@ def run_nine_waves(mesh, loads, games, caps):
         shown_seated = fresh if fresh is not None else seated
         log(mesh, f"wave seated={shown_seated} steps {shown}")
         snapshot_wave_seated(mesh, shown_seated, steps)
+        if push_through_heat():
+            fell_side, fell_why = first_server_fall(
+                mesh.sections, after, before_players, aimed_sides, gained_by_side, harness_miss
+            )
+            if fell_side:
+                log_first_fall(mesh, f"{fell_side} {fell_why}", shown_seated)
+                return
+        remember_players(last_players, after)
 
 
 def resume_target(mesh):
@@ -2605,7 +3337,11 @@ def run(mesh):
     if seated is None:
         raise SystemExit("no generator answered; not treating that as zero seated")
     note_started(mesh)
-    if mesh.name == "nine":
+    if mesh.name in ("nine", "four"):
+        if mesh.name == "four":
+            for index, (name, _ip) in enumerate(loads):
+                seed_player_ages(mesh, games, index * PIN_SPAN, PIN_SPAN)
+                log(mesh, f"ages ready {name} {index * PIN_SPAN}+{PIN_SPAN}")
         run_nine_waves(mesh, loads, games, caps)
         return
     if (clean_held and seated < clean_held) or target < seated:

@@ -6,7 +6,8 @@ the live connected counts on the four-server and 16-server meshes, read
 from harness status. The map reads positions from the nine game servers.
 Its headline is the live seated total on the nine generators. Dots stay
 bots that have a saved position. Under the map, the generator diagram
-rereads the local nine-climb log (or the snapshot beside it). That is a
+rereads the local nine-climb log (or the snapshot beside it) and, when
+the file is present, the generator list beside that log. That is a
 disk read. It does not open a connection to a game server or a generator.
 Does not place bots, clear bots, or start a climb. Binds 127.0.0.1:8768 only.
 """
@@ -68,8 +69,6 @@ _four = {"value": None, "answered": 0, "sought": 0}
 
 COMMIT = "c9ff2a3f3c711de6d5af17ef2f36e7b913c6e252"
 JAR_SHA = "b7a2ab65f87de5d0e542476fea1421ee6d89c224560ecd7f172c875c220d5aa0"
-NINE_PLAYERS = 513
-NINE_SERVERS = 9
 
 SEAM_HOLDS = (
     (2, 44, "22 per server"),
@@ -116,9 +115,8 @@ DOCUMENT = """<!DOCTYPE html>
 <header>
   <h1>Mesh climbs</h1>
   <p class="sub"><a href="/map">Nine-server world map</a></p>
-  <p class="sub">Four-server climb and 16-server climb. Both are this jar, commit COMMIT_TOKEN, sha256 SHA_TOKEN.</p>
-  <p>The nine-server point is a different build. It is the hold of 513 players on nine servers, about 57 per server, on the previous jar.</p>
-  <p class="note">C(N) = N*C(1) / (1 + sigma*(N-1) + kappa*N*(N-1)). The curve is drawn after both climbs have a bend row: a hold whose load stays at or above 1.8 for the whole 180 seconds, or whose busiest core stays at or above 90%, and whose next count fails because the game servers refused it. A six-hour walker exit, a harness restart, a full index window, and a load-generator miss are not bends.</p>
+  <p class="sub">Four-server climb, nine-server climb, and 16-server climb. The fit uses this jar, commit COMMIT_TOKEN, sha256 SHA_TOKEN.</p>
+  <p class="note">C(N) = N*C(1) / (1 + sigma*(N-1) + kappa*N*(N-1)). The inputs are the highest count so far on four servers, the latest seated count on nine servers, and the sixteen-server count just before players dropped. The curve for servers 1 through 18 is drawn through those three counts, including when C(1), sigma, or kappa is negative.</p>
 </header>
 <main id="live">
 <!--LIVE-->
@@ -334,7 +332,10 @@ def chart_point(rows: list[dict], servers: int, color: str, name: str):
 
 def usl(n: float, c1: float, sigma: float, kappa: float):
     denom = 1.0 + sigma * (n - 1.0) + kappa * n * (n - 1.0)
-    if not math.isfinite(denom) or denom <= 1e-12:
+    # A falling-then-rising per-server count makes C(1) negative, so this
+    # denominator is negative while the ratio is still the seated count.
+    # Only a zero denominator is undefined.
+    if not math.isfinite(denom) or abs(denom) <= 1e-12:
         return None
     value = n * c1 / denom
     if not math.isfinite(value):
@@ -379,31 +380,149 @@ def recover(points):
     return solve3(matrix, rhs)
 
 
-def try_fit(four_rows: list[dict], sixteen_rows: list[dict]):
-    four = next((row for row in four_rows if row["is_bend"]), None)
-    sixteen = next((row for row in sixteen_rows if row["is_bend"]), None)
-    waiting = {"ready": False, "undetermined": False, "curve": []}
-    if four is None or sixteen is None:
+def highest_held_in_text(text: str, commit: str):
+    """Highest n_held on this jar. A blank commit, an excluded row, and any other jar are skipped."""
+    text = read_changeable_text(text)
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+    except csv.Error:
+        return None
+    if not reader.fieldnames:
+        return None
+    best = None
+    for raw in reader:
+        if not raw:
+            continue
+        raw = {
+            str(key).strip(): ("" if value is None else str(value).strip())
+            for key, value in raw.items()
+            if key
+        }
+        if raw.get("mod_commit") != commit:
+            continue
+        if (raw.get("version_certainty") or "").strip().lower() == "excluded":
+            continue
+        held = as_number(raw.get("n_held"))
+        if isinstance(held, bool) or not isinstance(held, (int, float)) or held <= 0:
+            continue
+        if best is None or held > best:
+            best = held
+    return best
+
+
+def highest_held(path: Path, commit: str):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return highest_held_in_text(text, commit)
+
+
+def sixteen_before_drop(text: str):
+    """Seated count the sixteen-server note records just before players dropped."""
+    match = re.search(r"pre-crash seated count of (\d+)", text)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"Seated fell from (\d+)", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def sixteen_crash_count(path: Path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return sixteen_before_drop(text)
+
+
+SEATED_COUNT_RE = re.compile(r"(?<![A-Za-z])seated(?:=|\s+)(\d+)")
+
+
+def nine_latest_seated_text(text: str):
+    """Latest seated count. A later `seated N` line replaces an earlier `wave seated=` line."""
+    latest = None
+    for match in SEATED_COUNT_RE.finditer(text):
+        value = int(match.group(1))
+        if value > 0:
+            latest = value
+    return latest
+
+
+def nine_latest_seated(path: Path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return nine_latest_seated_text(text)
+
+
+def scalability_points():
+    """Three counts on this jar: four-server high-water, latest nine seated count, sixteen before the drop."""
+    return [
+        {"servers": 4, "players": highest_held(FOUR_CSV, COMMIT), "kind": "high-water"},
+        {"servers": 9, "players": nine_latest_seated(NINE_CLIMB_LOG), "kind": "climbing"},
+        {
+            "servers": 16,
+            "players": sixteen_crash_count(SIXTEEN_CSV.with_suffix(".md")),
+            "kind": "crash-before",
+        },
+    ]
+
+
+def plain_point(point: dict) -> str:
+    servers = point["servers"]
+    players = whole(point.get("players"))
+    kind = point.get("kind")
+    if kind == "crash-before":
+        return (
+            f"{servers} servers, {players} players, a crash-before count: "
+            "the seated count just before players dropped."
+        )
+    if kind == "climbing":
+        return (
+            f"{servers} servers, {players} players, the latest seated count: "
+            "the newest seated line in the nine-server log, not a crash."
+        )
+    return (
+        f"{servers} servers, {players} players, a high-water mark: "
+        "the highest count so far on this jar. There was no player drop."
+    )
+
+
+def try_fit(points):
+    found = list(points or [])
+    waiting = {"ready": False, "undetermined": False, "curve": [], "points": found}
+    usable = []
+    for point in found:
+        players = point.get("players")
+        servers = point.get("servers")
+        if isinstance(players, bool) or not isinstance(players, (int, float)):
+            return waiting
+        if players <= 0 or servers is None:
+            return waiting
+        usable.append((float(servers), float(players)))
+    if len(usable) != 3:
         return waiting
-    c4 = four.get("held")
-    c16 = sixteen.get("held")
-    if c4 is None or c16 is None or c4 <= 0 or c16 <= 0:
-        return {"ready": False, "undetermined": True, "curve": []}
-    solved = recover([(4, c4), (NINE_SERVERS, NINE_PLAYERS), (16, c16)])
+    solved = recover(usable)
+    undetermined = {"ready": False, "undetermined": True, "curve": [], "points": found}
     if not solved:
-        return {"ready": False, "undetermined": True, "curve": []}
+        return undetermined
     c1, sigma, kappa = solved
-    checks = ((4, float(c4)), (float(NINE_SERVERS), float(NINE_PLAYERS)), (16, float(c16)))
-    for servers, players in checks:
+    # Negative C(1), sigma, or kappa still determines the curve. A zero
+    # denominator is the only algebraic result that stays undetermined.
+    for servers, players in usable:
         predicted = usl(servers, c1, sigma, kappa)
         if predicted is None or abs(predicted - players) > max(1e-4, abs(players) * 1e-6):
-            return {"ready": False, "undetermined": True, "curve": []}
+            return undetermined
     curve = []
     step = 1.0
     servers = 1.0
     while servers <= 18.0001:
         curve.append((servers, usl(servers, c1, sigma, kappa)))
         servers += step
+    by_server = {int(point["servers"]): point["players"] for point in found}
     return {
         "ready": True,
         "undetermined": False,
@@ -413,9 +532,11 @@ def try_fit(four_rows: list[dict], sixteen_rows: list[dict]):
         "c1_text": format_param(c1),
         "sigma_text": format_param(sigma),
         "kappa_text": format_param(kappa),
-        "four_held": whole(c4),
-        "sixteen_held": whole(c16),
+        "four_held": whole(by_server.get(4)),
+        "nine_held": whole(by_server.get(9)),
+        "sixteen_held": whole(by_server.get(16)),
         "curve": curve,
+        "points": found,
     }
 
 
@@ -440,7 +561,7 @@ def build():
     mark_bend(sixteen_rows)
     mark_bend(nine_rows)
     return {
-        "fit": try_fit(four_rows, sixteen_rows),
+        "fit": try_fit(scalability_points()),
         "four": climb_state("Four-server climb", 4, "#1d4ed8", four_rows, four_err, four_stamp, FOUR_CSV.name),
         "sixteen": climb_state("16-server climb", 16, "#c2410c", sixteen_rows, sixteen_err, sixteen_stamp, SIXTEEN_CSV.name),
         "nine": climb_state("Nine-server climb", 9, "#0f766e", nine_rows, nine_err, nine_stamp, NINE_CSV.name),
@@ -490,17 +611,32 @@ def source_text(climb: dict) -> str:
     return f"Source {climb['filename']}{stamp}, {len(climb['rows'])} rows."
 
 
+def parameter_clause(name: str, value: float, text: str) -> str:
+    clause = f"a {name} of {text}"
+    if value < 0:
+        clause += ", which is negative"
+    return clause
+
+
 def fit_html(fit: dict) -> str:
     if fit["ready"]:
+        c1 = parameter_clause("C(1)", fit["c1"], fit["c1_text"])
+        sigma = parameter_clause("sigma", fit["sigma"], fit["sigma_text"])
+        kappa = parameter_clause("kappa", fit["kappa"], fit["kappa_text"])
         return (
-            '<p id="fit" class="status">C(1) = '
-            f'{esc(fit["c1_text"])}, sigma = {esc(fit["sigma_text"])}, kappa = {esc(fit["kappa_text"])}. '
-            f'Fitted through N=4 at {esc(fit["four_held"])} players and N=16 at {esc(fit["sixteen_held"])} players on this jar, '
-            "and N=9 at 513 players. The nine-server point is a different build.</p>"
+            '<p id="fit" class="status">'
+            f'The counts of {esc(fit["four_held"])} players on 4 servers, '
+            f'{esc(fit["nine_held"])} players on 9 servers, and '
+            f'{esc(fit["sixteen_held"])} players on 16 servers give '
+            f'{esc(c1)}, {esc(sigma)}, and {esc(kappa)}.</p>'
         )
     if fit.get("undetermined"):
+        by_server = {int(point["servers"]): whole(point["players"]) for point in fit.get("points", [])}
         return (
-            '<p id="fit" class="status wait">Both climbs have a bend row, and those points did not determine '
+            '<p id="fit" class="status wait">The high-water counts of '
+            f'{esc(by_server.get(4, "—"))} players on 4 servers, '
+            f'{esc(by_server.get(9, "—"))} on 9, and '
+            f'{esc(by_server.get(16, "—"))} on 16 did not determine '
             "C(1), sigma, and kappa.</p>"
         )
     return '<p id="fit" class="status wait">The fit is waiting.</p>'
@@ -802,48 +938,55 @@ def four_now_html() -> str:
 def capacity_section(state: dict) -> str:
     fit = state["fit"]
     points = []
-    player_values = [float(NINE_PLAYERS)]
-    for climb in (state["four"], state["sixteen"]):
-        chart = climb["chart"]
-        if not chart:
+    player_values = []
+    fills = {4: "#1d4ed8", 9: "#0f766e", 16: "#c2410c"}
+    shapes = {"crash-before": "filled", "high-water": "open", "climbing": "diamond"}
+    sentences = []
+    for point in fit.get("points") or []:
+        players = point.get("players")
+        if isinstance(players, bool) or not isinstance(players, (int, float)) or players <= 0:
             continue
-        player_values.append(chart["y"])
-        kind = chart["kind"]
-        shape = "filled" if kind == "bend" else "open"
-        per = per_server(chart["y"], chart["x"])
-        word = "bend" if kind == "bend" else "latest hold"
+        player_values.append(float(players))
+        kind = point.get("kind")
+        words = {
+            "crash-before": "before the drop",
+            "climbing": "latest seated",
+            "high-water": "high-water",
+        }
+        sentences.append(plain_point(point))
         points.append({
-            "x": chart["x"],
-            "y": chart["y"],
-            "shape": shape,
-            "fill": chart["color"],
-            "label": f"{whole(chart['y'])} {word}",
-            "title": f"{chart['name']}, {whole(chart['y'])} players, {per} per server, {word}, this jar",
+            "x": point["servers"],
+            "y": float(players),
+            "shape": shapes.get(kind, "filled"),
+            "fill": fills.get(point["servers"], "#44403c"),
+            "label": f"{whole(players)} {words.get(kind, 'count')}",
+            "title": plain_point(point),
         })
-    points.append({
-        "x": NINE_SERVERS,
-        "y": float(NINE_PLAYERS),
-        "shape": "diamond",
-        "fill": "#6d28d9",
-        "label": "513 previous jar",
-        "title": "Nine-server hold of 513 players, about 57 per server, previous jar. The nine-server point is a different build.",
-    })
     curve = fit["curve"] if fit["ready"] else []
-    curve_values = [players for _servers, players in curve if players is not None and 0 < players <= max(player_values) * 3]
-    top = max(player_values + curve_values)
-    ymax = max(top * 1.22, 100)
+    curve_values = [
+        players
+        for _servers, players in curve
+        if players is not None and player_values and 0 < players <= max(player_values) * 3
+    ]
+    if player_values or curve_values:
+        top = max(player_values + curve_values)
+        ymax = max(top * 1.22, 100)
+    else:
+        ymax = 100
     svg = chart_svg(points, curve, 0, 18, 0, ymax, "Servers", "Players")
     legend = [
-        '<li><i style="background:#1d4ed8"></i>Four-server climb, this jar</li>',
-        '<li><i style="background:#c2410c"></i>16-server climb, this jar</li>',
-        '<li><i class="diamond" style="background:#6d28d9"></i>Nine-server hold, 513, previous jar</li>',
+        '<li><i style="background:#1d4ed8"></i>Four servers, high-water mark, this jar</li>',
+        '<li><i class="diamond" style="background:#0f766e"></i>Nine servers, latest seated count, this jar</li>',
+        '<li><i style="background:#c2410c"></i>16 servers, crash-before count, this jar</li>',
     ]
     if fit["ready"]:
         legend.append("<li><i style=\"background:#44403c;border-radius:0;height:2px;vertical-align:middle\"></i>Universal Scalability Law</li>")
     note = (
-        "An open circle is the latest hold and is not in the fit. A filled circle is that climb's bend row. "
-        "The diamond is the nine-server hold of 513, about 57 per server. The nine-server point is a different build."
+        "The open circle is the four-server high-water mark. "
+        "The diamond is the latest nine-server seated count, and that climb has not crashed. "
+        "The filled circle is the sixteen-server count just before players dropped."
     )
+    listed = "".join(f"<li>{esc(sentence)}</li>" for sentence in sentences)
     return (
         "<section>"
         "<h2>Players against server count</h2>"
@@ -853,6 +996,7 @@ def capacity_section(state: dict) -> str:
         "</div>"
         f"{svg}"
         f'<ul class="legend">{"".join(legend)}</ul>'
+        f'<ul id="fit-inputs">{listed}</ul>'
         f'<p class="note">{esc(note)}</p>'
         "</section>"
     )
@@ -2478,8 +2622,19 @@ def flow_notes(wave, time_id="flow-time") -> str:
     return notes
 
 
+def side_host(side: str):
+    for name, host, *_rest in CELLS:
+        if name == side:
+            return host
+    return None
+
+
 def server_lines(side, info):
-    lines = [side]
+    lines = []
+    host = side_host(side)
+    if host:
+        lines.append(host)
+    lines.append(side)
     if info.get("cpu") is not None:
         lines.append(f"cpu {info['cpu']}")
     if info.get("load") is not None:
@@ -2584,9 +2739,75 @@ def curve_at(t, x1, y1, x2, y2):
     return x, y, c1x, c1y, c2x, c2y
 
 
-def flow_diagram(wave) -> str:
-    servers = dict(wave.get("servers") or {})
+def nine_generators_path() -> Path:
+    return nine_climb_log().with_name("generators.txt")
+
+
+def generator_roster() -> list:
+    """Generator names from the list file. Missing file means use the log."""
+    path = nine_generators_path()
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    names = []
+    seen = set()
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for token in re.split(r"[\s,]+", line):
+            if not token or token in seen or IP_RE.search(token):
+                continue
+            seen.add(token)
+            names.append(token)
+    return names
+
+
+def flow_line_caption() -> str:
+    return (
+        '<p class="note" id="flow-lines">Lines are the last wave\'s new bots, '
+        "not every bot already seated.</p>"
+    )
+
+
+def generator_box_label(name: str, seen_shorts: set) -> str:
+    """A short label that stays unique when two fleets share lg-N."""
+    if not name or IP_RE.search(name):
+        short = "generator"
+    else:
+        short = short_generator(name)
+    if not short or IP_RE.search(short):
+        return ""
+    if short not in seen_shorts:
+        return short
+    if "f4-lg-" in name:
+        alt = "f4-" + short
+    elif "p5-lg-" in name:
+        alt = "p5-" + short
+    else:
+        alt = name.rsplit("/", 1)[-1][-24:]
+    if not alt or alt in seen_shorts or IP_RE.search(alt):
+        return ""
+    return alt
+
+
+def flow_diagram(wave, roster=None, server_stats=None) -> str:
+    servers = {}
+    base = server_stats if isinstance(server_stats, dict) else (wave.get("servers") or {})
+    for side, info in base.items():
+        if isinstance(side, str):
+            servers[side] = dict(info) if isinstance(info, dict) else {}
+    for side, info in (wave.get("servers") or {}).items():
+        if isinstance(side, str) and side not in servers:
+            servers[side] = dict(info) if isinstance(info, dict) else {}
+    for side, _host, *_rest in CELLS:
+        servers.setdefault(side, {})
     gens = []
+    seen_names = set()
+    seen_shorts = set()
     for admit in wave.get("admits") or []:
         seats = {}
         for side, count in (admit.get("seats") or {}).items():
@@ -2595,7 +2816,29 @@ def flow_diagram(wave) -> str:
             if count > 0:
                 seats[side] = count
                 servers.setdefault(side, {})
-        gens.append({**admit, "seats": seats, "lines": generator_lines(admit), "edges": len(seats)})
+        label = generator_box_label(admit.get("name") or "", seen_shorts)
+        if not label:
+            continue
+        shown = {**admit, "short": label}
+        gens.append({**shown, "seats": seats, "lines": generator_lines(shown), "edges": len(seats)})
+        if admit.get("name"):
+            seen_names.add(admit["name"])
+        seen_shorts.add(label)
+    for name in roster or []:
+        if not isinstance(name, str) or name in seen_names or IP_RE.search(name):
+            continue
+        short = generator_box_label(name, seen_shorts)
+        if not short:
+            continue
+        seen_names.add(name)
+        seen_shorts.add(short)
+        gens.append({
+            "name": name,
+            "short": short,
+            "seats": {},
+            "lines": [short],
+            "edges": 0,
+        })
     gens.sort(key=lambda item: flow_sort_key(item.get("short") or item.get("name") or ""))
     server_names = sorted(servers, key=flow_sort_key)
     incoming = {side: 0 for side in server_names}
@@ -2655,7 +2898,8 @@ def flow_diagram(wave) -> str:
     height = max(gen_bottom, server_bottom, label_bottom, 48) + 8
     parts = [
         f'<svg class="flow" viewBox="0 0 {FLOW_WIDTH} {height:.0f}" role="group" '
-        'aria-label="Generators connected to game servers" font-family="system-ui, sans-serif">',
+        'aria-label="Nine game servers and the generators. Lines are the last wave of new bots." '
+        'font-family="system-ui, sans-serif">',
         f'<text x="{FLOW_LEFT_X}" y="16" font-size="11" fill="#57534e">Generators</text>',
         f'<text x="{FLOW_RIGHT_X}" y="16" font-size="11" fill="#57534e">Game servers</text>',
     ]
@@ -2708,26 +2952,32 @@ def flow_node(kind, key, x, y, height, lines, accent) -> str:
     return "".join(parts)
 
 
-def render_flow(wave, source="log") -> str:
+def render_flow(wave, source="log", roster=None, server_stats=None) -> str:
     if not wave or (not wave.get("servers") and not wave.get("admits")):
         return (
             '<h2>Generators and game servers</h2>'
             '<p class="note" data-flow-source="none">No wave sample is in the climb log yet.</p>'
         )
-    body = flow_diagram(wave) if wave.get("admits") else server_rows(wave)
+    diagram = flow_diagram(wave, roster=roster, server_stats=server_stats)
+    body = diagram if wave.get("admits") else diagram + server_rows(wave)
     return (
         '<h2>Generators and game servers</h2>'
         f"{flow_notes(wave)}"
+        f"{flow_line_caption()}"
         f'<div data-flow-source="{esc(source)}">{body}</div>'
     )
 
 
-def render_flow_view(connections, latest, source="log") -> str:
+def render_flow_view(connections, latest, source="log", roster=None) -> str:
     if connections is None:
-        return render_flow(latest, source)
+        return render_flow(latest, source, roster=roster)
+    stats = None
+    if latest is not None and latest is not connections and latest.get("sampled"):
+        stats = latest.get("servers") or {}
     parts = [
         '<h2>Generators and game servers</h2>',
         flow_notes(connections),
+        flow_line_caption(),
     ]
     if latest is not None and latest is not connections:
         if not connections.get("closed"):
@@ -2742,7 +2992,10 @@ def render_flow_view(connections, latest, source="log") -> str:
             else "A later sample did not log connections."
         )
         parts.append(f'<p class="note" id="flow-later">{esc(later)}</p>')
-    parts.append(f'<div data-flow-source="{esc(source)}">{flow_diagram(connections)}</div>')
+    parts.append(
+        f'<div data-flow-source="{esc(source)}">'
+        f"{flow_diagram(connections, roster=roster, server_stats=stats)}</div>"
+    )
     if latest is not None and latest is not connections and latest.get("servers"):
         parts.append("<h2>Latest server load</h2>")
         parts.append(flow_notes(latest, "flow-later-time"))
@@ -2756,8 +3009,13 @@ def flow_body() -> str:
     except Exception as exc:
         sys.stderr.write(f"climb log read failed: {type(exc).__name__}\n")
         waves, source = [], "log"
+    try:
+        roster = generator_roster()
+    except Exception as exc:
+        sys.stderr.write(f"generator list read failed: {type(exc).__name__}\n")
+        roster = []
     connections, latest = pick_flow(waves)
-    return render_flow_view(connections, latest, source)
+    return render_flow_view(connections, latest, source, roster=roster)
 
 
 def map_live_fragment() -> str:
@@ -2945,18 +3203,87 @@ def self_check():
         for actual, expected in zip(got, (c1, sigma, kappa)):
             expect(abs(actual - expected) <= 1e-6 * max(1.0, abs(expected)), f"USL recover {actual} != {expected}")
 
-    four = parsed("200,200,clean,west,92,2.2,none,4,1,6/8,true\n209,180,fail,west,95,3,game,1,2,2/8,\n")
-    sixteen = parsed("700,700,clean,p1,91,1.9,none,8,0,10/16,true\n701,640,fail,p1,96,2.5,game,2,3,4/16,\n")
-    fit = try_fit(four, sixteen)
-    expect(fit["ready"], "two bend rows should fit")
-    for servers, players in ((4, 200.0), (9, 513.0), (16, 700.0)):
+    fit = try_fit([
+        {"servers": 4, "players": 200, "kind": "high-water"},
+        {"servers": 9, "players": 400, "kind": "climbing"},
+        {"servers": 16, "players": 700, "kind": "crash-before"},
+    ])
+    expect(fit["ready"], "three counts should fit")
+    for servers, players in ((4, 200.0), (9, 400.0), (16, 700.0)):
         predicted = usl(servers, fit["c1"], fit["sigma"], fit["kappa"])
         expect(predicted is not None and abs(predicted - players) < 1e-3, "fit misses a labeled point")
     fitted = fit_html(fit)
     expect("The fit is waiting." not in fitted, "a finished fit still says it is waiting")
     expect("C(1)" in fitted and "sigma" in fitted and "kappa" in fitted, "fitted page omits a parameter")
-    expect("different build" in fitted, "fitted page omits the different-build sentence")
-    expect("The fit is waiting." in fit_html(try_fit([], [])), "missing bends should wait")
+    expect("200" in fitted and "400" in fitted and "700" in fitted, "fitted page omits an input")
+    expect("different build" not in fitted, "fitted page still names a different build")
+    expect("The fit is waiting." in fit_html(try_fit([])), "missing counts should wait")
+    negative_fit = try_fit([
+        {"servers": 4, "players": 586, "kind": "high-water"},
+        {"servers": 9, "players": 736, "kind": "climbing"},
+        {"servers": 16, "players": 2589, "kind": "crash-before"},
+    ])
+    expect(negative_fit["ready"] and not negative_fit["undetermined"], "a negative parameter should still fit")
+    expect(negative_fit["c1"] < 0 and negative_fit["sigma"] < 0, "this triple's C(1) and sigma should be negative")
+    for servers, players in ((4, 586.0), (9, 736.0), (16, 2589.0)):
+        predicted = usl(servers, negative_fit["c1"], negative_fit["sigma"], negative_fit["kappa"])
+        expect(predicted is not None and abs(predicted - players) < 1e-3, "negative fit misses a labeled point")
+    drawn = [
+        players
+        for servers, players in negative_fit["curve"]
+        if players is not None and abs(servers - 4) < 1e-9
+    ]
+    expect(drawn and abs(drawn[0] - 586) < 1e-3, "the curve is not drawn through four servers")
+    negative_html = fit_html(negative_fit)
+    expect("did not determine" not in negative_html, "a negative parameter hid the fit")
+    expect("which is negative" in negative_html, "a negative parameter was not named")
+    expect("586" in negative_html and "736" in negative_html and "2589" in negative_html, "negative fit omits an input")
+    expect("C(1)" in negative_html and "sigma" in negative_html and "kappa" in negative_html, "negative fit omits a parameter")
+    expect("The fit is waiting." not in negative_html, "a negative fit still says it is waiting")
+    negative_svg = chart_svg(
+        [
+            {"x": 4, "y": 586, "shape": "open", "fill": "#1d4ed8", "label": "586", "title": "four"},
+            {"x": 9, "y": 736, "shape": "diamond", "fill": "#0f766e", "label": "736", "title": "nine"},
+            {"x": 16, "y": 2589, "shape": "filled", "fill": "#c2410c", "label": "2589", "title": "sixteen"},
+        ],
+        negative_fit["curve"],
+        0,
+        18,
+        0,
+        8000,
+        "Servers",
+        "Players",
+    )
+    expect('stroke="#44403c"' in negative_svg, "the curve path is missing")
+    other_jar = "1739c9f5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    picked = highest_held_in_text(
+        "n_target,n_held,mod_commit,version_certainty\n"
+        "10,513,,excluded\n"
+        f"20,9999,{other_jar},measured\n"
+        f"30,549,{COMMIT},measured\n"
+        f"40,586,{COMMIT},measured\n",
+        COMMIT,
+    )
+    expect(picked == 586, "the high-water mark skipped the old jar or kept another jar")
+    expect(
+        sixteen_before_drop(
+            "The climb stopped at the pre-crash seated count of 2589 because a server was OOM-killed. "
+            "Seated fell from 2589 to 1053 when that JVM was killed."
+        )
+        == 2589,
+        "the sixteen note lost the pre-crash count",
+    )
+    expect(
+        nine_latest_seated_text(
+            "20:38:55 live seated=142 busiest=p9\n"
+            "08:47:02 wave seated=900 steps p1:10\n"
+            "13:38:49 wave seated=736 steps p1:80\n"
+            "13:39:29 wave nothing to add; seated 710\n"
+            "unseated=9000\n"
+        )
+        == 710,
+        "the nine seated count was not the latest seated line",
+    )
 
     nasty = parsed("10,10,clean,<b>,95,2,none,1,0,3/8\n11,0,fail,<b>,99,3,cpu,0,1,0/8\n")
     rendered = climb_section({
@@ -2978,14 +3305,23 @@ def self_check():
     state = build()
     page = render_document(state)
     expect("Four-server climb" in page and "16-server climb" in page, "page does not name both climbs")
-    expect("different build" in page, "page does not say the nine-server point is a different build")
     expect("seam-scaling-four-2026-11-19.csv" in page and "seam-scaling-sixteen-2026-11-19.csv" in page, "page hides a source")
     expect("not part of the fit" in page, "seam chart is not labeled as outside the fit")
-    expect("513" in page and "about 57" in page, "nine-server point is missing")
     expect("held 44" in page and "held 80" in page and "held 90" in page, "seam-lap holds are missing")
-    if state["fit"]["ready"]:
-        expect("C(1)" in page and "sigma" in page and "kappa" in page, "ready fit is not printed")
-        expect("The fit is waiting." not in page, "ready fit still says it is waiting")
+    expect("different build" not in page, "page still says the nine-server point is a different build")
+    expect('id="fit-inputs"' in page, "fit inputs are missing beside the chart")
+    if state["fit"]["ready"] or state["fit"]["undetermined"]:
+        expect("The fit is waiting." not in page, "counts are in and the fit still says it is waiting")
+        for point in state["fit"]["points"]:
+            expect(plain_point(point) in page, "a fit input is missing beside the chart")
+        if state["fit"]["ready"]:
+            expect("C(1)" in page and "sigma" in page and "kappa" in page, "ready fit is not printed")
+            expect("did not determine" not in page, "a finished fit still says it did not determine")
+            if any(state["fit"][name] < 0 for name in ("c1", "sigma", "kappa")):
+                expect("which is negative" in page, "a negative parameter was not named")
+            expect('stroke="#44403c"' in page, "the scalability curve is not drawn")
+        else:
+            expect("did not determine" in page, "undetermined fit lost its sentence")
     else:
         expect("The fit is waiting." in page, "the fit should be waiting")
     expect('data-page="mesh-climbs"' in page, "page marker missing")
@@ -3113,6 +3449,18 @@ def self_check():
     expect("Last completed wave in the climb log, not a live 8-second sample." in html, "completed-wave note missing")
     expect("08:41:51" in html and "76 seated at 08:47:02" in html, "wave timestamp missing")
     expect("10.1.2.3" not in html and IP_RE.search(html) is None, "flow diagram contains an address")
+    expect(
+        all(f'data-server="{side}"' in html and f">{host}<" in html for side, host, *_rest in CELLS),
+        "a game server with no new bots was left off the diagram",
+    )
+    expect(
+        "Lines are the last wave's new bots, not every bot already seated." in html
+        and "from the climb log" in html,
+        "the flow caption dropped the climb-log note",
+    )
+    listed = flow_diagram(wave, roster=["test-mc-p5-lg-30", "10.2.3.4"])
+    expect('data-generator="lg-30"' in listed and 'data-link="lg-30' not in listed, "a listed generator was drawn as a link")
+    expect("10.2.3.4" not in listed, "a generator list address was drawn")
     quiet = parse_climb_log_text(
         "08:52:43 wave p1 cpu=13.1 load=0.42 players=19 over=0 step=11 next=11 add=11\n"
         "08:52:43 wave west cpu=None load=0.1 players=4 over=0 step=2 next=2 add=2\n"
