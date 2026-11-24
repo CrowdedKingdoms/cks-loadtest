@@ -99,6 +99,133 @@ def log(mesh, msg):
         fh.write(line + "\n")
 
 
+def flow_snapshot_path(mesh):
+    return mesh.log_path.with_name(mesh.log_path.stem + "-flow.json")
+
+
+def _flow_value(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str) and value.strip() in {"", "None", "none", "null"}:
+        return None
+    if isinstance(value, (int, float, str)):
+        return value
+    return None
+
+
+def update_flow_snapshot(mesh, mutate):
+    """Record a wave the driver already sampled. A disk miss does not stop the climb."""
+    path = flow_snapshot_path(mesh)
+    try:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            data = {"waves": []}
+        if not isinstance(data, dict) or not isinstance(data.get("waves"), list):
+            data = {"waves": []}
+        mutate(data)
+        data["waves"] = [wave for wave in data["waves"] if isinstance(wave, dict)][-8:]
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, separators=(",", ":")))
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def snapshot_wave_sample(mesh, rows):
+    if not rows:
+        return
+    at = time.strftime("%H:%M:%S")
+    servers = {}
+    for side, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        kept = {}
+        for key in ("cpu", "load", "players", "over", "step", "next", "add"):
+            value = _flow_value(row.get(key))
+            if value is not None:
+                kept[key] = value
+        if kept:
+            servers[side] = kept
+
+    def mutate(data):
+        data["waves"].append({"at": at, "servers": servers, "admits": [], "closed": False})
+
+    update_flow_snapshot(mesh, mutate)
+
+
+def snapshot_wave_admit(mesh, name, place, span, seats):
+    at = time.strftime("%H:%M:%S")
+    kept_seats = {}
+    for side, count in (seats or {}).items():
+        value = _flow_value(count)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        kept_seats[str(side)] = value
+    admit = {"at": at, "name": name, "place": place, "span": span, "seats": kept_seats}
+
+    def mutate(data):
+        if not data["waves"] or data["waves"][-1].get("closed"):
+            data["waves"].append({"at": at, "servers": {}, "admits": [], "closed": False})
+        wave = data["waves"][-1]
+        admits = wave.get("admits")
+        if not isinstance(admits, list):
+            admits = []
+        wave["admits"] = [item for item in admits if not (isinstance(item, dict) and item.get("name") == name)]
+        wave["admits"].append(admit)
+
+    update_flow_snapshot(mesh, mutate)
+
+
+def snapshot_wave_gained(mesh, side, over, step):
+    def mutate(data):
+        if not data["waves"] or data["waves"][-1].get("closed"):
+            return
+        servers = data["waves"][-1].get("servers")
+        if not isinstance(servers, dict):
+            servers = {}
+            data["waves"][-1]["servers"] = servers
+        row = servers.get(side)
+        if not isinstance(row, dict):
+            row = {}
+            servers[side] = row
+        if isinstance(over, int) and not isinstance(over, bool):
+            row["over"] = over
+        value = _flow_value(step)
+        if value is not None:
+            row["step"] = value
+
+    update_flow_snapshot(mesh, mutate)
+
+
+def snapshot_wave_seated(mesh, seated, steps):
+    at = time.strftime("%H:%M:%S")
+
+    def mutate(data):
+        if not data["waves"] or data["waves"][-1].get("closed"):
+            data["waves"].append({"at": at, "servers": {}, "admits": [], "closed": False})
+        wave = data["waves"][-1]
+        value = _flow_value(seated)
+        if value is not None:
+            wave["seated"] = value
+            wave["seated_at"] = at
+        wave["closed"] = True
+        servers = wave.get("servers")
+        if not isinstance(servers, dict):
+            servers = {}
+            wave["servers"] = servers
+        for side, step in steps.items():
+            row = servers.get(side)
+            if not isinstance(row, dict):
+                row = {}
+                servers[side] = row
+            kept = _flow_value(step)
+            if kept is not None:
+                row["step"] = kept
+
+    update_flow_snapshot(mesh, mutate)
+
+
 def four_mesh():
     return Mesh(
         name="four",
@@ -1945,6 +2072,10 @@ def write_holds(mesh, bend, needs_loadgen):
 MC_MAX_PLAYERS = 200
 LINE_CPU = 70.0
 LINE_LOAD = 1.8
+# Starting per-server add. Each server keeps its own step. A full seat under
+# the line grows by one. A hot server or a real refusal steps down by one
+# and is never reset to 1. A short seat holds. Not a bend.
+STEP_START = 9
 ADMIT_PATH = "/opt/ck-mc-harness/section-admit.json"
 
 
@@ -1963,30 +2094,47 @@ def server_over_line(cpu, load1):
 def plan_server_wave(step, seated, over):
     """Bots to add this cycle, and the step held until that add is judged.
 
-    Over the line adds nothing and the next step is 1.
-    Under the line adds the current step, capped by room under 200 players.
-    An unknown seated count adds nothing and leaves the step alone.
+    Over the line adds nothing and steps down by one. It does not reset
+    the step to 1. Under the line adds the current step, capped by room
+    under 200 players, and leaves the step for the judge. No room under
+    that cap grows the step by one: the server was offered nothing only
+    because it was full. An unknown seated count adds nothing and leaves
+    the step alone.
     """
     step = max(1, int(step))
     if over:
-        return 0, 1
+        return 0, max(1, step - 1)
     if seated is None:
         return 0, step
     room = max(0, MC_MAX_PLAYERS - int(seated))
+    if room <= 0:
+        return 0, step + 1
     return min(step, room), step
 
 
-def judge_server_wave(step, added, gained, over_after):
+def judge_server_wave(step, added, gained, over_after, harness_miss=0):
     """Next step after an add that was actually sent.
 
-    A short seat, or a following sample that is over the line, sets the
-    next step to 1. A full seat that is still under the line grows by one.
+    Over the line steps down by one. A game server that was offered bots
+    and gained none steps down by one, unless the harness itself missed
+    only a bot or two: that short is not this server refusing. Any other
+    short seat holds the step. A full seat under the line grows by one.
+    The step is never reset to 1. This ramp does not take a 180 second
+    hold, and a progressive step is not a bend.
     """
+    step = max(1, int(step))
     if int(added) <= 0:
-        return int(step)
-    if gained is None or int(gained) < int(added) or over_after:
-        return 1
-    return int(step) + 1
+        return step
+    if over_after:
+        return max(1, step - 1)
+    if gained is not None and int(gained) >= int(added):
+        return step + 1
+    # A partial seat is not a hiccup. Gained none is a refusal only when
+    # the harness missed more than a couple of bots, so a one-bot miss
+    # cannot step this server down.
+    if gained is not None and int(gained) <= 0 and int(harness_miss) > 2:
+        return max(1, step - 1)
+    return step
 
 
 def memory_seats(mem, by_index):
@@ -2173,6 +2321,7 @@ def add_admitted(mesh, loads, plans):
             continue
         seats = ",".join(f"{side}:{n}" for side, n in sorted(plan["seats"].items()))
         log(mesh, f"admit {name} place={len(plan['place'])} span={count} {seats}")
+        snapshot_wave_admit(mesh, name, len(plan["place"]), count, plan["seats"])
         try:
             write_admit(mesh, ip, plan)
             resp = api(mesh, ip, "POST", "/v1/clients/add", {"count": count, "run_id": mesh.name})
@@ -2211,20 +2360,22 @@ def wave_stop_reason(mesh, games, marks):
 
 
 def run_nine_waves(mesh, loads, games, caps):
-    """Add per game server. A hot server does not shrink the others.
+    """Add per game server. One server's result does not change another step.
 
-    Each server starts at a step of 9. Under the line the step grows by one
-    after a wave that seats. Over the line, that server's next add is one
-    bot, then two, and so on. This ramp does not take a 180s hold, and a
-    progressive step is not a bend: holding one server would make the others
-    wait. A 60s tick or an OOM still stops the climb and leaves every bot up.
-    Nothing here clears bots.
+    Each server starts at a step of 9. Under the line, a full seat grows
+    that server's step by one. A short seat, including a one or two bot
+    harness miss, a generator memory refusal, or a spawn miss, holds the
+    step. Over the line, or a refusal that is this game server, adds
+    nothing and steps down by one. This ramp does not take a 180s hold,
+    and a progressive step is not a bend: holding one server would make
+    the others wait. A 60s tick or an OOM still stops the climb and leaves
+    every bot up. Nothing here clears bots.
     """
-    steps = {side: 9 for side in mesh.sections}
+    steps = {side: STEP_START for side in mesh.sections}
     log(
         mesh,
-        "per-server steps start at 9; a hot server does not shrink the others; "
-        "no 180s hold on this ramp; a progressive step is not a bend",
+        "per-server steps start at 9; only a hot or refusing server steps down by one; "
+        "a short seat holds; no 180s hold on this ramp; a progressive step is not a bend",
     )
     marks = None
     while True:
@@ -2253,12 +2404,14 @@ def run_nine_waves(mesh, loads, games, caps):
             return
         samples = sample_server_line(mesh, games)
         wanted = {}
+        wave_rows = {}
         for side in mesh.sections:
             sample = samples.get(side) or {}
             before = steps.get(side, 9)
             if not sample.get("known"):
                 log(mesh, f"wave {side} sample missing; step stays {before}; not adding")
                 wanted[side] = 0
+                wave_rows[side] = {"step": before}
                 continue
             add, steps[side] = plan_server_wave(before, sample.get("players"), bool(sample.get("over")))
             wanted[side] = add
@@ -2268,6 +2421,16 @@ def run_nine_waves(mesh, loads, games, caps):
                 f"players={sample.get('players')} over={int(bool(sample.get('over')))} "
                 f"step={before} next={steps[side]} add={add}",
             )
+            wave_rows[side] = {
+                "cpu": sample.get("cpu"),
+                "load": sample.get("load1"),
+                "players": sample.get("players"),
+                "over": int(bool(sample.get("over"))),
+                "step": before,
+                "next": steps[side],
+                "add": add,
+            }
+        snapshot_wave_sample(mesh, wave_rows)
         if sum(wanted.values()) <= 0:
             log(mesh, f"wave nothing to add; seated {seated}")
             time.sleep(20)
@@ -2314,6 +2477,9 @@ def run_nine_waves(mesh, loads, games, caps):
             return
         after = sample_server_line(mesh, games)
         harness_full = isinstance(active, int) and active >= seated + aimed
+        harness_miss = (seated + aimed - active) if isinstance(active, int) and active < seated + aimed else 0
+        if harness_miss:
+            log(mesh, f"wave harness missed {harness_miss}")
         for side, sent in aimed_sides.items():
             if sent <= 0:
                 continue
@@ -2333,15 +2499,20 @@ def run_nine_waves(mesh, loads, games, caps):
                 log(mesh, f"wave {side} player count unread; step stays {steps[side]}")
                 continue
             previous = steps[side]
-            steps[side] = judge_server_wave(previous, sent, gained, bool(sample.get("over")))
+            steps[side] = judge_server_wave(
+                previous, sent, gained, bool(sample.get("over")), harness_miss
+            )
             log(
                 mesh,
                 f"wave {side} gained={gained} over={int(bool(sample.get('over')))} "
                 f"step {previous} -> {steps[side]}",
             )
+            snapshot_wave_gained(mesh, side, int(bool(sample.get("over"))), steps[side])
         fresh, _room = keeper_room(mesh, loads, caps)
         shown = " ".join(f"{side}:{steps[side]}" for side in mesh.sections)
-        log(mesh, f"wave seated={fresh if fresh is not None else seated} steps {shown}")
+        shown_seated = fresh if fresh is not None else seated
+        log(mesh, f"wave seated={shown_seated} steps {shown}")
+        snapshot_wave_seated(mesh, shown_seated, steps)
 
 
 def resume_target(mesh):

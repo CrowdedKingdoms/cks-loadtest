@@ -4,6 +4,10 @@
 Reads the climb CSVs and re-reads them. The chart section also shows
 the live connected counts on the four-server and 16-server meshes, read
 from harness status. The map reads positions from the nine game servers.
+Its headline is the live seated total on the nine generators. Dots stay
+bots that have a saved position. Under the map, the generator diagram
+rereads the local nine-climb log (or the snapshot beside it). That is a
+disk read. It does not open a connection to a game server or a generator.
 Does not place bots, clear bots, or start a climb. Binds 127.0.0.1:8768 only.
 """
 
@@ -21,6 +25,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -958,7 +963,47 @@ CELLS = (
     ("p9", "test-mc-p5-9", 4000, 6000, 4000, 6000),
 )
 WORLD = 6000
+COLUMNS_PATH = Path.home() / ".local/state/cks-test-mc-p5/nine-climb/section-columns.json"
+_columns_lock = threading.Lock()
+_columns = {"mtime": None, "table": {}}
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def column_table() -> dict:
+    """Ground heights from the nine-climb column table. Key is 'x,z'."""
+    path = COLUMNS_PATH
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    with _columns_lock:
+        if _columns["mtime"] == mtime:
+            return _columns["table"]
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return _columns["table"]
+        table = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool):
+                    table[key] = value
+        _columns["mtime"] = mtime
+        _columns["table"] = table
+        return table
+
+
+def column_state(table: dict, x: int, z: int) -> dict:
+    """A positive table value is ground. 0 is open water. A missing key is unmeasured."""
+    block_x = int(x)
+    block_z = int(z)
+    key = f"{block_x},{block_z}"
+    if key not in table:
+        return {"x": block_x, "z": block_z, "state": "unmeasured"}
+    value = table[key]
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return {"x": block_x, "z": block_z, "state": "ground", "y": value}
+    return {"x": block_x, "z": block_z, "state": "water"}
 
 
 def redact_public(text: str) -> str:
@@ -975,6 +1020,9 @@ BOT_NUMBER_RE = re.compile(r"^S\d+$")
 _map_lock = threading.Lock()
 _map_ready = threading.Event()
 _map = {"updated": None, "players": [], "failed": []}
+_nine_lock = threading.Lock()
+_nine_ready = threading.Event()
+_nine = {"value": None, "answered": 0, "sought": 9}
 
 REMOTE_SCRIPT = r'''
 import gzip, json, re, socket, struct
@@ -1294,6 +1342,137 @@ def ssh_text(ip: str, script: str, timeout: int = 22) -> str:
     return text
 
 
+def nine_load_names() -> tuple:
+    raw = os.environ.get("CK_NINE_LOADS", "")
+    names = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if names:
+        return names
+    return tuple(f"test-mc-p5-lg-{i}" for i in range(10, 19))
+
+
+def nine_token() -> str:
+    raw = os.environ.get("CK_NINE_TOKEN_FILE", "").strip()
+    path = Path(raw).expanduser() if raw else Path.home() / ".local/state/cks-test-mc-p5/control-token"
+    return path.read_text().strip()
+
+
+def nine_ssh_key() -> Path:
+    raw = os.environ.get("CK_SSH_KEY", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".local/state/cks-test-mc-cluster/id_ed25519"
+
+
+def nine_known_hosts() -> Path:
+    raw = os.environ.get("CK_KNOWN_HOSTS", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".local/state/cks-test-mc-p5/nine-climb/known_hosts"
+
+
+def generator_active(ip: str, token: str) -> int:
+    """Live seated bots for run nine. Returns the integer only."""
+    script = r'''
+import json, os, urllib.request
+tok = os.environ["CK_TOKEN"]
+req = urllib.request.Request(
+    "http://127.0.0.1:9109/v1/status?run_id=nine",
+    headers={"Authorization": "Bearer " + tok},
+)
+with urllib.request.urlopen(req, timeout=20) as resp:
+    data = json.loads(resp.read().decode())
+if data.get("run_id") != "nine":
+    raise SystemExit(2)
+active = data.get("active")
+if isinstance(active, bool) or not isinstance(active, int):
+    raise SystemExit(3)
+print(active)
+'''
+    proc = subprocess.run(
+        [
+            "ssh",
+            "-i",
+            str(nine_ssh_key()),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"UserKnownHostsFile={nine_known_hosts()}",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=12",
+            "-o",
+            "LogLevel=ERROR",
+            f"ubuntu@{ip}",
+            "read -r CK_TOKEN && export CK_TOKEN && python3 -",
+        ],
+        input=(token + "\n" + script).encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=25,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ssh exit {proc.returncode}")
+    line = ""
+    for row in proc.stdout.decode("utf-8", "replace").splitlines():
+        row = row.strip()
+        if row.lstrip("-").isdigit():
+            line = row
+    if not line:
+        raise RuntimeError("no count")
+    return int(line)
+
+
+def refresh_nine_seated():
+    """Sum active on the nine generators. A partial answer does not replace a full sum."""
+    names = nine_load_names()
+    hosts = game_hosts()
+    token = nine_token()
+    loads = [(name, hosts[name]) for name in names if name in hosts]
+
+    def read_one(item):
+        try:
+            return generator_active(item[1], token)
+        except Exception:
+            return None
+
+    rows = {}
+    if loads:
+        with ThreadPoolExecutor(max_workers=len(loads)) as pool:
+            for item, active in zip(loads, pool.map(read_one, loads)):
+                rows[item[0]] = active
+    answered = sum(1 for name in names if isinstance(rows.get(name), int) and not isinstance(rows.get(name), bool))
+    with _nine_lock:
+        _nine["sought"] = len(names)
+        _nine["answered"] = answered
+        if names and answered == len(names):
+            _nine["value"] = sum(rows[name] for name in names)
+
+
+def nine_seated_total():
+    """Last complete generator sum. A later partial poll does not wipe it."""
+    with _nine_lock:
+        value = _nine["value"]
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def nine_watch():
+    while True:
+        started = time.time()
+        try:
+            refresh_nine_seated()
+        except Exception as exc:
+            sys.stderr.write(f"nine seated count unavailable: {type(exc).__name__}\n")
+        finally:
+            if nine_seated_total() is not None:
+                _nine_ready.set()
+        time.sleep(max(1.0, 15.0 - (time.time() - started)))
+
+
 def parse_side(text: str, side: str):
     line = ""
     for row in text.splitlines():
@@ -1475,7 +1654,8 @@ def map_svg(payload: dict) -> str:
         return top + (1.0 - float(z) / WORLD) * size
 
     parts = [
-        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Nine-server coordinate grid">',
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Nine-server coordinate grid" '
+        f'data-plot-left="{left}" data-plot-top="{top}" data-plot-size="{size}" data-world="{WORLD}">',
         f'<rect x="{left}" y="{top}" width="{size}" height="{size}" fill="#f5f5f4" stroke="#1c1917" stroke-width="1.5"/>',
     ]
     for cell in payload["cells"]:
@@ -1484,7 +1664,8 @@ def map_svg(payload: dict) -> str:
         w = sx(cell["x1"]) - x
         h = sz(cell["z0"]) - y
         parts.append(
-            f'<g data-cell="{esc(cell["id"])}">'
+            f'<g data-cell="{esc(cell["id"])}" data-host="{esc(cell["host"])}" data-label="{esc(cell["label"])}" '
+            f'data-x0="{cell["x0"]}" data-x1="{cell["x1"]}" data-z0="{cell["z0"]}" data-z1="{cell["z1"]}">'
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" fill="#fff" stroke="#a8a29e"/>'
             f'<text x="{x + w / 2:.1f}" y="{y + 28:.1f}" text-anchor="middle" font-size="16" font-weight="650" fill="#1c1917">{esc(cell["label"])}</text>'
             f'<text x="{x + w / 2:.1f}" y="{y + 48:.1f}" text-anchor="middle" font-size="12" fill="#57534e">{esc(cell["host"])}</text>'
@@ -1528,9 +1709,16 @@ def map_svg(payload: dict) -> str:
     return "".join(parts)
 
 
-def map_body(payload: dict) -> str:
+def map_body(payload: dict, seated=None) -> str:
     names = [player["name"] for player in payload["real"]]
     named = ", ".join(names) if names else "none online"
+    if seated is None:
+        seated = nine_seated_total()
+    plotted = payload["bots"]
+    if isinstance(seated, int) and not isinstance(seated, bool):
+        lead = f"{seated} bots seated. {plotted} plotted."
+    else:
+        lead = f"{plotted} bots."
     rows = []
     for player in payload["real"]:
         where = player["cell"] or "outside the grid"
@@ -1548,11 +1736,12 @@ def map_body(payload: dict) -> str:
         failed = f'<p class="note">No reading from {esc(", ".join(payload["failed"]))}.</p>'
     updated = payload["updated"] or "not yet"
     return (
-        f'<p id="counts" class="status">{payload["bots"]} bots. Real players: {esc(named)}.</p>'
+        f'<p id="counts" class="status">{lead} Real players: {esc(named)}.</p>'
         f'<p class="note">Read {esc(updated)}. Named players are read live. Bot dots are the latest saved position. '
         "A bot name starts with Load, or is an S-numbered walker. "
         f'{payload["outside"]} outside the 0–6000 grid.</p>'
         f"{failed}"
+        f'<p id="coord-readout" class="readout">Hover the map for world x and z. Click a spot to pin a teleport command.</p>'
         f'<div id="grid">{map_svg(payload)}</div>'
         "<h2>Real players</h2>"
         f'<ul>{"".join(rows)}</ul>'
@@ -1577,9 +1766,16 @@ MAP_PAGE = """<!DOCTYPE html>
   .sub, .note, .foot { color: var(--muted); }
   .status { margin: 0 0 12px; padding: 10px 12px; background: var(--okbg); border: 1px solid #bbf7d0; border-radius: 10px; color: var(--ok); font-weight: 650; }
   section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin: 0 0 14px; }
-  svg { width: 100%; height: auto; display: block; }
+  svg { width: 100%; height: auto; display: block; cursor: crosshair; }
+  .readout { margin: 0 0 10px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; white-space: pre-line; min-height: 172px; }
+  .readout.frozen { border-color: #c2410c; cursor: pointer; }
   ul { margin: 0; padding-left: 18px; }
   .foot { font-size: 12.5px; padding-bottom: 28px; }
+  #flow h2 { margin-top: 0; }
+  #flow svg { cursor: default; }
+  #flow table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  #flow th, #flow td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  #flow td.num, #flow th.num { text-align: right; white-space: nowrap; }
 </style>
 </head>
 <body data-page="nine-map">
@@ -1591,6 +1787,9 @@ MAP_PAGE = """<!DOCTYPE html>
 <section id="board">
 <!--BOARD-->
 </section>
+<section id="flow" aria-label="Generator and game server load">
+<!--FLOW-->
+</section>
 </main>
 <p class="foot">Bound to 127.0.0.1:8768. Refreshes about every 8 seconds.</p>
 <script>
@@ -1598,13 +1797,288 @@ async function tick() {
   try {
     const res = await fetch("/map/live", {cache: "no-store"});
     if (!res.ok) throw new Error("HTTP " + res.status);
-    document.getElementById("board").innerHTML = await res.text();
+    const html = await res.text();
+    const holder = document.createElement("template");
+    holder.innerHTML = html;
+    const mapLive = holder.content.querySelector("#map-live");
+    const flowLive = holder.content.querySelector("#flow-live");
+    const board = document.getElementById("board");
+    if (mapLive && board) board.innerHTML = mapLive.innerHTML;
+    else if (board) board.innerHTML = html;
+    const flow = document.getElementById("flow");
+    if (flowLive && flow) flow.innerHTML = flowLive.innerHTML;
+    if (frozen) showFrozen();
+    else if (pointer) paintReadout();
   } catch (err) {
     const board = document.getElementById("board");
     if (board && !board.textContent.trim()) board.textContent = "Could not read positions.";
   }
 }
 setInterval(tick, 6000);
+
+const board = document.getElementById("board");
+const heightCache = new Map();
+let pointer = null;
+let frozen = null;
+let hoverSeq = 0;
+let pinSeq = 0;
+const lineBreak = String.fromCharCode(10);
+
+function setReadout(text, pinned) {
+  const el = document.getElementById("coord-readout");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("frozen", !!pinned);
+  if (pinned) el.title = "Click to unpin";
+  else el.removeAttribute("title");
+}
+
+function blockOf(value, limit) {
+  let block = Math.floor(value + 1e-9);
+  if (block >= limit) block = limit - 1;
+  if (block < 0) block = 0;
+  return block;
+}
+
+function spotAt(clientX, clientY) {
+  const svg = document.querySelector("#board svg");
+  if (!svg) return null;
+  const plot = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  if (!plot.width || !plot.height || !vb.width || !vb.height) return null;
+  const vx = ((clientX - plot.left) / plot.width) * vb.width + vb.x;
+  const vy = ((clientY - plot.top) / plot.height) * vb.height + vb.y;
+  const left = Number(svg.dataset.plotLeft);
+  const top = Number(svg.dataset.plotTop);
+  const size = Number(svg.dataset.plotSize);
+  const world = Number(svg.dataset.world);
+  const x = ((vx - left) / size) * world;
+  const z = (1 - ((vy - top) / size)) * world;
+  if (!(x >= 0 && z >= 0 && x < world && z < world)) return null;
+  const blockX = blockOf(x, world);
+  const blockZ = blockOf(z, world);
+  let cell = null;
+  for (const node of svg.querySelectorAll("[data-cell]")) {
+    const x0 = Number(node.dataset.x0);
+    const x1 = Number(node.dataset.x1);
+    const z0 = Number(node.dataset.z0);
+    const z1 = Number(node.dataset.z1);
+    if (blockX >= x0 && blockX < x1 && blockZ >= z0 && blockZ < z1) {
+      cell = {
+        id: node.dataset.cell,
+        host: node.dataset.host,
+        label: node.dataset.label,
+        x0: node.dataset.x0,
+        x1: node.dataset.x1,
+        z0: node.dataset.z0,
+        z1: node.dataset.z1,
+      };
+      break;
+    }
+  }
+  return {blockX: blockX, blockZ: blockZ, cell: cell};
+}
+
+function formatSpot(spot, column, pinned) {
+  const lines = [];
+  if (spot.cell) lines.push(spot.cell.label + " · " + spot.cell.host);
+  lines.push("x " + spot.blockX + "  z " + spot.blockZ);
+  let yPart = null;
+  if (column && column.state === "ground" && Number.isInteger(column.y) && column.y > 0) {
+    lines.push("y " + column.y);
+    yPart = String(column.y);
+  } else if (column && column.state === "water") {
+    lines.push("open water, no dry ground");
+  } else if (pinned && column) {
+    lines.push("height is unmeasured");
+  }
+  if (spot.cell) {
+    lines.push(
+      "section x " + spot.cell.x0 + " to " + (Number(spot.cell.x1) - 1)
+      + ", z " + spot.cell.z0 + " to " + (Number(spot.cell.z1) - 1)
+    );
+  }
+  if (pinned && column) {
+    lines.push("/tp @s " + spot.blockX + " " + (yPart == null ? "~" : yPart) + " " + spot.blockZ);
+    const server = spot.cell ? spot.cell.id : "outside the grid";
+    lines.push(server + ". /tp only moves you on the server you are standing on.");
+    lines.push("Click this readout to unpin.");
+  } else if (pinned) {
+    lines.push("reading height");
+  }
+  return lines.join(lineBreak);
+}
+
+function commandLine(text) {
+  for (const line of text.split(lineBreak)) {
+    if (line.startsWith("/tp @s ")) return line;
+  }
+  return "";
+}
+
+function fallbackCopy(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.top = "0";
+  area.style.left = "-9999px";
+  document.body.appendChild(area);
+  area.focus();
+  area.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (err) {
+    ok = false;
+  }
+  area.remove();
+  if (!ok) throw new Error("copy");
+}
+
+function copyCommand(text) {
+  const write = navigator.clipboard && navigator.clipboard.writeText
+    ? navigator.clipboard.writeText(text)
+    : Promise.reject(new Error("clipboard"));
+  return write.catch(() => fallbackCopy(text));
+}
+
+function rememberColumn(column) {
+  if (column && Number.isInteger(column.x) && Number.isInteger(column.z)) {
+    heightCache.set(column.x + "," + column.z, column);
+  }
+  return column;
+}
+
+async function columnAt(x, z, fresh) {
+  const key = x + "," + z;
+  if (!fresh && heightCache.has(key)) return heightCache.get(key);
+  const res = await fetch("/map/column?x=" + x + "&z=" + z, {cache: "no-store"});
+  if (!res.ok) throw new Error("column");
+  return rememberColumn(await res.json());
+}
+
+function clearPin() {
+  const pin = document.getElementById("map-pin");
+  if (pin) pin.remove();
+}
+
+function drawPin() {
+  const svg = document.querySelector("#board svg");
+  if (!svg || !frozen) return;
+  clearPin();
+  const left = Number(svg.dataset.plotLeft);
+  const top = Number(svg.dataset.plotTop);
+  const size = Number(svg.dataset.plotSize);
+  const world = Number(svg.dataset.world);
+  const cx = left + ((frozen.blockX + 0.5) / world) * size;
+  const cy = top + (1 - ((frozen.blockZ + 0.5) / world)) * size;
+  const pin = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  pin.setAttribute("id", "map-pin");
+  pin.setAttribute("cx", cx.toFixed(2));
+  pin.setAttribute("cy", cy.toFixed(2));
+  pin.setAttribute("r", "6");
+  pin.setAttribute("fill", "none");
+  pin.setAttribute("stroke", "#c2410c");
+  pin.setAttribute("stroke-width", "2");
+  pin.setAttribute("pointer-events", "none");
+  svg.appendChild(pin);
+}
+
+function showFrozen() {
+  if (!frozen) return;
+  setReadout(frozen.text, true);
+  drawPin();
+}
+
+function paintReadout() {
+  if (frozen) return;
+  const spot = pointer ? spotAt(pointer.x, pointer.y) : null;
+  if (!spot) {
+    setReadout("—", false);
+    return;
+  }
+  const seq = ++hoverSeq;
+  const cached = heightCache.get(spot.blockX + "," + spot.blockZ);
+  setReadout(formatSpot(spot, cached || null, false), false);
+  if (cached) return;
+  columnAt(spot.blockX, spot.blockZ, false).then((column) => {
+    if (frozen || seq !== hoverSeq) return;
+    const current = pointer ? spotAt(pointer.x, pointer.y) : null;
+    if (!current || current.blockX !== spot.blockX || current.blockZ !== spot.blockZ) return;
+    setReadout(formatSpot(spot, column, false), false);
+  }).catch(() => {});
+}
+
+async function freezeAt(spot) {
+  const seq = ++pinSeq;
+  frozen = {
+    blockX: spot.blockX,
+    blockZ: spot.blockZ,
+    text: formatSpot(spot, null, true),
+    seq: seq,
+  };
+  showFrozen();
+  let column;
+  try {
+    column = await columnAt(spot.blockX, spot.blockZ, true);
+  } catch (err) {
+    column = {x: spot.blockX, z: spot.blockZ, state: "unmeasured"};
+  }
+  if (!frozen || frozen.seq !== seq) return;
+  const text = formatSpot(spot, column, true);
+  const command = commandLine(text);
+  frozen.text = text;
+  showFrozen();
+  if (!command) return;
+  let note = "Not copied.";
+  try {
+    await copyCommand(command);
+    note = "Copied to clipboard.";
+  } catch (err) {
+    note = "Not copied.";
+  }
+  if (!frozen || frozen.seq !== seq) return;
+  frozen.text = text + lineBreak + note;
+  showFrozen();
+}
+
+function onMove(event) {
+  if (frozen) return;
+  const target = event.target;
+  if (target && target.closest && target.closest("#coord-readout")) return;
+  const svg = target && target.closest ? target.closest("svg") : null;
+  if (!svg) {
+    pointer = null;
+    setReadout("—", false);
+    return;
+  }
+  pointer = {x: event.clientX, y: event.clientY};
+  paintReadout();
+}
+
+board.addEventListener("mousemove", onMove);
+board.addEventListener("pointerleave", () => {
+  pointer = null;
+  if (frozen) return;
+  setReadout("—", false);
+});
+board.addEventListener("click", (event) => {
+  const target = event.target;
+  if (target && target.closest && target.closest("#coord-readout")) {
+    pinSeq += 1;
+    frozen = null;
+    pointer = null;
+    clearPin();
+    setReadout("—", false);
+    return;
+  }
+  const svg = target && target.closest ? target.closest("svg") : null;
+  if (!svg) return;
+  const spot = spotAt(event.clientX, event.clientY);
+  if (!spot) return;
+  freezeAt(spot);
+});
 </script>
 <noscript><meta http-equiv="refresh" content="6"></noscript>
 </body>
@@ -1612,8 +2086,689 @@ setInterval(tick, 6000);
 """
 
 
+NINE_CLIMB_LOG = Path.home() / ".local/state/cks-test-mc-p5/nine-climb/climb-nine.log"
+FLOW_SAMPLE_RE = re.compile(
+    r"^(?P<at>\d{2}:\d{2}:\d{2}) wave (?P<side>\S+) "
+    r"cpu=(?P<cpu>\S+) load=(?P<load>\S+) players=(?P<players>\S+) "
+    r"over=(?P<over>\S+) step=(?P<step>\S+) next=(?P<next>\S+) add=(?P<add>\S+)\s*$"
+)
+FLOW_MISSING_RE = re.compile(
+    r"^(?P<at>\d{2}:\d{2}:\d{2}) wave (?P<side>\S+) sample missing; step stays (?P<step>\S+);"
+)
+FLOW_ADMIT_RE = re.compile(
+    r"^(?P<at>\d{2}:\d{2}:\d{2}) admit (?P<name>\S+) place=(?P<place>\S+) span=(?P<span>\S+)"
+    r"(?: (?P<rest>.*))?$"
+)
+FLOW_GAINED_RE = re.compile(
+    r"^(?P<at>\d{2}:\d{2}:\d{2}) wave (?P<side>\S+) gained=(?P<gained>\S+) over=(?P<over>\S+) "
+    r"step \S+ -> (?P<step>\S+)\s*$"
+)
+FLOW_SEATED_RE = re.compile(
+    r"^(?P<at>\d{2}:\d{2}:\d{2}) wave seated=(?P<seated>\S+) steps (?P<steps>.*)$"
+)
+FLOW_COLORS = (
+    "#1d4ed8",
+    "#c2410c",
+    "#15803d",
+    "#7c3aed",
+    "#b45309",
+    "#0f766e",
+    "#9f1239",
+    "#1e40af",
+    "#a16207",
+    "#0369a1",
+    "#4d7c0f",
+    "#6d28d9",
+)
+FLOW_NODE_W = 156
+FLOW_LEFT_X = 8
+FLOW_RIGHT_X = 276
+FLOW_WIDTH = 440
+
+
+def nine_climb_log() -> Path:
+    raw = os.environ.get("CK_MESH_DIR", "").strip()
+    if raw:
+        candidate = Path(raw).expanduser() / "climb-nine.log"
+        if candidate.exists():
+            return candidate
+    return NINE_CLIMB_LOG
+
+
+def read_log_tail(path: Path, limit: int = 2_000_000) -> str:
+    data = path.read_bytes()
+    if len(data) > limit:
+        data = data[-limit:]
+        cut = data.find(b"\n")
+        if cut >= 0:
+            data = data[cut + 1 :]
+    return data.decode("utf-8", "replace")
+
+
+def present(text):
+    if text is None:
+        return None
+    token = str(text).strip()
+    if token in {"", "None", "none", "null"}:
+        return None
+    return token
+
+
+def format_flow_value(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float):
+        return present(f"{value:.6g}")
+    return present(value)
+
+
+def whole_token(text):
+    token = present(text)
+    if token is None or not re.fullmatch(r"-?\d+", token):
+        return None
+    return token
+
+
+def flow_sort_key(name):
+    text = str(name)
+    match = re.search(r"(\d+)$", text)
+    if not match:
+        return (text, -1, text)
+    return (text[: match.start()], int(match.group(1)), text)
+
+
+def short_generator(name: str) -> str:
+    match = re.search(r"(lg-\d+)$", name)
+    if match:
+        return match.group(1)
+    if IP_RE.search(name):
+        return "generator"
+    return name.rsplit("/", 1)[-1][-24:]
+
+
+def mem_label(value):
+    text = present(value)
+    if text is None:
+        return None
+    if text.lower().startswith("mem"):
+        return text
+    return f"mem {text}"
+
+
+def parse_seat_token(token):
+    seats = {}
+    for part in token.split(","):
+        if ":" not in part:
+            continue
+        side, count = part.split(":", 1)
+        count = whole_token(count)
+        if not side or count is None:
+            continue
+        seats[side] = int(count)
+    return seats
+
+
+def admit_from_match(match):
+    seats = {}
+    mem = None
+    for token in (match.group("rest") or "").split():
+        if token.startswith(("mem=", "memory=", "mib=")):
+            mem = token.split("=", 1)[1]
+            continue
+        if ":" in token:
+            seats.update(parse_seat_token(token))
+    admit = {
+        "at": match.group("at"),
+        "name": match.group("name"),
+        "short": short_generator(match.group("name")),
+        "seats": seats,
+    }
+    place = whole_token(match.group("place"))
+    if place is not None:
+        admit["place"] = place
+    span = whole_token(match.group("span"))
+    if span is not None:
+        admit["span"] = span
+    label = mem_label(mem)
+    if label:
+        admit["mem"] = label
+    return admit
+
+
+def blank_wave(at):
+    return {
+        "at": at,
+        "servers": {},
+        "admits": [],
+        "seated": None,
+        "seated_at": None,
+        "closed": False,
+        "sampled": False,
+    }
+
+
+def parse_climb_waves(text: str):
+    """Latest wave from the driver's log. Missing fields stay absent."""
+    waves = []
+    current = None
+
+    def open_wave(at):
+        nonlocal current
+        current = blank_wave(at)
+        waves.append(current)
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = FLOW_SAMPLE_RE.match(line)
+        if match:
+            side = match.group("side")
+            if current is None or current["closed"] or current["admits"] or side in current["servers"]:
+                open_wave(match.group("at"))
+            server = {}
+            cpu = present(match.group("cpu"))
+            if cpu is not None:
+                server["cpu"] = cpu
+            load = present(match.group("load"))
+            if load is not None:
+                server["load"] = load
+            players = present(match.group("players"))
+            if players is not None:
+                server["players"] = players
+            over = whole_token(match.group("over"))
+            if over is not None:
+                server["over"] = int(over)
+            step = present(match.group("step"))
+            if step is not None:
+                server["step"] = step
+            current["servers"][side] = server
+            current["sampled"] = True
+            continue
+        match = FLOW_MISSING_RE.match(line)
+        if match:
+            side = match.group("side")
+            if current is None or current["closed"] or current["admits"] or side in current["servers"]:
+                open_wave(match.group("at"))
+            step = present(match.group("step"))
+            server = {}
+            if step is not None:
+                server["step"] = step
+            current["servers"][side] = server
+            continue
+        match = FLOW_ADMIT_RE.match(line)
+        if match:
+            if current is None or current["closed"]:
+                open_wave(match.group("at"))
+            admit = admit_from_match(match)
+            current["admits"] = [item for item in current["admits"] if item["name"] != admit["name"]]
+            current["admits"].append(admit)
+            continue
+        match = FLOW_GAINED_RE.match(line)
+        if match:
+            if current is None or current["closed"]:
+                open_wave(match.group("at"))
+            side = match.group("side")
+            server = current["servers"].setdefault(side, {})
+            over = whole_token(match.group("over"))
+            if over is not None:
+                server["over"] = int(over)
+            step = present(match.group("step"))
+            if step is not None:
+                server["step"] = step
+            continue
+        match = FLOW_SEATED_RE.match(line)
+        if match:
+            if current is None or current["closed"]:
+                open_wave(match.group("at"))
+            seated = whole_token(match.group("seated"))
+            if seated is not None:
+                current["seated"] = seated
+            current["seated_at"] = match.group("at")
+            current["closed"] = True
+            for part in match.group("steps").split():
+                if ":" not in part:
+                    continue
+                side, step = part.split(":", 1)
+                step = present(step)
+                if not side or step is None:
+                    continue
+                current["servers"].setdefault(side, {})["step"] = step
+            continue
+    return waves
+
+
+def parse_climb_log_text(text: str):
+    for wave in reversed(parse_climb_waves(text)):
+        if wave["servers"] or wave["admits"]:
+            return wave
+    return None
+
+
+def waves_from_snapshot(data):
+    if not isinstance(data, dict) or not isinstance(data.get("waves"), list):
+        return []
+    parsed = []
+    for chosen in data["waves"]:
+        if not isinstance(chosen, dict):
+            continue
+        servers_in = chosen.get("servers") if isinstance(chosen.get("servers"), dict) else {}
+        admits_in = chosen.get("admits") if isinstance(chosen.get("admits"), list) else []
+        if not servers_in and not admits_in:
+            continue
+        servers = {}
+        for side, row in servers_in.items():
+            if not isinstance(side, str) or not isinstance(row, dict):
+                continue
+            server = {}
+            for key in ("cpu", "load", "players", "step"):
+                text = format_flow_value(row.get(key))
+                if text is not None:
+                    server[key] = text
+            over = row.get("over")
+            if isinstance(over, int) and not isinstance(over, bool):
+                server["over"] = over
+            servers[side] = server
+        admits = []
+        for row in admits_in:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+                continue
+            seats = {}
+            raw_seats = row.get("seats") if isinstance(row.get("seats"), dict) else {}
+            for side, count in raw_seats.items():
+                if isinstance(side, str) and isinstance(count, int) and not isinstance(count, bool):
+                    seats[side] = count
+            admit = {
+                "at": row.get("at") if isinstance(row.get("at"), str) else None,
+                "name": row["name"],
+                "short": short_generator(row["name"]),
+                "seats": seats,
+            }
+            place = format_flow_value(row.get("place"))
+            if place is not None:
+                admit["place"] = place
+            span = format_flow_value(row.get("span"))
+            if span is not None:
+                admit["span"] = span
+            label = mem_label(row.get("mem") if row.get("mem") is not None else row.get("memory"))
+            if label:
+                admit["mem"] = label
+            admits.append(admit)
+        seated = format_flow_value(chosen.get("seated"))
+        parsed.append({
+            "at": chosen.get("at") if isinstance(chosen.get("at"), str) else None,
+            "servers": servers,
+            "admits": admits,
+            "seated": seated,
+            "seated_at": chosen.get("seated_at") if isinstance(chosen.get("seated_at"), str) else None,
+            "closed": bool(chosen.get("closed")) or seated is not None,
+            "sampled": any(
+                key in server for server in servers.values() for key in ("cpu", "load", "players")
+            ),
+        })
+    return parsed
+
+
+def prefer_flow_snapshot(log_mtime, snap_mtime) -> bool:
+    if snap_mtime is None:
+        return False
+    if log_mtime is None:
+        return True
+    return snap_mtime + 1 >= log_mtime
+
+
+def load_flow_waves():
+    path = nine_climb_log()
+    snap_path = path.with_name(path.stem + "-flow.json")
+    log_waves = []
+    log_mtime = None
+    if path.exists():
+        log_waves = parse_climb_waves(read_log_tail(path))
+        try:
+            log_mtime = path.stat().st_mtime
+        except OSError:
+            log_mtime = None
+    snap_waves = []
+    snap_mtime = None
+    if snap_path.exists():
+        try:
+            snap_waves = waves_from_snapshot(json.loads(snap_path.read_text()))
+            snap_mtime = snap_path.stat().st_mtime
+        except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+            snap_waves = []
+    if snap_waves and prefer_flow_snapshot(log_mtime, snap_mtime):
+        return snap_waves, "snapshot"
+    return log_waves, "log"
+
+
+def pick_flow(waves):
+    usable = [wave for wave in waves or [] if wave.get("servers") or wave.get("admits")]
+    if not usable:
+        return None, None
+    latest = usable[-1]
+    if latest.get("admits"):
+        return latest, latest
+    connections = None
+    for wave in reversed(usable):
+        if wave.get("admits"):
+            connections = wave
+            break
+    return connections, latest
+
+
+def flow_notes(wave, time_id="flow-time") -> str:
+    bits = []
+    if wave.get("sampled") and wave.get("at"):
+        bits.append(f"Server load sampled at {wave['at']}")
+    elif wave.get("at"):
+        bits.append(f"Wave at {wave['at']}")
+    if wave.get("seated") is not None and wave.get("seated_at"):
+        bits.append(f"{wave['seated']} seated at {wave['seated_at']}")
+    elif wave.get("seated") is not None:
+        bits.append(f"{wave['seated']} seated")
+    if not bits:
+        bits.append("Wave time is not in the climb log")
+    bits.append("from the climb log")
+    notes = f'<p class="note" id="{esc(time_id)}">{esc(", ".join(bits))}.</p>'
+    if wave.get("closed"):
+        notes += (
+            '<p class="note" id="flow-kind">Last completed wave in the climb log, '
+            "not a live 8-second sample.</p>"
+        )
+    return notes
+
+
+def server_lines(side, info):
+    lines = [side]
+    if info.get("cpu") is not None:
+        lines.append(f"cpu {info['cpu']}")
+    if info.get("load") is not None:
+        lines.append(f"load {info['load']}")
+    if info.get("players") is not None:
+        lines.append(f"players {info['players']}")
+    if info.get("over") is not None:
+        lines.append("over" if info["over"] else "under")
+    if info.get("step") is not None:
+        lines.append(f"step {info['step']}")
+    return lines
+
+
+def generator_lines(gen):
+    lines = [gen["short"]]
+    if gen.get("place") is not None:
+        lines.append(f"placed {gen['place']}")
+    if gen.get("span") is not None and gen.get("span") != gen.get("place"):
+        lines.append(f"span {gen['span']}")
+    if gen.get("mem"):
+        lines.append(gen["mem"])
+    return lines
+
+
+def server_rows(wave, note="Connections for this wave are not in the log yet.") -> str:
+    servers = wave.get("servers") or {}
+    columns = [
+        ("cpu", "CPU"),
+        ("load", "Load"),
+        ("players", "Players"),
+        ("over", "Line"),
+        ("step", "Step"),
+    ]
+    shown = []
+    for key, _label in columns:
+        if any(key in info for info in servers.values()):
+            shown.append((key, _label))
+    head = "".join(f"<th>{esc(label)}</th>" for _key, label in shown)
+    body = []
+    for side in sorted(servers, key=flow_sort_key):
+        info = servers[side]
+        cells = [f'<td>{esc(side)}</td>']
+        for key, _label in shown:
+            if key not in info:
+                cells.append("<td></td>")
+                continue
+            if key == "over":
+                cells.append(f'<td>{"over" if info[key] else "under"}</td>')
+            else:
+                cells.append(f'<td class="num">{esc(info[key])}</td>')
+        body.append(f'<tr data-server="{esc(side)}">{"".join(cells)}</tr>')
+    table = (
+        '<table class="flow-load"><thead><tr><th>Server</th>'
+        f"{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+    )
+    return table + f'<p class="note">{esc(note)}</p>'
+
+
+def flow_box_height(line_count: int) -> int:
+    return 16 + 13 * max(0, line_count - 1) + 10
+
+
+def layout_flow_column(entries):
+    y = 28
+    placed = []
+    for entry in entries:
+        text_h = flow_box_height(len(entry["lines"]))
+        edges = entry.get("edges", 0)
+        slot = text_h if edges <= 0 else max(text_h, edges * 16)
+        node_y = y + max(0, (slot - text_h) / 2)
+        placed.append({**entry, "y": node_y, "h": text_h})
+        y += slot + 8
+    return placed, y
+
+
+def separate_flow_labels(labels):
+    labels.sort(key=lambda item: (item["y"], item["x"]))
+    for _ in range(12):
+        for index in range(1, len(labels)):
+            if abs(labels[index]["x"] - labels[index - 1]["x"]) > 36:
+                continue
+            gap = labels[index]["y"] - labels[index - 1]["y"]
+            if gap < 14:
+                push = (14 - gap) / 2
+                labels[index - 1]["y"] -= push
+                labels[index]["y"] += push
+    if not labels:
+        return
+    low = min(item["y"] for item in labels)
+    if low < 22:
+        delta = 22 - low
+        for item in labels:
+            item["y"] += delta
+
+
+def curve_at(t, x1, y1, x2, y2):
+    c1x, c1y = x1 + 46, y1
+    c2x, c2y = x2 - 46, y2
+    u = 1 - t
+    x = (u * u * u * x1) + (3 * u * u * t * c1x) + (3 * u * t * t * c2x) + (t * t * t * x2)
+    y = (u * u * u * y1) + (3 * u * u * t * c1y) + (3 * u * t * t * c2y) + (t * t * t * y2)
+    return x, y, c1x, c1y, c2x, c2y
+
+
+def flow_diagram(wave) -> str:
+    servers = dict(wave.get("servers") or {})
+    gens = []
+    for admit in wave.get("admits") or []:
+        seats = {}
+        for side, count in (admit.get("seats") or {}).items():
+            if isinstance(count, bool) or not isinstance(count, int):
+                continue
+            if count > 0:
+                seats[side] = count
+                servers.setdefault(side, {})
+        gens.append({**admit, "seats": seats, "lines": generator_lines(admit), "edges": len(seats)})
+    gens.sort(key=lambda item: flow_sort_key(item.get("short") or item.get("name") or ""))
+    server_names = sorted(servers, key=flow_sort_key)
+    incoming = {side: 0 for side in server_names}
+    for gen in gens:
+        for side in gen["seats"]:
+            incoming[side] = incoming.get(side, 0) + 1
+    server_entries = [
+        {
+            "side": side,
+            "lines": server_lines(side, servers.get(side) or {}),
+            "edges": incoming.get(side, 0),
+            "over": (servers.get(side) or {}).get("over"),
+        }
+        for side in server_names
+    ]
+    gen_placed, gen_bottom = layout_flow_column(gens)
+    server_placed, server_bottom = layout_flow_column(server_entries)
+    server_by_side = {item["side"]: item for item in server_placed}
+    edges = []
+    labels = []
+    for index, gen in enumerate(gen_placed):
+        color = FLOW_COLORS[index % len(FLOW_COLORS)]
+        gen["color"] = color
+        y1 = gen["y"] + gen["h"] / 2
+        x1 = FLOW_LEFT_X + FLOW_NODE_W
+        for side, count in sorted(gen["seats"].items(), key=lambda item: flow_sort_key(item[0])):
+            server = server_by_side.get(side)
+            if server is None:
+                continue
+            y2 = server["y"] + server["h"] / 2
+            x2 = FLOW_RIGHT_X
+            mx, my, c1x, c1y, c2x, c2y = curve_at(0.5, x1, y1, x2, y2)
+            edges.append({
+                "short": gen["short"],
+                "side": side,
+                "count": count,
+                "color": color,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "c1x": c1x,
+                "c1y": c1y,
+                "c2x": c2x,
+                "c2y": c2y,
+            })
+            labels.append({
+                "short": gen["short"],
+                "side": side,
+                "count": count,
+                "color": color,
+                "x": mx,
+                "y": my,
+            })
+    separate_flow_labels(labels)
+    label_bottom = max((item["y"] + 12 for item in labels), default=0)
+    height = max(gen_bottom, server_bottom, label_bottom, 48) + 8
+    parts = [
+        f'<svg class="flow" viewBox="0 0 {FLOW_WIDTH} {height:.0f}" role="group" '
+        'aria-label="Generators connected to game servers" font-family="system-ui, sans-serif">',
+        f'<text x="{FLOW_LEFT_X}" y="16" font-size="11" fill="#57534e">Generators</text>',
+        f'<text x="{FLOW_RIGHT_X}" y="16" font-size="11" fill="#57534e">Game servers</text>',
+    ]
+    for edge in edges:
+        parts.append(
+            f'<path data-link="{esc(edge["short"])} {esc(edge["side"])}" data-count="{edge["count"]}" '
+            f'd="M {edge["x1"]:.1f} {edge["y1"]:.1f} C {edge["c1x"]:.1f} {edge["c1y"]:.1f}, '
+            f'{edge["c2x"]:.1f} {edge["c2y"]:.1f}, {edge["x2"]:.1f} {edge["y2"]:.1f}" '
+            f'fill="none" stroke="{edge["color"]}" stroke-width="1.4"/>'
+        )
+    for label in labels:
+        text = str(label["count"])
+        width = 8 + 7 * len(text)
+        parts.append(
+            f'<g data-link-label="{esc(label["short"])} {esc(label["side"])}" data-count="{label["count"]}">'
+            f'<rect x="{label["x"] - width / 2:.1f}" y="{label["y"] - 8:.1f}" width="{width}" height="14" rx="3" '
+            f'fill="#fff" stroke="#e7e5e4"/>'
+            f'<text x="{label["x"]:.1f}" y="{label["y"] + 3:.1f}" text-anchor="middle" font-size="11" '
+            f'font-weight="650" fill="{label["color"]}">{esc(text)}</text>'
+            f'<title>{esc(label["short"])} to {esc(label["side"])}: {esc(text)}</title>'
+            "</g>"
+        )
+    for gen in gen_placed:
+        parts.append(flow_node("generator", gen["short"], FLOW_LEFT_X, gen["y"], gen["h"], gen["lines"], gen["color"]))
+    for server in server_placed:
+        accent = "#9f1239" if server.get("over") else "#a8a29e"
+        parts.append(flow_node("server", server["side"], FLOW_RIGHT_X, server["y"], server["h"], server["lines"], accent))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def flow_node(kind, key, x, y, height, lines, accent) -> str:
+    parts = [
+        f'<g data-{kind}="{esc(key)}">',
+        f'<rect x="{x:.1f}" y="{y:.1f}" width="{FLOW_NODE_W}" height="{height:.1f}" rx="8" '
+        f'fill="#fafaf9" stroke="{accent}" stroke-width="1.2"/>',
+    ]
+    for index, line in enumerate(lines):
+        weight = ' font-weight="650"' if index == 0 else ""
+        fill = "#1c1917" if index == 0 else "#44403c"
+        if line == "over":
+            fill = "#9f1239"
+        elif line == "under":
+            fill = "#14532d"
+        parts.append(
+            f'<text x="{x + 10:.1f}" y="{y + 16 + 13 * index:.1f}" font-size="12" fill="{fill}"{weight}>'
+            f"{esc(line)}</text>"
+        )
+    parts.append("</g>")
+    return "".join(parts)
+
+
+def render_flow(wave, source="log") -> str:
+    if not wave or (not wave.get("servers") and not wave.get("admits")):
+        return (
+            '<h2>Generators and game servers</h2>'
+            '<p class="note" data-flow-source="none">No wave sample is in the climb log yet.</p>'
+        )
+    body = flow_diagram(wave) if wave.get("admits") else server_rows(wave)
+    return (
+        '<h2>Generators and game servers</h2>'
+        f"{flow_notes(wave)}"
+        f'<div data-flow-source="{esc(source)}">{body}</div>'
+    )
+
+
+def render_flow_view(connections, latest, source="log") -> str:
+    if connections is None:
+        return render_flow(latest, source)
+    parts = [
+        '<h2>Generators and game servers</h2>',
+        flow_notes(connections),
+    ]
+    if latest is not None and latest is not connections:
+        if not connections.get("closed"):
+            parts.append(
+                '<p class="note" id="flow-kind">These connections are from the climb log, '
+                "not a live 8-second sample.</p>"
+            )
+        when = latest.get("at")
+        later = (
+            f"A later sample at {when} did not log connections."
+            if when
+            else "A later sample did not log connections."
+        )
+        parts.append(f'<p class="note" id="flow-later">{esc(later)}</p>')
+    parts.append(f'<div data-flow-source="{esc(source)}">{flow_diagram(connections)}</div>')
+    if latest is not None and latest is not connections and latest.get("servers"):
+        parts.append("<h2>Latest server load</h2>")
+        parts.append(flow_notes(latest, "flow-later-time"))
+        parts.append(server_rows(latest, "This sample did not log connections."))
+    return "".join(parts)
+
+
+def flow_body() -> str:
+    try:
+        waves, source = load_flow_waves()
+    except Exception as exc:
+        sys.stderr.write(f"climb log read failed: {type(exc).__name__}\n")
+        waves, source = [], "log"
+    connections, latest = pick_flow(waves)
+    return render_flow_view(connections, latest, source)
+
+
+def map_live_fragment() -> str:
+    payload = positions_payload()
+    return f'<div id="map-live">{map_body(payload)}</div><div id="flow-live">{flow_body()}</div>'
+
+
 def render_map_page() -> str:
-    return MAP_PAGE.replace("<!--BOARD-->", map_body(positions_payload()), 1)
+    payload = positions_payload()
+    page = MAP_PAGE.replace("<!--BOARD-->", map_body(payload), 1)
+    return page.replace("<!--FLOW-->", flow_body(), 1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1625,7 +2780,11 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f"{self.command} {code}\n")
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        if path == "/map/column":
+            self._column(urllib.parse.parse_qs(parsed.query))
+            return
         if path == "/positions.json":
             body = redact_public(json.dumps(positions_payload())).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
@@ -1634,7 +2793,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", redact_public(render_map_page()).encode("utf-8"))
             return
         if path == "/map/live":
-            self._send(200, "text/html; charset=utf-8", redact_public(map_body(positions_payload())).encode("utf-8"))
+            self._send(200, "text/html; charset=utf-8", redact_public(map_live_fragment()).encode("utf-8"))
             return
         try:
             state = build()
@@ -1648,6 +2807,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", render_live(state).encode("utf-8"))
             return
         self._send(404, "text/plain; charset=utf-8", b"not found\n")
+
+    def _column(self, query):
+        try:
+            x = int(query.get("x", [""])[0])
+            z = int(query.get("z", [""])[0])
+        except (TypeError, ValueError):
+            self._send(400, "application/json; charset=utf-8", b'{"state":"bad"}\n')
+            return
+        if 0 <= x < WORLD and 0 <= z < WORLD:
+            payload = column_state(column_table(), x, z)
+        else:
+            payload = {"x": x, "z": z, "state": "unmeasured"}
+        self._send(200, "application/json; charset=utf-8", json.dumps(payload).encode("utf-8"))
 
     def _send(self, code, content_type, body: bytes):
         self.send_response(code)
@@ -1664,8 +2836,10 @@ def serve():
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     threading.Thread(target=watch, name="csv-watch", daemon=True).start()
     threading.Thread(target=map_watch, name="positions", daemon=True).start()
+    threading.Thread(target=nine_watch, name="nine-seated", daemon=True).start()
     _pop_ready.wait(timeout=30)
     _map_ready.wait(timeout=25)
+    _nine_ready.wait(timeout=45)
     try:
         httpd = ThreadingHTTPServer(BIND, Handler)
     except OSError:
@@ -1891,9 +3065,92 @@ def self_check():
     drawn = map_body(sample)
     expect("BenScholtens" in drawn and "Hiirukai" in drawn, "real names missing from the map")
     expect("Load1" not in drawn and "S161" not in drawn, "a bot was given a name tag")
-    expect("2 bots" in drawn, "bot count missing")
+    expect("2 bots." in drawn, "bot count missing")
+    expect("seated" not in drawn, "an unmeasured seated count was invented")
+    labeled = map_body(sample, seated=5)
+    expect("5 bots seated. 2 plotted." in labeled, "seated and plotted counts missing")
+    expect("Load1" not in labeled and "S161" not in labeled, "a seated label named a bot")
     expect('data-cell="p1"' in drawn and 'data-cell="p9"' in drawn and "p1 southwest" in drawn and "p5 center" in drawn, "grid labels missing")
     expect('data-cut="2000"' in drawn and 'data-cut="4000"' in drawn, "cut lines missing")
+    expect('aria-label="Nine-server coordinate grid"' in drawn, "map label missing")
+    expect('data-plot-left="52"' in drawn and 'data-plot-size="560"' in drawn and 'data-world="6000"' in drawn, "map scale missing")
+    expect('data-host="test-mc-p5-1"' in drawn and 'data-x0="2000"' in drawn and 'data-z1="6000"' in drawn, "cell bounds missing")
+    expect('id="coord-readout"' in drawn, "hover readout missing")
+    expect(
+        "mousemove" in MAP_PAGE and "/tp @s" in MAP_PAGE and "height is unmeasured" in MAP_PAGE,
+        "map page dropped the pinned teleport readout",
+    )
+    expect(
+        "navigator.clipboard.writeText" in MAP_PAGE and 'document.execCommand("copy")' in MAP_PAGE
+        and "Copied to clipboard." in MAP_PAGE and "Not copied." in MAP_PAGE,
+        "map page dropped the teleport clipboard copy",
+    )
+    expect('id="flow"' in MAP_PAGE and 'id="board"' in MAP_PAGE and "#map-live" in MAP_PAGE, "map page dropped the load diagram")
+    sample_log = (
+        "08:41:51 wave p1 cpu=1.2 load=0.08 players=0 over=0 step=9 next=9 add=9\n"
+        "08:41:51 wave p2 cpu=None load=0.11 players=0 over=0 step=9 next=9 add=9\n"
+        "08:41:51 wave p10 cpu=3 load=0.2 players=1 over=1 step=4 next=4 add=4\n"
+        "08:41:59 admit test-mc-p5-lg-10 place=9 span=9 p1:1,p2:0,p10:2\n"
+        "08:42:00 admit test-mc-p5-lg-19 place=3 span=3 p1:3 mem=4100\n"
+        "08:42:01 admit 10.1.2.3 place=1 span=1 p1:4\n"
+        "08:46:56 wave p1 gained=9 over=0 step 9 -> 10\n"
+        "08:47:02 wave seated=76 steps p1:10 p2:1 p10:4\n"
+    )
+    wave = parse_climb_log_text(sample_log)
+    expect(wave["closed"] and wave["seated"] == "76", "wave seated count")
+    expect("cpu" not in wave["servers"]["p2"], "missing cpu is omitted")
+    expect(wave["servers"]["p2"]["load"] == "0.11", "a present load was dropped")
+    expect(wave["servers"]["p1"]["step"] == "10", "the seated step was dropped")
+    expect(wave["servers"]["p10"]["over"] == 1, "a server over the line was dropped")
+    html = render_flow(wave)
+    expect('data-server="p1"' in html and 'data-server="p10"' in html, "server nodes missing")
+    expect('data-generator="lg-10"' in html and 'data-generator="lg-19"' in html, "generator nodes missing")
+    expect('data-link="lg-10 p1" data-count="1"' in html, "admit count missing")
+    expect('data-link="lg-10 p10" data-count="2"' in html, "a later server admit was dropped")
+    expect('data-link="lg-19 p1" data-count="3"' in html, "a new generator admit was dropped")
+    expect('data-link="lg-10 p2"' not in html, "a zero admit was drawn")
+    expect("mem 4100" in html and "placed 9" in html, "admit fields missing")
+    expect("Last completed wave in the climb log, not a live 8-second sample." in html, "completed-wave note missing")
+    expect("08:41:51" in html and "76 seated at 08:47:02" in html, "wave timestamp missing")
+    expect("10.1.2.3" not in html and IP_RE.search(html) is None, "flow diagram contains an address")
+    quiet = parse_climb_log_text(
+        "08:52:43 wave p1 cpu=13.1 load=0.42 players=19 over=0 step=11 next=11 add=11\n"
+        "08:52:43 wave west cpu=None load=0.1 players=4 over=0 step=2 next=2 add=2\n"
+    )
+    quiet_html = render_flow(quiet)
+    expect("Connections for this wave are not in the log yet." in quiet_html, "missing admits were not called out")
+    expect("data-link=" not in quiet_html, "a line was drawn without an admit")
+    expect(">p1<" in quiet_html and ">13.1<" in quiet_html and ">west<" in quiet_html, "server rows missing")
+    expect("cpu" not in quiet["servers"]["west"], "a missing cpu was invented")
+    expect("Last completed wave" not in quiet_html, "an open wave was called completed")
+    expect("No wave sample is in the climb log yet." in render_flow(None), "empty log note missing")
+    mixed = parse_climb_waves(
+        "08:52:43 wave p1 cpu=13.1 load=0.42 players=19 over=0 step=11 next=11 add=11\n"
+        "08:52:51 admit test-mc-p5-lg-10 place=2 span=2 p1:2\n"
+        "08:58:29 wave seated=245 steps p1:12\n"
+        "09:07:49 wave p1 cpu=16.4 load=0.28 players=30 over=0 step=12 next=12 add=12\n"
+    )
+    connections, latest = pick_flow(mixed)
+    mixed_html = render_flow_view(connections, latest)
+    expect(connections is not latest, "a later sample hid the last admit")
+    expect('data-link="lg-10 p1" data-count="2"' in mixed_html, "the last admit line was dropped")
+    expect("245 seated at 08:58:29" in mixed_html, "the last seated wave was dropped")
+    expect("Last completed wave in the climb log, not a live 8-second sample." in mixed_html, "completed-wave note missing")
+    expect("A later sample at 09:07:49 did not log connections." in mixed_html, "later sample was hidden")
+    expect(">16.4<" in mixed_html and "This sample did not log connections." in mixed_html, "later server load missing")
+    expect(not prefer_flow_snapshot(10, 8), "an older snapshot must not hide the log")
+    expect(prefer_flow_snapshot(10, 10), "a snapshot written with the log is preferred")
+    expect(prefer_flow_snapshot(None, 10), "a snapshot is used when the log is missing")
+    expect(not prefer_flow_snapshot(10, None), "a missing snapshot falls back to the log")
+    live_html = flow_body()
+    expect("Generators and game servers" in live_html, "live flow heading missing")
+    expect(IP_RE.search(live_html) is None, "live flow contains an address")
+    dry = column_state({"1246,37": 68, "8,8": 0}, 1246, 37)
+    expect(dry["state"] == "ground" and dry["y"] == 68 and "y" in dry, "measured ground height")
+    wet = column_state({"8,8": 0}, 8, 8)
+    expect(wet["state"] == "water" and "y" not in wet, "open water is not a teleport height")
+    missing = column_state({}, 3, 4)
+    expect(missing["state"] == "unmeasured" and "y" not in missing, "a missing column stays unmeasured")
     expect(IP_RE.search(drawn) is None, "map contains an address")
     expect(IP_RE.search(json.dumps(sample)) is None, "positions contain an address")
 

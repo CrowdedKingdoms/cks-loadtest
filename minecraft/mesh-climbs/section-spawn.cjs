@@ -77,6 +77,26 @@ function sectionSlot(index, count) {
 }
 
 /**
+ * The nine-server column table was measured for indexes 0..7199. 7200 divides
+ * by the nine section count, so a higher index uses that measured index's
+ * candidate list and stands in the same section. Indexes inside the window
+ * are unchanged. Four-server and 16-server tables are not folded.
+ */
+const NINE_MEASURED_SPAN = 7200;
+
+function columnSeed(index, sections) {
+  const i = Number(index) | 0;
+  const nine =
+    sections.length === 9 &&
+    sections[0] &&
+    sections[0].x1 - sections[0].x0 === 2000 &&
+    sections[0].z1 - sections[0].z0 === 2000;
+  if (!nine || NINE_MEASURED_SPAN % sections.length !== 0) return i;
+  if (i >= 0 && i < NINE_MEASURED_SPAN) return i;
+  return ((i % NINE_MEASURED_SPAN) + NINE_MEASURED_SPAN) % NINE_MEASURED_SPAN;
+}
+
+/**
  * A wave file lists indexes that should spawn. Indexes inside its window
  * that are not listed stay unplaced, so one section can be skipped while
  * the others still receive bots. No file means every index is admitted.
@@ -178,7 +198,7 @@ function sectionSpawn(index, sections, options) {
   const spanX = cell.x1 - inset - x0;
   const spanZ = cell.z1 - inset - z0;
   if (spanX <= 0 || spanZ <= 0) throw new Error("section " + cell.id + " is smaller than the inset");
-  const rand = mulberry32((i + 1) >>> 0);
+  const rand = mulberry32((columnSeed(i, sections) + 1) >>> 0);
   const attempts = opts.attempts == null ? ATTEMPTS : opts.attempts;
   const column = opts.column || null;
   let sawMeasured = false;
@@ -285,6 +305,27 @@ function selfTest() {
   check("p1 origin", P16_SECTIONS[0].id === "p1" && P16_SECTIONS[0].x0 === 0 && P16_SECTIONS[0].z0 === 0);
   check("p16 corner", P16_SECTIONS[15].id === "p16" && P16_SECTIONS[15].x0 === 6144 && P16_SECTIONS[15].z0 === 6144);
   check("ne chunks", fourOwner(2000, 2000) === "ne" && fourOwner(1999, 2000) === "north" && fourOwner(2000, 1999) === "east");
+  const foldedHome = sectionSpawn(2, NINE_SECTIONS, { column: dry });
+  const foldedHigh = sectionSpawn(7202, NINE_SECTIONS, { column: dry });
+  check(
+    "nine high index uses measured column",
+    foldedHigh.pending === false &&
+      foldedHigh.x === foldedHome.x &&
+      foldedHigh.z === foldedHome.z &&
+      foldedHigh.y === foldedHome.y &&
+      foldedHigh.server === foldedHome.server &&
+      foldedHigh.server === NINE_SECTIONS[7202 % 9].id,
+  );
+  const lowKept = sectionSpawn(2, NINE_SECTIONS, { column: dry });
+  check("nine low index stays", lowKept.x === foldedHome.x && lowKept.server === "p3");
+  const sixteenHigh = sectionSpawn(7202, P16_SECTIONS, { column: dry });
+  const sixteenLow = sectionSpawn(2, P16_SECTIONS, { column: dry });
+  check(
+    "sixteen is not folded",
+    sixteenHigh.pending === false &&
+      sixteenHigh.server === P16_SECTIONS[7202 % 16].id &&
+      (sixteenHigh.x !== sixteenLow.x || sixteenHigh.z !== sixteenLow.z),
+  );
   const os = require("os");
   const path = require("path");
   const admitPath = path.join(os.tmpdir(), "section-admit-self-test.json");
