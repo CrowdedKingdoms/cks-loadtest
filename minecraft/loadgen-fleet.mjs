@@ -30,7 +30,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_CRED = path.join(
   os.homedir(),
-  "Documents/CrowdedKingdoms/cks-project-root/creds/remote-creds/credentials.test.env",
+  ".local/state/cks-mc-loadtest-run/credentials.test.env",
 );
 const DEFAULT_PUB = path.join(
   os.homedir(),
@@ -45,7 +45,7 @@ const CRED = process.env.LOADGEN_SECRETS_ENV || DEFAULT_CRED;
 /** SoftMax Tailscale node keys often live beside OVH creds in load-testing-creds/. */
 const DEFAULT_TS_CRED = path.join(
   os.homedir(),
-  "Documents/CrowdedKingdoms/cks-project-root/creds/remote-creds/load-testing-creds/ben-dev-test.env",
+  ".local/state/cks-mc-loadtest-run/ben-dev-test.env",
 );
 const TS_CRED = process.env.LOADGEN_TS_SECRETS_ENV || DEFAULT_TS_CRED;
 const PUB_PATH = process.env.LOADGEN_SSH_PUBKEY || DEFAULT_PUB;

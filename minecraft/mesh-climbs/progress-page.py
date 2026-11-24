@@ -37,9 +37,6 @@ def find_project_root() -> Path:
         return Path(os.environ["CK_PROJECT_ROOT"]).expanduser()
     here = Path(__file__).resolve()
     for parent in here.parents:
-        nested = parent / "cks-project-root" / "seam-scaling-four-2026-11-19.csv"
-        if nested.exists():
-            return nested.parent
         if (parent / "seam-scaling-four-2026-11-19.csv").exists():
             return parent
     return here.parents[2]
