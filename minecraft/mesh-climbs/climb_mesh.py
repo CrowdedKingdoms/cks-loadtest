@@ -1068,7 +1068,10 @@ def wait_settled(mesh, loads, want):
             idle_since = None
             time.sleep(10)
             continue
-        if active >= want and (seen_busy or want == 0):
+        # busy is false here. An add of zero never sets busy, so a count that
+        # is already the target is settled. Waiting for seen_busy holds until
+        # the deadline and the hold never starts.
+        if active >= want:
             return last, active, True
         if seen_busy or any(isinstance(st, dict) and st.get("add_error") for st in last.values()):
             if idle_since is None:
