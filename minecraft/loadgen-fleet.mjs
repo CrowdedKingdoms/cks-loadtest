@@ -28,10 +28,6 @@ import os from "node:os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const DEFAULT_CRED = path.join(
-  os.homedir(),
-  "Documents/CrowdedKingdoms/cks-project-root/creds/remote-creds/credentials.test.env",
-);
 const DEFAULT_PUB = path.join(
   os.homedir(),
   ".local/state/cks-test-mc-cluster/id_ed25519.pub",
@@ -41,13 +37,9 @@ const DEFAULT_STATE = path.join(
   ".local/state/cks-mc-loadtest-run/loadgen-fleet.json",
 );
 
-const CRED = process.env.LOADGEN_SECRETS_ENV || DEFAULT_CRED;
-/** SoftMax Tailscale node keys often live beside OVH creds in load-testing-creds/. */
-const DEFAULT_TS_CRED = path.join(
-  os.homedir(),
-  "Documents/CrowdedKingdoms/cks-project-root/creds/remote-creds/load-testing-creds/ben-dev-test.env",
-);
-const TS_CRED = process.env.LOADGEN_TS_SECRETS_ENV || DEFAULT_TS_CRED;
+const CRED = process.env.LOADGEN_SECRETS_ENV || "";
+/** Unset means there is no Tailscale credential file. */
+const TS_CRED = process.env.LOADGEN_TS_SECRETS_ENV || "";
 const PUB_PATH = process.env.LOADGEN_SSH_PUBKEY || DEFAULT_PUB;
 const STATE = process.env.LOADGEN_STATE || DEFAULT_STATE;
 const REGION = process.env.LOADGEN_REGION || "US-EAST-VA-1";
@@ -87,11 +79,13 @@ function parseEnv(filePath) {
   return out;
 }
 
-if (!fs.existsSync(CRED)) {
-  throw new Error(`LOADGEN_SECRETS_ENV missing: ${CRED}`);
+if (!CRED || !fs.existsSync(CRED)) {
+  throw new Error(
+    CRED ? `LOADGEN_SECRETS_ENV missing: ${CRED}` : "LOADGEN_SECRETS_ENV is required",
+  );
 }
 const secrets = parseEnv(CRED);
-const tsSecrets = fs.existsSync(TS_CRED) ? parseEnv(TS_CRED) : {};
+const tsSecrets = TS_CRED && fs.existsSync(TS_CRED) ? parseEnv(TS_CRED) : {};
 const PROJECT = secrets.OVH_PROJECT_ID;
 if (
   !PROJECT ||
