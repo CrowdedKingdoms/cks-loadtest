@@ -1955,7 +1955,7 @@ def run(mesh):
                 caps[name] = active
                 log(mesh, f"{name} index {base} used {used} stops at {end}; not a mesh cap")
     last_hot = None
-    bend = None
+    bend_row = None
     needs_loadgen = False
     log(mesh, f"resume target={target}")
     seated, _room = keeper_room(mesh, loads, caps)
@@ -2046,7 +2046,7 @@ def run(mesh):
             next_binding=row.get("binding") or "",
             next_note=row.get("note") or "",
         ):
-            bend = last_hot
+            bend_row = last_hot
             break
         if (row.get("binding") or "") == "game":
             log(mesh, "a game server refused the pack before a hot hold; not a bend")
@@ -2063,8 +2063,8 @@ def run(mesh):
         target = held + max(step, 1)
         log(mesh, f"hold did not stand at {row['n_target']}; not a bend; next target {target}")
         continue
-    if bend:
-        write_holds(mesh, bend, False)
+    if bend_row:
+        write_holds(mesh, bend_row, False)
         log(mesh, "note written; connected bots were left up")
     else:
         log(mesh, "left the climb without a bend; note not rewritten")
