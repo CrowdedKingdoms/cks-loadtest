@@ -129,8 +129,18 @@ bool Bot::start() {
   }
   int sock = -1;
   for (addrinfo* it = res; it; it = it->ai_next) {
+#if defined(__APPLE__)
+    sock = ::socket(it->ai_family, SOCK_STREAM, it->ai_protocol);
+    if (sock < 0) continue;
+    int fl = ::fcntl(sock, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+    ::fcntl(sock, F_SETFD, FD_CLOEXEC);
+    int nosig = 1;
+    ::setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#else
     sock = ::socket(it->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, it->ai_protocol);
     if (sock < 0) continue;
+#endif
     int one = 1;
     ::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     int rc = ::connect(sock, it->ai_addr, it->ai_addrlen);
@@ -209,7 +219,11 @@ void Bot::onWritable() {
     send(pid(SbLogin::HELLO), hello.b);
   }
   while (!out_.empty()) {
+#if defined(__APPLE__)
+    ssize_t n = ::send(fd, out_.data(), out_.size(), 0);
+#else
     ssize_t n = ::send(fd, out_.data(), out_.size(), MSG_NOSIGNAL);
+#endif
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) return;
       fail("send");

@@ -4,14 +4,20 @@
 #include "PacketIds.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -26,7 +32,12 @@ static void fail(const std::string& why) {
 }
 
 static int listenEphemeral(int& port) {
+#if defined(__APPLE__)
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+#else
   int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#endif
   if (fd < 0) fail("socket");
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -45,7 +56,11 @@ static int listenEphemeral(int& port) {
 static void sendAll(int fd, const std::vector<uint8_t>& bytes) {
   size_t off = 0;
   while (off < bytes.size()) {
+#if defined(__APPLE__)
+    ssize_t n = ::send(fd, bytes.data() + off, bytes.size() - off, 0);
+#else
     ssize_t n = ::send(fd, bytes.data() + off, bytes.size() - off, MSG_NOSIGNAL);
+#endif
     if (n < 0) fail("send");
     off += static_cast<size_t>(n);
   }
@@ -182,7 +197,28 @@ static void serveOne(int client, Seen& seen, bool playLongEnoughForPunch) {
   }
 }
 
+static long selfRssKb() {
+#if defined(__APPLE__)
+  mach_task_basic_info info{};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+    return -1;
+  }
+  return static_cast<long>(info.resident_size / 1024);
+#else
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("VmRSS:", 0) == 0) return std::strtol(line.c_str() + 6, nullptr, 10);
+  }
+  return -1;
+#endif
+}
+
 int main() {
+#if defined(__APPLE__)
+  signal(SIGPIPE, SIG_IGN);
+#endif
   auto uuid = offlineUuid("Load1");
   const char* expect = "0992312cc0783fb3907d03a0edcf65ef";
   std::string hex;
@@ -273,14 +309,7 @@ int main() {
   for (auto& t : servers) t.join();
   if (joined.load() != 10) fail("ten-bot join count " + std::to_string(joined.load()));
 
-  std::ifstream status("/proc/self/status");
-  std::string line;
-  long rssKb = -1;
-  while (std::getline(status, line)) {
-    if (line.rfind("VmRSS:", 0) == 0) {
-      rssKb = std::strtol(line.c_str() + 6, nullptr, 10);
-    }
-  }
+  long rssKb = selfRssKb();
   std::cout << "protocol_test: ten bots VmRSS_kB=" << rssKb
             << " java_one_bot_heap_kB=" << (512 * 1024) << "\n";
   if (rssKb < 0) fail("no VmRSS");

@@ -1,6 +1,7 @@
 #include "fleet.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/select.h>
@@ -83,7 +84,12 @@ int listenOn(const std::string& where) {
   if (colon == std::string::npos) throw std::runtime_error("control bind needs host:port");
   std::string host = where.substr(0, colon);
   int port = std::stoi(where.substr(colon + 1));
+#if defined(__APPLE__)
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+#else
   int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#endif
   if (fd < 0) throw std::runtime_error("socket");
   int one = 1;
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -103,7 +109,11 @@ int listenOn(const std::string& where) {
 
 void reply(int fd, const std::string& line) {
   std::string out = line + "\n";
+#if defined(__APPLE__)
+  (void)::send(fd, out.data(), out.size(), 0);
+#else
   (void)::send(fd, out.data(), out.size(), MSG_NOSIGNAL);
+#endif
 }
 
 }  // namespace
