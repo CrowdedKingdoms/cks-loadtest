@@ -72,3 +72,5 @@ target_link_libraries(control_http_test PRIVATE loadtest_core)
 add_test(NAME control_http_test COMMAND control_http_test)
 
 install(TARGETS cks-loadtest cks-loadtest-ctl RUNTIME DESTINATION bin)
+
+add_subdirectory(minecraft/cpp)
