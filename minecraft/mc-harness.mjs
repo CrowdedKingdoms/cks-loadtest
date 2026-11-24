@@ -4,6 +4,7 @@
  * Each client is a LoadWalker JVM (same TCP seam choreography). Not Buddy UDP.
  */
 import http from "node:http";
+import net from "node:net";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -118,13 +119,22 @@ const MC_ALTERNATE =
   env("LT_MC_ALTERNATE", "") === "1" ||
   env("LT_MC_ALTERNATE", "").toLowerCase() === "true" ||
   (MC_HOST_EAST !== "" && env("LT_MC_ALTERNATE", "auto") !== "0");
-/** Delay after each bot's spawn before the next pose+login (ms). Default 2s. */
-const LOGIN_STAGGER_MS = Math.max(0, Number(env("LT_LOGIN_STAGGER_MS", "2000")));
+/** java keeps one JVM per bot. cpp is one ck-mc-load process for every bot. */
+const ENGINE = env("LT_MC_ENGINE", "java").toLowerCase();
+const CPP_BIN = env("LT_MC_CPP", path.join(__dirname, "cpp/build/ck-mc-load"));
+const CPP_CONTROL = env("LT_MC_CPP_CONTROL", "127.0.0.1:9119");
+const CPP_THREADS = env("LT_MC_THREADS", "1");
+const FLY_CLEARANCE = Number(env("LT_MC_FLY_CLEARANCE", "8"));
+/** Delay after each bot's spawn before the next pose+login (ms). Java defaults to 2s; cpp does not start a JVM. */
+const LOGIN_STAGGER_MS = Math.max(
+  0,
+  Number(env("LT_LOGIN_STAGGER_MS", ENGINE === "cpp" ? "100" : "2000")),
+);
 /** How long after spawn to treat an exit as "early" (retry window). Default 20s. */
 const EARLY_STABLE_MS = Math.max(1000, Number(env("LT_EARLY_STABLE_MS", "20000")));
 /** Extra attempts after the first when a bot dies early / transfer-fails. Default 2. */
 const ADD_RETRIES = Math.max(0, Number(env("LT_ADD_RETRIES", "2")));
-const MC_DIST = requireEnv("LT_MC_DIST");
+const MC_DIST = ENGINE === "cpp" ? env("LT_MC_DIST", "") : requireEnv("LT_MC_DIST");
 const INDEX_BASE = Number(env("LT_INDEX_BASE", "0"));
 const INDEX_LIMIT = Number(env("LT_INDEX_LIMIT", "8"));
 const INSTANCE_ID = env("LT_INSTANCE_ID", os.hostname());
@@ -190,10 +200,92 @@ if (CONTROL_BIND !== "off") {
   }
 }
 
-const runSh = path.join(MC_DIST, "run.sh");
-if (!fs.existsSync(runSh)) {
+const runSh = ENGINE === "cpp" ? "" : path.join(MC_DIST, "run.sh");
+if (ENGINE !== "cpp" && !fs.existsSync(runSh)) {
   console.error(`mc-harness: no run.sh in LT_MC_DIST=${MC_DIST}`);
   process.exit(2);
+}
+if (ENGINE !== "java" && ENGINE !== "cpp") {
+  console.error(`mc-harness: LT_MC_ENGINE must be java or cpp (got ${ENGINE})`);
+  process.exit(2);
+}
+
+let cppProc = null;
+let cppSocket = null;
+let cppChain = Promise.resolve();
+
+function poseNearOpts() {
+  if (ENGINE !== "cpp") return {};
+  return { maxY: Math.max(25, FLY_CLEARANCE + 16) };
+}
+
+function startCppProcess() {
+  if (!fs.existsSync(CPP_BIN)) {
+    console.error(`mc-harness: LT_MC_ENGINE=cpp but ${CPP_BIN} is not built`);
+    process.exit(2);
+  }
+  cppProc = spawn(CPP_BIN, ["--control", CPP_CONTROL, "--threads", CPP_THREADS], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  cppProc.stdout.on("data", (chunk) => process.stdout.write(chunk));
+  cppProc.stderr.on("data", (chunk) => process.stderr.write(chunk));
+  cppProc.on("exit", (code, signal) => {
+    console.error(`mc-harness: ck-mc-load exited code=${code} signal=${signal}`);
+    for (const state of clients.values()) {
+      if (state.engine === "cpp") state.alive = false;
+    }
+  });
+}
+
+function connectCpp() {
+  const [host, portText] = CPP_CONTROL.includes("]:")
+    ? [CPP_CONTROL.slice(1, CPP_CONTROL.lastIndexOf("]")), CPP_CONTROL.slice(CPP_CONTROL.lastIndexOf(":") + 1)]
+    : CPP_CONTROL.split(":");
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(Number(portText), host);
+    const fail = (err) => {
+      sock.destroy();
+      reject(err);
+    };
+    sock.once("error", fail);
+    sock.setEncoding("utf8");
+    let buf = "";
+    sock.on("data", (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, "");
+        buf = buf.slice(nl + 1);
+        const wait = sock._ckWait;
+        sock._ckWait = null;
+        if (!wait) continue;
+        if (line === "ok" || line.startsWith("ok ")) wait.resolve(line);
+        else wait.reject(new Error(line || "empty control reply"));
+      }
+    });
+    sock.once("connect", () => {
+      sock.removeListener("error", fail);
+      sock.on("error", (err) => console.error(`mc-harness: cpp control ${err.message}`));
+      cppSocket = sock;
+      resolve();
+    });
+  });
+}
+
+function cppCmd(line) {
+  const run = cppChain.then(
+    () =>
+      new Promise((resolve, reject) => {
+        if (!cppSocket) {
+          reject(new Error("cpp control is down"));
+          return;
+        }
+        cppSocket._ckWait = { resolve, reject };
+        cppSocket.write(`${line}\n`);
+      }),
+  );
+  cppChain = run.catch(() => {});
+  return run;
 }
 
 /** @type {Map<number, { proc: import('node:child_process').ChildProcess, name: string, side: string, host: string, port: number, transfers: number, east: number, west: number, relays: number, confirmedSide: string | null, alive: boolean, stable?: boolean, suppressExitRetry?: boolean, endpoint?: { side: string, host: string, port: number, ckServer: string } }>} */
@@ -216,6 +308,7 @@ const lifetime = {
   east_pauses: 0,
   west_pauses: 0,
   relays: 0,
+  north_pauses: 0,
   starts: 0,
   exits: 0,
 };
@@ -366,8 +459,15 @@ function stopWalker(globalIndex) {
   if (!state) return;
   // Harness-initiated kills must not trigger post-stable transfer retries.
   state.suppressExitRetry = true;
+  if (state.engine === "cpp") {
+    state.alive = false;
+    cppCmd(`stop ${state.name}`).catch((err) => {
+      console.error(`mc-harness: stop ${state.name}: ${err.message}`);
+    });
+    return;
+  }
   try {
-    if (state.alive) state.proc.kill("SIGTERM");
+    if (state.alive && state.proc) state.proc.kill("SIGTERM");
   } catch {
     /* ignore */
   }
@@ -403,30 +503,59 @@ function spawnWalker(globalIndex, endpoint, runId) {
   const keptRun = runId || previousRun;
   const { host, port, side } = endpoint;
   const logPath = walkerLogPath(name);
-  const logFd = fs.openSync(logPath, "a");
   const motion = process.env.LT_MC_MOTION || "";
-  const pathMode = process.env.LT_MC_PATH || (motion === "wander" || motion === "shuttle" || motion === "triangle" ? motion : "");
-  const proc = spawn(runSh, [name, host, String(port)], {
-    cwd: MC_DIST,
-    env: {
-      ...process.env,
-      ...(pathMode ? { LT_MC_PATH: pathMode } : {}),
-      ...(process.env.LT_MC_WANDER_BPS ? { LT_MC_WANDER_BPS: process.env.LT_MC_WANDER_BPS } : {}),
-    },
-    stdio: ["ignore", logFd, logFd],
-    detached: false,
-  });
-  fs.closeSync(logFd);
-
+  const pathMode =
+    process.env.LT_MC_PATH ||
+    (motion === "wander" || motion === "shuttle" || motion === "triangle" ? motion : "");
   let logMark = 0;
   try {
     logMark = fs.statSync(logPath).size;
   } catch {
     logMark = 0;
   }
+  let proc = null;
+  if (ENGINE === "cpp") {
+    const waypoints = process.env.LT_MC_WAYPOINTS || "-";
+    const bps = process.env.LT_MC_WANDER_BPS || "2";
+    const maxS = process.env.LT_MC_MAX_RUNTIME_S || "180";
+    const fields = [
+      "add",
+      name,
+      host,
+      String(port),
+      pathMode || "seam",
+      bps,
+      String(FLY_CLEARANCE),
+      maxS,
+      waypoints,
+      logPath,
+    ];
+    cppCmd(fields.join(" ")).catch((err) => {
+      console.error(`mc-harness: cpp add ${name}: ${err.message}`);
+    });
+  } else {
+    const logFd = fs.openSync(logPath, "a");
+    proc = spawn(runSh, [name, host, String(port)], {
+      cwd: MC_DIST,
+      env: {
+        ...process.env,
+        ...(pathMode ? { LT_MC_PATH: pathMode } : {}),
+        ...(process.env.LT_MC_WANDER_BPS ? { LT_MC_WANDER_BPS: process.env.LT_MC_WANDER_BPS } : {}),
+      },
+      stdio: ["ignore", logFd, logFd],
+      detached: false,
+    });
+    fs.closeSync(logFd);
+    try {
+      logMark = fs.statSync(logPath).size;
+    } catch {
+      logMark = 0;
+    }
+  }
 
   const state = {
     proc,
+    engine: ENGINE,
     name,
     side,
     host,
@@ -465,6 +594,10 @@ function spawnWalker(globalIndex, endpoint, runId) {
         lifetime.transfers++;
         if (openWindow) openWindow.transfers++;
         state.earlyExitReason = "transfer";
+        if (state.engine === "cpp") {
+          state.alive = false;
+          maybeSchedulePostStableTransferRetry(globalIndex, state);
+        }
       }
       // Pause stats count only a finished hold. "east pause start" is not a completed pause.
       if (line.includes("east pause done")) {
@@ -476,6 +609,17 @@ function spawnWalker(globalIndex, endpoint, runId) {
         state.west++;
         lifetime.west_pauses++;
         if (openWindow) openWindow.west++;
+      }
+      if (line.includes("north pause done")) {
+        state.north = (state.north || 0) + 1;
+        lifetime.north_pauses++;
+        if (openWindow) openWindow.north = (openWindow.north || 0) + 1;
+      }
+      if (
+        state.engine === "cpp" &&
+        (line.includes(" closed:") || line.includes(" max runtime"))
+      ) {
+        state.alive = false;
       }
       // A crossing counts when the server's position moves the bot from one owned side to the other.
       // A pause line, finished or not, does not. A visible transfer packet is a failure, counted above.
@@ -507,13 +651,15 @@ function spawnWalker(globalIndex, endpoint, runId) {
     }
   }, 500);
 
-  proc.on("exit", (code, signal) => {
-    clearInterval(watch);
-    state.alive = false;
-    lifetime.exits++;
-    console.error(`mc-harness: ${name} exited code=${code} signal=${signal}`);
-    maybeSchedulePostStableTransferRetry(globalIndex, state);
-  });
+  if (proc) {
+    proc.on("exit", (code, signal) => {
+      clearInterval(watch);
+      state.alive = false;
+      lifetime.exits++;
+      console.error(`mc-harness: ${name} exited code=${code} signal=${signal}`);
+      maybeSchedulePostStableTransferRetry(globalIndex, state);
+    });
+  }
 
   console.log(
     `${ts()} mc-harness: started ${name} -> ${side} ${host}:${port} log=${logPath}`,
@@ -628,7 +774,7 @@ async function waitEarlyOutcome(globalIndex, timeoutMs, target) {
     const text = readSessionLog(state, globalIndex);
     const pose = parseLatestPlayPose(text);
     if (pose && target) {
-      if (nearSeam(pose, target)) {
+      if (nearSeam(pose, target, poseNearOpts())) {
         offSeamSince = 0;
       } else {
         const stranded =
@@ -655,7 +801,7 @@ async function waitEarlyOutcome(globalIndex, timeoutMs, target) {
     // Still alive: require near-seam placement when we have a pose sample.
     const text = readSessionLog(state, globalIndex);
     const pose = parseLatestPlayPose(text);
-    if (pose && target && !nearSeam(pose, target)) {
+    if (pose && target && !nearSeam(pose, target, poseNearOpts())) {
       return { ok: false, reason: "spawn-miss", pos: pose };
     }
     return { ok: true, pos: pose || undefined };
@@ -878,6 +1024,7 @@ function statusJson(runId = "") {
     add_error: addError || undefined,
     current_rung: currentRung,
     mode: "minecraft-loadwalker",
+    engine: ENGINE,
     mc_host: MC_HOST_WEST || MC_HOST,
     mc_host_west: MC_HOST_WEST || MC_HOST || undefined,
     mc_host_east: MC_HOST_EAST || undefined,
@@ -929,6 +1076,7 @@ function statsJson() {
       transfers: lifetime.transfers,
       east_pauses: lifetime.east_pauses,
       west_pauses: lifetime.west_pauses,
+      north_pauses: lifetime.north_pauses,
       relays: lifetime.relays,
     },
   };
@@ -954,11 +1102,13 @@ function closeRung() {
     opened_at: openWindow.openedAt,
     closed_at: Date.now(),
     mode: "minecraft-loadwalker",
+    engine: ENGINE,
     window: {
       counters: {
         transfers: openWindow.transfers,
         east_pauses: openWindow.east,
         west_pauses: openWindow.west,
+        north_pauses: openWindow.north || 0,
         relays: openWindow.relays,
       },
     },
@@ -977,9 +1127,21 @@ function closeRung() {
 
 function shutdown() {
   shuttingDown = true;
+  if (ENGINE === "cpp") {
+    cppCmd("quit").catch(() => {});
+    setTimeout(() => {
+      try {
+        cppProc?.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      process.exit(0);
+    }, 300);
+    return;
+  }
   for (const c of clients.values()) {
     try {
-      c.proc.kill("SIGTERM");
+      c.proc?.kill("SIGTERM");
     } catch {
       /* ignore */
     }
@@ -1053,15 +1215,43 @@ function listen() {
   });
 }
 
-ensureStatsDir();
-listen();
-if (START_CLIENTS > 0) {
-  const err = requestAdd(START_CLIENTS, env("LT_RUN_ID", "boot"));
-  if (err) {
-    console.error("mc-harness: initial add failed:", err);
-    process.exit(2);
+async function boot() {
+  if (ENGINE === "cpp") {
+    startCppProcess();
+    let last = null;
+    for (let i = 0; i < 50; i++) {
+      try {
+        await connectCpp();
+        last = null;
+        break;
+      } catch (err) {
+        last = err;
+        await sleep(50);
+      }
+    }
+    if (!cppSocket) {
+      console.error(`mc-harness: ck-mc-load control did not come up (${last?.message || "no socket"})`);
+      try {
+        cppProc?.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      process.exit(2);
+    }
+    console.log(`mc-harness: ck-mc-load control ${CPP_CONTROL}`);
+  }
+  ensureStatsDir();
+  listen();
+  if (START_CLIENTS > 0) {
+    const err = requestAdd(START_CLIENTS, env("LT_RUN_ID", "boot"));
+    if (err) {
+      console.error("mc-harness: initial add failed:", err);
+      process.exit(2);
+    }
   }
 }
+
+boot();
 
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
