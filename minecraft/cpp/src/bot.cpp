@@ -1173,6 +1173,9 @@ void Bot::tick() {
   if (rejoinAttempts_ > 0 && ticks_ - placedAtTick_ >= kRejoinResetTicks) rejoinAttempts_ = 0;
   if (!sentAbilities_) sendAbilities();
   tickMotion();
+  if (javaWanderPath() && ticks_ % 40 == 0) {
+    say(spec_.name + " wander x=" + f3(x_) + " z=" + f3(z_) + " yaw=" + std::to_string(javaWander_.yaw));
+  }
   noteCell();
   if (statusNow_ || statusDue(ticks_, statusOffset_)) sayStatus();
   settle();
