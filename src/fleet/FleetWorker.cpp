@@ -1121,6 +1121,14 @@ void FleetWorker::onReleased(Session& s, const Released& r, int64_t now) {
             break;
         case RELEASED_SIGN_IN_ENDED: {
             inc(st.released2Held);
+            static std::atomic<bool> said2{false};
+            if (!said2.exchange(true)) {
+                std::fprintf(stderr,
+                             "[fleet] FLEET_RELEASED reason 2 (the sign-in ended) for player %d "
+                             "on session %d: signing the player in again. Later ones are "
+                             "counted in the summary\n",
+                             p.index, s.index);
+            }
             if (p.carry.active) break; // a carry with a newer token is on its way
             const uint32_t v = world_.creds[static_cast<size_t>(p.index)].version();
             if (v != p.curVersion && !(v & 1)) {
@@ -1131,11 +1139,20 @@ void FleetWorker::onReleased(Session& s, const Released& r, int64_t now) {
             }
             break;
         }
-        case RELEASED_IDLE:
+        case RELEASED_IDLE: {
             inc(st.released5Held);
+            static std::atomic<bool> said5{false};
+            if (!said5.exchange(true)) {
+                std::fprintf(stderr,
+                             "[fleet] FLEET_RELEASED reason 5 (idle) for player %d on session "
+                             "%d: carrying the player again. Later ones are counted in the "
+                             "summary\n",
+                             p.index, s.index);
+            }
             inc(st.recarriedAfterRelease);
             if (!p.carry.active) startCarry(s, p, CarryCause::Recarry, now);
             break;
+        }
         default:
             inc(st.releasedOtherHeld);
             inc(st.recarriedAfterRelease);

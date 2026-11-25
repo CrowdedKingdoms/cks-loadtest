@@ -144,10 +144,11 @@ Signing 3,000 players in at 20 a second takes 150 seconds before the 30 minutes 
 minutes starts without signing anyone in. Roster files hold live tokens; `.gitignore`
 covers names that end in `-roster.json`.
 
-The progress line goes to stderr every 5 seconds, and the summary goes to stdout:
+The progress line goes to stderr every 5 seconds, and the summary goes to stdout. This
+line is from a dry run:
 
 ```
-[fleet] t=45s sessions=100 players=3000/3000 | upd=14998/s notif=35016/s | cross=76.2/s (target 75.0) speed=0.353 | carry p50=0.1ms p99=0.3ms | released ok=3454 missing=0 | refused=0 own_state=0 | api busy=0 limited=0 crossing=0 | lag p99=1.12ms
+[fleet] t=45s sessions=100 players=3000/3000 | upd=14998/s notif=35016/s | cross=76.2/s (target 75.0) speed=0.353 | carry p50=0.1ms p99=0.3ms | released ok=3454 missing=0 r2=0 r5=0 | refused=0 own_state=0 | api busy=0 limited=0 crossing=0 | lag p99=1.12ms
 ```
 
 ## The options and their defaults

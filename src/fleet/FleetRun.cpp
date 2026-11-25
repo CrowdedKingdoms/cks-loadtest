@@ -361,14 +361,16 @@ void FleetRun::progress(double windowS) {
             log_,
             "[fleet] t=%.0fs sessions=%d players=%d/%d | upd=%.0f/s notif=%.0f/s | "
             "cross=%.1f/s (target %.1f) speed=%.3f | carry p50=%.1fms p99=%.1fms | "
-            "released ok=%" PRIu64 " missing=%" PRIu64 " | refused=%" PRIu64 " own_state=%" PRIu64
+            "released ok=%" PRIu64 " missing=%" PRIu64 " r2=%" PRIu64 " r5=%" PRIu64
+            " | refused=%" PRIu64 " own_state=%" PRIu64
             " | api busy=%" PRIu64 " limited=%" PRIu64 " crossing=%" PRIu64 " | lag p99=%.2fms\n",
             // A player in transit between two workers can be in both gauges for an instant.
             windowS, cfg_.servers, std::min(sumCarried(), cfg_.players), cfg_.players, updPs,
             notifPs, crossPs,
             cfg_.crossRate, world_->speed.load(), stats_.carryLatency.percentileMs(0.50),
             stats_.carryLatency.percentileMs(0.99), get(stats_.releaseReceived),
-            get(stats_.releaseMissing), get(stats_.playerMessagesRefused),
+            get(stats_.releaseMissing), get(stats_.releasedByReason[2]),
+            get(stats_.releasedByReason[5]), get(stats_.playerMessagesRefused),
             get(stats_.ownStateReceived), busy, limited,
             stats_.api.byCause(ApiCause::Crossing) + get(stats_.api.requestsFromCrossingPath),
             stats_.sendLag.percentileMs(0.99));
