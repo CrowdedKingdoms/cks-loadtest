@@ -498,7 +498,7 @@ echo started
 
 # ----- watching -----
 
-METER = re.compile(r"Crowded Kingdoms meter: tps=(\S+) msptAvg=(\S+) msptP95=(\S+) msptMax=(\S+) players=(\d+) links=(\d+) heapMB=(\d+) parts\[(.*?)\](?: sent\[(.*?)\])?(?: link\[(.*?)\])?")
+METER = re.compile(r"Crowded Kingdoms meter: tps=(\S+) msptAvg=(\S+) msptP95=(\S+) msptMax=(\S+) players=(\d+) links=(\d+) heapMB=(\d+) parts\[(.*?)\](?: sent\[(.*?)\])?(?: link\[(.*?)\])?(?: signin\[(.*?)\])?")
 
 
 def last_meter(text):
@@ -537,7 +537,7 @@ def cmd_watch(args):
                      "p95": float(meter.group(3)) if meter else None, "max": float(meter.group(4)) if meter else None,
                      "players": int(meter.group(5)) if meter else None, "links": int(meter.group(6)) if meter else None,
                      "heap": int(meter.group(7)) if meter else None, "parts": meter.group(8) if meter else "", "sent": (meter.group(9) or "") if meter else "", "link": (meter.group(10) or "") if meter else "", "load": load_avg.group(1) if load_avg else "",
-                     "behind": behind, "seamTps": min(seam) if seam else None})
+                     "behind": behind, "seamTps": min(seam) if seam else None, "signin": (meter.group(11) or "") if meter else ""})
     if args.json:
         print(json.dumps(rows))
         return
@@ -556,6 +556,38 @@ def cmd_watch(args):
         print(f"-- {len(live)} of {len(rows)} servers reporting; players {sum(r['players'] for r in live)}; tps min {tps[0]:.1f} median {tps[len(tps) // 2]:.1f}; "
               f"mspt p95 median {p95[len(p95) // 2]:.1f} worst {p95[-1]:.1f}; servers under 19.5 tps: {sum(1 for t in tps if t < 19.5)}; "
               f"over 50 ms p95: {sum(1 for p in p95 if p > 50)}")
+        signin = sign_ins(live)
+        if signin:
+            print("-- sign-ins since the servers started: " + signin)
+
+
+def sign_ins(rows):
+    """Every server's sign-in counters (the meter's signin[...], since each started) added up: sent, ok, told to wait,
+    retried to success, given up, sessions that did not open, the waits CK named and refusals by code. "" on a jar
+    that has none."""
+    totals, codes, low, high, any_ = {}, {}, None, 0, False
+    for row in rows:
+        text = row.get("signin") or ""
+        if not text:
+            continue
+        any_ = True
+        for key, value in re.findall(r"(\w+)=(\S+)", text):
+            if key == "afterMs":
+                a, _, b = value.partition("-")
+                if int(b) > 0:
+                    low = int(a) if low is None else min(low, int(a))
+                    high = max(high, int(b))
+            elif key == "codes":
+                for pair in value.split(","):
+                    name, _, count = pair.partition(":")
+                    if count:
+                        codes[name] = codes.get(name, 0) + int(count)
+            else:
+                totals[key] = totals.get(key, 0) + int(value)
+    if not any_:
+        return ""
+    by = ",".join(f"{k}:{v}" for k, v in sorted(codes.items())) or "-"
+    return " ".join(f"{k}={v}" for k, v in totals.items()) + f" afterMs={low or 0}-{high} codes={by}"
 
 
 def cmd_say(args):
