@@ -215,6 +215,8 @@ private:
         int64_t lastRxNs = 0;
         int64_t lastMoveNs = 0;
         int64_t moveRetryAtNs = 0;
+        bool movePending = false;    // told to move while the last move was settling
+        MoveTrigger pendingTrigger = MoveTrigger::ReconnectCommand;
         int errStreak = 0;
         int sendErrStreak = 0;
         std::vector<std::unique_ptr<Player>> players;

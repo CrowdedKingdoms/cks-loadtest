@@ -89,6 +89,23 @@ add_executable(control_http_test tests/control_http_test.cpp)
 target_link_libraries(control_http_test PRIVATE loadtest_core)
 add_test(NAME control_http_test COMMAND control_http_test)
 
-install(TARGETS cks-loadtest cks-loadtest-ctl RUNTIME DESTINATION bin)
+# The fleet load client's tests. The last three run the binary itself: its
+# built-in checks, a dry run (no network), and a live run refused for want of
+# the org token.
+foreach(fleet_test fleet_wire_test fleet_world_test fleet_api_test fleet_run_test)
+  add_executable(${fleet_test} tests/${fleet_test}.cpp)
+  target_link_libraries(${fleet_test} PRIVATE fleet_load_core)
+  add_test(NAME ${fleet_test} COMMAND ${fleet_test})
+endforeach()
+add_test(NAME fleet_self_test COMMAND ck-fleet-load --self-test)
+add_test(NAME fleet_dry_run
+         COMMAND ck-fleet-load --dry-run --servers 16 --players 320 --cross-rate 40 --dry-run-s 3)
+add_test(NAME fleet_needs_org_token
+         COMMAND ck-fleet-load --api https://api.example.invalid/graphql --app 1 --servers 1 --players 1)
+set_tests_properties(fleet_needs_org_token PROPERTIES
+  ENVIRONMENT "CK_ORG_TOKEN="
+  WILL_FAIL TRUE)
+
+install(TARGETS cks-loadtest cks-loadtest-ctl ck-fleet-load RUNTIME DESTINATION bin)
 
 add_subdirectory(minecraft/cpp)

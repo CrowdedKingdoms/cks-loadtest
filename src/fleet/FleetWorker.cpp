@@ -330,6 +330,7 @@ void FleetWorker::activate(Session& s, const FleetSessionInfo& info, int64_t now
     s.lastRxNs = now;
     s.errStreak = 0;
     s.sendErrStreak = 0;
+    s.movePending = false;
 }
 
 void FleetWorker::closeSocket(Session& s) {
@@ -514,6 +515,8 @@ void FleetWorker::sweep(int64_t now) {
 
         if (s.state == Session::State::Active) {
             ++active;
+            if (s.movePending && now - s.lastMoveNs >= MOVE_COOLDOWN_NS)
+                requestMove(s, s.pendingTrigger, now);
             if (cfg.rxSilentS > 0 && now >= s.activateAtNs && !s.players.empty() &&
                 now - s.lastRxNs > static_cast<int64_t>(cfg.rxSilentS) * SEC) {
                 requestMove(s, MoveTrigger::RxSilence, now);
@@ -759,7 +762,14 @@ void FleetWorker::requestSignInAgain(Player& p, int64_t now) {
 
 void FleetWorker::requestMove(Session& s, MoveTrigger trigger, int64_t now) {
     if (s.state != Session::State::Active) return;
-    if (s.lastMoveNs && now - s.lastMoveNs < MOVE_COOLDOWN_NS) return; // the last move settles
+    if (s.lastMoveNs && now - s.lastMoveNs < MOVE_COOLDOWN_NS) {
+        // The last move is still settling. Do it when that is over (sweep), so a
+        // command that arrives now is not lost.
+        s.movePending = true;
+        s.pendingTrigger = trigger;
+        return;
+    }
+    s.movePending = false;
     inc(world_.stats.sessionMoves[static_cast<size_t>(trigger)]);
     closeSocket(s);
     s.state = Session::State::Moving;

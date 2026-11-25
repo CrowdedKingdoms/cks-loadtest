@@ -104,6 +104,7 @@ private:
     std::atomic<int> tokensReady_{0};
 
     std::vector<int64_t> refreshNotBeforeMs_;    // by player; the main thread's only
+    std::vector<uint32_t> refreshTriedVersion_;  // the token version the last attempt started from
     std::vector<int64_t> keepNotBeforeMs_;       // by session
     std::unique_ptr<CrossRateController> controller_;
     double startSpeed_ = 0;

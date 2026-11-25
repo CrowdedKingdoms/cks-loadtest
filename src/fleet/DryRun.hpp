@@ -41,9 +41,15 @@ struct FakeRunResult {
 
 /// Run `cfg` with no network: the stand-in answers the Application API and the
 /// realtime wire. `onTick` is called during the measured window with the seconds
-/// since it opened, to inject faults.
+/// since it opened, to inject faults; `before` is called once before the run.
 FakeRunResult runAgainstFake(FleetConfig cfg, FakeRealtime::Options options,
                              std::atomic<bool>& stop, FILE* log,
+                             std::function<void(double, FakeRealtime&)> onTick = nullptr,
+                             std::function<void(FakeRealtime&)> before = nullptr);
+
+/// The same against a stand-in the caller keeps, so two runs can share one.
+FakeRunResult runAgainstFake(FakeRealtime& fake, FleetConfig cfg, std::atomic<bool>& stop,
+                             FILE* log,
                              std::function<void(double, FakeRealtime&)> onTick = nullptr);
 
 /// The built-in checks behind `--self-test`. Prints one line a check to stdout

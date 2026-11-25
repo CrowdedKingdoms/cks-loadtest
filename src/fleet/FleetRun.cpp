@@ -271,10 +271,15 @@ void FleetRun::housekeeping() {
     const int64_t lead = static_cast<int64_t>(cfg_.tokenRefreshLeadS) * 1000;
     for (int n = 0; n < cfg_.players; ++n) {
         SharedCreds& creds = world_->creds[static_cast<size_t>(n)];
-        if (creds.version() == 0) continue;
+        const uint32_t version = creds.version();
+        if (version == 0) continue;
         if (creds.expiresAtMs() - nowMs > lead) continue;
-        if (nowMs < refreshNotBeforeMs_[static_cast<size_t>(n)]) continue;
+        // After an attempt that did not bring a new token, wait before the next.
+        if (version == refreshTriedVersion_[static_cast<size_t>(n)] &&
+            nowMs < refreshNotBeforeMs_[static_cast<size_t>(n)])
+            continue;
         if (creds.busy.exchange(true)) continue;
+        refreshTriedVersion_[static_cast<size_t>(n)] = version;
         refreshNotBeforeMs_[static_cast<size_t>(n)] = nowMs + 10000;
         Job j;
         j.kind = Job::Kind::RefreshToken;
@@ -373,6 +378,7 @@ int FleetRun::run() {
     sessions_.assign(static_cast<size_t>(cfg_.servers), FleetSessionInfo{});
     sessionOpen_.assign(static_cast<size_t>(cfg_.servers), 0);
     refreshNotBeforeMs_.assign(static_cast<size_t>(cfg_.players), 0);
+    refreshTriedVersion_.assign(static_cast<size_t>(cfg_.players), 0);
     keepNotBeforeMs_.assign(static_cast<size_t>(cfg_.servers), 0);
 
     // The speed that should give the target crossing rate; the controller trims it.
@@ -487,7 +493,8 @@ int FleetRun::run() {
         const int64_t waitFrom = nowNs();
         const int64_t patience =
             static_cast<int64_t>(cfg_.sessionSettleMs + 2 * cfg_.carryGiveUpMs + 2000) * MS;
-        while (setupOk && alive() && sumCarried() < cfg_.players &&
+        while (setupOk && alive() &&
+               sumCarried() + static_cast<int>(get(stats_.playersFailed)) < cfg_.players &&
                nowNs() - waitFrom < patience) {
             housekeeping();
             sleepMs(10);
