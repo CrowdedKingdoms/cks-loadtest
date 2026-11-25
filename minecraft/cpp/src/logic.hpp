@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -175,5 +176,40 @@ struct FleetStats {
 
 // The `stats` reply, without the newline.
 std::string formatStats(const FleetStats& stats);
+
+// Overworld MOTION_BLOCKING heightmap, as ClientboundLevelChunkWithLightPacket sends it.
+// 384 blocks of world height pack into 9 bits. The stored value plus the min build height
+// (-64) is the feet Y: the first block above the surface. An empty column stores 0.
+inline constexpr int kMotionBlockingId = 4;
+inline constexpr int kHeightmapBits = 9;
+inline constexpr int kHeightmapColumns = 256;
+inline constexpr int kHeightmapLongs = 37;  // ceil(256 / (64 / 9))
+inline constexpr int kOverworldMinY = -64;
+inline constexpr int16_t kNoColumn = static_cast<int16_t>(-32768);
+
+// Feet Y of one local column, or false when `count` is not an overworld heightmap or the
+// column has no motion-blocking block.
+bool motionColumnFeet(const uint64_t* data, int count, int localX, int localZ, int& feetY);
+
+// One tick toward `feet`. A gap of at most 8 blocks closes in that tick (a clearance of 8
+// is accepted; a much larger single step is rejected). A longer fall uses vanilla gravity
+// (subtract 0.08, then * 0.98) and does not pass `feet`. A longer climb is 8 blocks a tick.
+void approachGround(double& y, double& vy, double feet);
+
+// ChunkPos as FriendlyByteBuf writes it: x in the low 32 bits, z in the high 32.
+inline uint64_t chunkKey(int cx, int cz) {
+  return static_cast<uint64_t>(static_cast<uint32_t>(cx)) |
+         (static_cast<uint64_t>(static_cast<uint32_t>(cz)) << 32);
+}
+
+// MOTION_BLOCKING columns from a level-chunk-with-light body (packet id already removed).
+struct ChunkGround {
+  int x = 0;
+  int z = 0;
+  std::array<int16_t, kHeightmapColumns> feet{};
+  bool ok = false;
+};
+
+bool readChunkGround(const uint8_t* body, size_t len, ChunkGround& out);
 
 }  // namespace ckmc

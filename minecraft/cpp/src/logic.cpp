@@ -1,5 +1,7 @@
 #include "logic.hpp"
 
+#include "buf.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -200,6 +202,74 @@ std::string formatStats(const FleetStats& s) {
   field("crossings", s.crossings);
   field("tick_ms_max", s.tickMsMax);
   return out;
+}
+
+bool motionColumnFeet(const uint64_t* data, int count, int localX, int localZ, int& feetY) {
+  if (data == nullptr || count != kHeightmapLongs) return false;
+  if (localX < 0 || localX > 15 || localZ < 0 || localZ > 15) return false;
+  int index = localX + localZ * 16;
+  int valuesPerLong = 64 / kHeightmapBits;
+  int cell = index / valuesPerLong;
+  int bit = (index - cell * valuesPerLong) * kHeightmapBits;
+  uint64_t mask = (1ULL << kHeightmapBits) - 1ULL;
+  int raw = static_cast<int>((data[cell] >> bit) & mask);
+  if (raw <= 0) return false;
+  feetY = raw + kOverworldMinY;
+  return true;
+}
+
+void approachGround(double& y, double& vy, double feet) {
+  constexpr double kSnap = 8.0;
+  double gap = y - feet;
+  if (std::fabs(gap) <= 1e-6 || std::fabs(gap) <= kSnap) {
+    y = feet;
+    vy = 0;
+    return;
+  }
+  if (gap > 0) {
+    vy = (vy - 0.08) * 0.98;
+    if (vy < -3.92) vy = -3.92;
+    y += vy;
+    if (y <= feet) {
+      y = feet;
+      vy = 0;
+    }
+    return;
+  }
+  vy = 0;
+  y = std::min(feet, y + kSnap);
+}
+
+bool readChunkGround(const uint8_t* body, size_t len, ChunkGround& out) {
+  out = {};
+  out.feet.fill(kNoColumn);
+  Buf b = bufFrom(body, len);
+  out.x = b.rI32();
+  out.z = b.rI32();
+  uint32_t maps = b.rVar();
+  if (!b.ok || maps > 16) return false;
+  uint64_t packed[kHeightmapLongs];
+  bool found = false;
+  for (uint32_t i = 0; i < maps && b.ok; i++) {
+    uint32_t type = b.rVar();
+    uint32_t n = b.rVar();
+    if (!b.ok || n > 64) return false;
+    if (type == static_cast<uint32_t>(kMotionBlockingId) && n == static_cast<uint32_t>(kHeightmapLongs)) {
+      for (int j = 0; j < kHeightmapLongs; j++) packed[j] = static_cast<uint64_t>(b.rI64());
+      found = b.ok;
+    } else {
+      for (uint32_t j = 0; j < n; j++) b.rI64();
+    }
+  }
+  if (!b.ok || !found) return false;
+  for (int i = 0; i < kHeightmapColumns; i++) {
+    int feet = 0;
+    if (motionColumnFeet(packed, kHeightmapLongs, i & 15, i >> 4, feet)) {
+      out.feet[static_cast<size_t>(i)] = static_cast<int16_t>(feet);
+    }
+  }
+  out.ok = true;
+  return true;
 }
 
 }  // namespace ckmc

@@ -2,11 +2,13 @@
 
 #include "logic.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -197,6 +199,16 @@ class Bot {
   double y_ = 0;
   double z_ = 0;
   double surfaceY_ = 0;
+  // Vertical speed while a wander bot is falling onto the heightmap. 0 when standing.
+  double fallVy_ = 0;
+  // True once a chunk has given this bot a place to stand, so a missing column does not
+  // pop it back up to the server Y it spawned at.
+  bool groundSeeking_ = false;
+  // The flying bit last sent. Ground wander sends it clear so the server will not keep
+  // the bot in the air.
+  bool abilitiesFlying_ = false;
+  // MOTION_BLOCKING feet Y per chunk. Missing columns are kNoColumn.
+  std::unordered_map<uint64_t, std::array<int16_t, kHeightmapColumns>> ground_;
   // Set while `altitude` is on, and afterwards until the bot is back at the clearance height.
   bool ramping_ = false;
   double serverX_ = 0;
@@ -263,6 +275,12 @@ class Bot {
   double wanderStep() const;
   const WanderBox& activeBox() const;
   void sendAbilities();
+  // path=wander, not rallied, not climbing to an altitude. Those bots stand on the ground.
+  bool groundStand() const;
+  bool columnFeet(double x, double z, int& feet) const;
+  // Highest motion-blocking feet under the bot's corners, or false while a corner's chunk
+  // is not in yet. Same reach HeightmapSnap uses (0.3).
+  bool supportFeet(double x, double z, double& feet) const;
   // Ends the bot and logs `closed: why`.
   void fail(const std::string& why);
   // The connection is gone. Schedules a rejoin when the bot has been placed and has attempts left.
