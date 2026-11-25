@@ -80,7 +80,14 @@ bool FleetRun::pop(Job& out) {
 
 void FleetRun::apiThread() {
     // One transport a thread: a libcurl handle is not shared.
-    FleetApi api(deps_.makeTransport(), cfg_.orgToken, cfg_.appId, stats_.api, &stop_);
+    std::unique_ptr<ApiTransport> transport;
+    try {
+        transport = deps_.makeTransport();
+    } catch (const std::exception& e) {
+        setFatal(std::string("cannot reach the Application API: ") + e.what());
+        return;
+    }
+    FleetApi api(std::move(transport), cfg_.orgToken, cfg_.appId, stats_.api, &stop_);
     Job j;
     while (pop(j)) {
         runJob(api, j);
@@ -356,7 +363,9 @@ void FleetRun::progress(double windowS) {
             "cross=%.1f/s (target %.1f) speed=%.3f | carry p50=%.1fms p99=%.1fms | "
             "released ok=%" PRIu64 " missing=%" PRIu64 " | refused=%" PRIu64 " own_state=%" PRIu64
             " | api busy=%" PRIu64 " limited=%" PRIu64 " crossing=%" PRIu64 " | lag p99=%.2fms\n",
-            windowS, cfg_.servers, sumCarried(), cfg_.players, updPs, notifPs, crossPs,
+            // A player in transit between two workers can be in both gauges for an instant.
+            windowS, cfg_.servers, std::min(sumCarried(), cfg_.players), cfg_.players, updPs,
+            notifPs, crossPs,
             cfg_.crossRate, world_->speed.load(), stats_.carryLatency.percentileMs(0.50),
             stats_.carryLatency.percentileMs(0.99), get(stats_.releaseReceived),
             get(stats_.releaseMissing), get(stats_.playerMessagesRefused),
@@ -446,6 +455,15 @@ int FleetRun::run() {
             sleepMs(5);
         }
         setupOk = alive() && opened_.load() == cfg_.servers;
+        const int perSession = stats_.maxPlayersPerSession.load();
+        if (setupOk && log_ && perSession > 0 &&
+            static_cast<double>(cfg_.players) / cfg_.servers > 0.6 * perSession) {
+            std::fprintf(log_,
+                         "[fleet] warning: about %d players a server against %d a session may "
+                         "carry. Players are not spread evenly, so some carries will be refused "
+                         "(status 4)\n",
+                         cfg_.players / cfg_.servers, perSession);
+        }
     }
 
     // 2. Every player signs in once (or is taken from the roster) and joins.
@@ -568,6 +586,7 @@ int FleetRun::run() {
         sleepMs(250); // the workers refresh their gauges every 100 ms
         while (nowNs() - drainFrom < static_cast<int64_t>(cfg_.drainS) * SEC &&
                (sumPending() > 0 || sumAwaiting() > 0)) {
+            housekeeping(); // a token that falls due now is still refreshed
             sleepMs(20);
         }
     }
@@ -587,7 +606,15 @@ int FleetRun::run() {
         end_.releasesPending += e.releasesPending;
     }
 
-    // 6. Close every session, also after an interrupt.
+    // 6. Close every session, also after an interrupt. First let go of the setup
+    // work that has not started and wait for what is in flight, so a session
+    // that is being opened right now is closed too.
+    {
+        std::lock_guard<std::mutex> lock(jobMu_);
+        jobs_.clear();
+    }
+    const int64_t settleFrom = nowNs();
+    while (jobsInFlight_.load() > 0 && nowNs() - settleFrom < 90 * SEC) sleepMs(5);
     int toClose = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -673,7 +700,10 @@ int FleetRun::run() {
                            " Application API call(s) were made because of a crossing");
     }
     if (exitCode == 0 && !failures.empty()) exitCode = 1;
-    if (interrupted_ && exitCode != 2) exitCode = 130;
+    // An interrupt ends a run that was asked to go on until interrupted, and that
+    // run is judged like any other. Any other interrupted run did not finish.
+    const bool untilInterrupted = !cfg_.dryRun && cfg_.durationS == 0 && ranWindow;
+    if (interrupted_ && exitCode != 2 && !untilInterrupted) exitCode = 130;
 
     buildSummary(exitCode, failures);
     return exitCode;

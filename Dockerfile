@@ -20,5 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --create-home loadtest
 COPY --from=build /src/build/cks-loadtest /usr/local/bin/cks-loadtest
 COPY --from=build /src/build/cks-loadtest-ctl /usr/local/bin/cks-loadtest-ctl
+COPY --from=build /src/build/ck-fleet-load /usr/local/bin/ck-fleet-load
 USER loadtest
 ENTRYPOINT ["cks-loadtest"]

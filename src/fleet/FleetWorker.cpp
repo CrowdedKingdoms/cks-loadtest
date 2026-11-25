@@ -577,8 +577,11 @@ bool FleetWorker::sendOn(Session& s, const uint8_t* buf, size_t len, SendKind ki
     // A realtime server that went away answers with ICMP, which shows as
     // ECONNREFUSED on the next send. A full socket buffer is this host's own.
     if (errno == ECONNREFUSED && ++s.sendErrStreak >= SEND_ERROR_STREAK_MOVE) {
+        // Leave the move to the next sweep: this send may be a crossing's carry,
+        // and the socket failing is not something the crossing caused.
         s.sendErrStreak = 0;
-        requestMove(s, MoveTrigger::SendErrors, now);
+        s.movePending = true;
+        s.pendingTrigger = MoveTrigger::SendErrors;
     }
     return false;
 }
@@ -680,7 +683,9 @@ void FleetWorker::adopt(Session& s, std::unique_ptr<Player> owned, CarryCause ca
     }
     p.retryCause = cause;
     p.retryAtNs = 0;
-    if (s.state == Session::State::Active && now >= s.activateAtNs) startCarry(s, p, cause, now);
+    // The session's capabilities are its first datagram, so a carry waits for them.
+    if (s.state == Session::State::Active && now >= s.activateAtNs && s.lastCapsNs != 0)
+        startCarry(s, p, cause, now);
     // Otherwise the carry starts when the session is up (tickCarry, or needCarryAll).
 }
 
@@ -1038,11 +1043,25 @@ void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
                          "(another organization's or another app's player)\n",
                          p.index);
             break;
-        default:
+        default: {
             // 3 (the proof or its time), 4 (the session is full) and anything
             // unknown: the resend timer tries again with a fresh time until the
             // five seconds are up.
+            static std::atomic<bool> hinted3{false}, hinted4{false};
+            if (r.status == CARRY_PROOF_OR_TIME && !hinted3.exchange(true)) {
+                std::fprintf(stderr,
+                             "[fleet] FLEET_CARRY_RESULT status 3 (the proof or its time): a "
+                             "time more than 30 s from the server's is refused, so check this "
+                             "host's clock\n");
+            } else if (r.status == CARRY_SESSION_FULL && !hinted4.exchange(true)) {
+                std::fprintf(stderr,
+                             "[fleet] FLEET_CARRY_RESULT status 4: session %d carries as many "
+                             "players as it may (%d). Use more servers, fewer players, or ask "
+                             "an operator to raise the organization's number\n",
+                             s.index, s.info.maxPlayers);
+            }
             break;
+        }
     }
 }
 
