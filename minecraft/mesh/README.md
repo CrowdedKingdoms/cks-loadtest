@@ -78,10 +78,12 @@ python3 minecraft/mesh/scenario.py --run $RUN --tests <mod>/tools/cluster-tests 
 ```
 
 A scenario's stage is at a z of its own, so the pair is the one whose row holds it: on the 10 x 10 plan above, rows
-1 to 4 of columns 4 and 5 (`s0104`/`s0105` to `west`/`east`). Stages north of the grid need the pair to own land
-there too (a second range for `west` and `east` in `cluster.json`). What to know before trusting a result:
+1 to 4 of columns 4 and 5 (`s0104`/`s0105` to `west`/`east`). A stage outside the grid is moved into a pair's row
+with `--shift-z <blocks>` (every z in the steps moves; `--dry-run` prints the moved steps and any step with a
+coordinate it did not know how to move). Giving `west` and `east` a second range out there instead did not work:
+nothing crossed the line between two servers' second ranges. What to know before trusting a result:
 
-- **Fresh names** (`--names Sd`: Tester1 plays as Sd1). A new player starts in the chunks of the server they first
+- **Fresh names** (`--names Sd`: Tester1 plays as Sd1; or one by one, `--names Tester1=Cam3,Tester2=Cam4`). A new player starts in the chunks of the server they first
   join, which is where every scenario expects its players. Test players' records persist in CK, and scenarios end by
   sending them to 0, 0, the default server's land on a mesh; the runner sends them to the west server's middle
   instead. The names must be on the whitelist (`payload --players`).
@@ -92,6 +94,11 @@ there too (a second range for `west` and `east` in `cluster.json`). What to know
   step file in order. A scenario that does not finish is aborted (the mod's script takes an `abort` line); the
   cleanup at its end goes with it, so put back any cluster-wide rule it changed (`spawn_mobs`, `mob_griefing`,
   the time).
+- **A name is used once.** A used player keeps its place in CK, and a script's own client of that name stays in the
+  server's process until it restarts, so the next scenario's `?client` is never met. Whitelist more names than
+  scenarios times four.
+- **Only a wait that ran out is a miss**, as in the mod's own runner. A step that "failed" (a tp of a player who is
+  not on that server yet) is how some scenarios mark time; the result counts them as `stepsThatFailed`.
 - **Steps a mesh cannot meet** are dropped by name (`--drop '^\?relays'`: "exactly one relay on this server").
 - **Scenarios that restart a server** (`rules`) are refused. `sleep` needs half the world's players in bed.
 - **Do not change the load while a scenario plays.** A crowd called to one corner, or the bots' speed raised, made

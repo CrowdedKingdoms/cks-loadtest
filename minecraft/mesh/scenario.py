@@ -49,6 +49,40 @@ def steps_of(path, token):
     return out
 
 
+TRIPLES = {"console fill", "console setblock", "?state", "watch", "useitem", "?contains", "?!contains", "contents", "use", "rightclick",
+           "?respawnat", "?position", "console summon", "console setworldspawn", "face", "console clone", "?bees", "?!bees"}
+PAIRS = {"tp", "console forceload", "?land", "?near", "walkto", "?none", "spawn", "toss", "place", "break", "bot", "?home", "?back"}
+NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def shift_z(line, dz, unshifted):
+    """A step with every z moved by dz blocks: a scenario's stage played in another row of the mesh. Steps are told
+    apart by their first words (which name x y z, which x z); an x is a number between 1880 and 2300, where every
+    scenario's stage is. A step with such a number that is neither kind is left as it is and listed."""
+    def moved(text):
+        value = float(text) + dz
+        return str(int(value)) if "." not in text else f"{value:.1f}"
+
+    line = re.sub(r"\bz=(-?\d+(?:\.\d+)?)", lambda m: "z=" + moved(m.group(1)), line)
+    words = line.split(" ")
+    kind = words[0] if words[0] != "console" else " ".join(words[:2])
+    step = 3 if kind in TRIPLES else 2 if kind in PAIRS else 0
+    i = 0
+    seen = False
+    while i < len(words):
+        if NUMBER.match(words[i]) and 1880 <= float(words[i]) <= 2300:
+            seen = True
+            at = i + step - 1
+            if step and at < len(words) and all(NUMBER.match(w) for w in words[i:at + 1]):
+                words[at] = moved(words[at])
+                i = at + 1
+                continue
+        i += 1
+    if seen and not step:
+        unshifted.append(line)
+    return " ".join(words)
+
+
 def follow(server, offset, pattern, seconds):
     """The first line of the server's log past that offset that matches, or None after that long."""
     until = time.time() + seconds
@@ -118,7 +152,9 @@ def main():
     p.add_argument("--client-script", help="starts a game client: <script> <name> <port>, with CK_MC_HOST the server's address")
     p.add_argument("--out", help="a folder for the clients' logs and this run's record (default: <run>/scenarios/<scenario>)")
     p.add_argument("--timeout", type=int, default=1500)
-    p.add_argument("--names", help="a prefix: the scenario's Tester1..4 play as <prefix>1..4, players new to the world, and nobody is put home first")
+    p.add_argument("--names", help="a prefix: the scenario's Tester1..4 play as <prefix>1..4, players new to the world, and nobody is put home first; or names one by one, Tester1=Cam3,Tester2=Cam4")
+    p.add_argument("--shift-z", type=int, default=0, help="move every z in the steps by so many blocks: the scenario's stage in another row")
+    p.add_argument("--dry-run", action="store_true", help="with --shift-z: print the moved steps and those left alone, and send nothing")
     p.add_argument("--drop", help="a regular expression: steps that match are left out (and listed in the result)")
     p.add_argument("--no-home", action="store_true", help="do not put the scenario's test players on the west server first")
     p.add_argument("--home-seconds", type=int, default=40)
@@ -138,6 +174,17 @@ def main():
     home_x, home_z = home_spot(sides["west"])
     for side in steps:
         steps[side] = [re.sub(r"^tp (\S+) 0 0$", rf"tp \1 {home_x} {home_z}", line) for line in steps[side]]
+    unshifted = []
+    if args.shift_z:
+        for side in steps:
+            steps[side] = [shift_z(line, args.shift_z, unshifted) for line in steps[side]]
+        if args.dry_run:
+            for side in steps:
+                print(f"--- {side}")
+                print("\n".join(steps[side]))
+            print("--- steps with a coordinate that were not moved")
+            print("\n".join(unshifted))
+            return 0
     dropped = []
     if args.drop:
         # A step written for two servers alone: "?relays 1" (exactly one relay on this server) can never be met on a
@@ -148,8 +195,14 @@ def main():
     if args.names:
         # Players nobody has been: each starts where it first joins (the west server's chunks), so nothing has to be
         # put back between scenarios. Tester1 becomes <prefix>1, and so on; the names must be on the whitelist.
-        for side in steps:
-            steps[side] = [re.sub(r"\bTester([0-9]+)\b", rf"{args.names}\1", line) for line in steps[side]]
+        if "=" in args.names:
+            # Names given one by one: Tester1=Cam3,Tester2=Cam4.
+            given = dict(pair.split("=", 1) for pair in args.names.split(","))
+            for side in steps:
+                steps[side] = [re.sub(r"\bTester[0-9]+\b", lambda m: given.get(m.group(0), m.group(0)), line) for line in steps[side]]
+        else:
+            for side in steps:
+                steps[side] = [re.sub(r"\bTester([0-9]+)\b", rf"{args.names}\1", line) for line in steps[side]]
     for side, lines in steps.items():
         for line in lines:
             words = line.split()
@@ -178,6 +231,10 @@ def main():
     for side, server in sides.items():
         ssh(server, f"cat >> {REMOTE_DIR}/steps.txt", input="\n".join(steps[side]) + "\n")
 
+    first_player = "Tester1"
+    if args.names:
+        first_player = dict(pair.split("=", 1) for pair in args.names.split(",")).get("Tester1", "Tester1") if "=" in args.names else args.names + "1"
+    noted = []
     done = set()
     misses = []
     notes_seen = {side: 0 for side in sides}
@@ -211,8 +268,12 @@ def main():
                 for line in lines:
                     if "Server script" in line or "not met after" in line:
                         log_all[side].append(line)
-                    if "not met after" in line or re.search(r"Server script: .* failed$", line) or "Server script: unknown step" in line:
+                    # Only a wait that ran out, as in the mod's own runner. A step that "failed" (a tp of a player who is
+                    # not on this server yet) is how some scenarios mark time, and passes there too; those are kept as notes.
+                    if "not met after" in line:
                         misses.append(f"{side}: {line[-240:]}")
+                    elif re.search(r"Server script: .* failed$", line) or "Server script: unknown step" in line:
+                        noted.append(f"{side}: {line[-200:]}")
                     found = re.search(r"Server script: note (.*)$", line)
                     if not found:
                         continue
@@ -221,7 +282,7 @@ def main():
                     if words[0] == "done":
                         done.add(side)
                     elif words[0] == "client":
-                        start_client(words[1], words[2] if len(words) > 2 else (args.names + "1" if args.names else "Tester1"))
+                        start_client(words[1], words[2] if len(words) > 2 else first_player)
                     elif words[0] == "expect":
                         expects.append({"user": words[1], "until": time.time() + float(words[2]), "text": " ".join(words[3:])})
             for expect in list(expects):
@@ -257,7 +318,7 @@ def main():
             except (RuntimeError, subprocess.TimeoutExpired):
                 pass
     record = {"scenario": args.scenario, "west": args.west, "east": args.east, "result": "pass" if not misses else "fail", "seconds": seconds,
-              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
+              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "shiftZ": args.shift_z, "unshifted": unshifted[:20], "stepsThatFailed": len(noted), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
     (out / "result.json").write_text(json.dumps(record, indent=1) + "\n")
     print(json.dumps(record))
     return 0 if not misses else 1
