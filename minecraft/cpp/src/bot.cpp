@@ -88,6 +88,7 @@ Bot::Bot(BotSpec spec, const Shared* shared, std::shared_ptr<BotView> view)
   parseWaypoints();
   parseWanderBox();
   wander_.reset(rng_);
+  javaRng_.setSeed(javaStringHash(spec_.name));
   statusOffset_ = static_cast<int>(seedFromName(spec_.name) % static_cast<uint64_t>(kStatusTicks));
   sink_ = Journal::get().openSink(spec_.logPath);
 }
@@ -100,14 +101,9 @@ Bot::~Bot() {
 }
 
 void Bot::parseWanderBox() {
-  if (spec_.path != "wander" || spec_.waypoints.empty() || spec_.waypoints == "-") return;
-  std::stringstream in(spec_.waypoints);
-  char comma;
-  WanderBox box;
-  if (!(in >> box.minX >> comma >> box.minZ >> comma >> box.maxX >> comma >> box.maxZ)) return;
-  if (box.minX >= box.maxX || box.minZ >= box.maxZ) return;
-  box.enabled = true;
-  box_ = box;
+  // LoadWalker.parseWaypoints("wander", ...) is empty. The old rectangle mirrored the
+  // heading at a cell edge, so a bot bounced inside its server instead of walking
+  // Benjamin's heading. Rally still has its own box.
 }
 
 void Bot::parseWaypoints() {
@@ -771,12 +767,18 @@ void Bot::onPosition(const uint8_t* body, size_t len) {
 
   // Pulled down from where the bot was flying: the flying bit has to go out again.
   bool yanked = placed_ && ny < y_ - 2.0;
+  double prevX = x_;
+  double prevY = y_;
+  double prevZ = z_;
+  bool wasPlaced = placed_;
   surfaceY_ = ny;
   x_ = nx;
   z_ = nz;
   // On the clearance rule the first move is the whole clearance at once, as it always was.
   // With `altitude` on, or on the way back from it, the bot climbs from here 0.4 a tick.
+  // A LoadWalker wander stays on the server's feet Y. It does not add clearance.
   if (shared_->altitudeOn || ramping_) y_ = ny;
+  else if (spec_.path == "wander" && !rally_.active) y_ = ny;
   else y_ = surfaceY_ + spec_.clearance;
   if (!progressSet_) {
     progressX_ = nx;
@@ -790,6 +792,13 @@ void Bot::onPosition(const uint8_t* body, size_t len) {
     stuck_ = 0;
   }
   serverX_ = nx;
+  serverZ_ = nz;
+  serverObserved_ = true;
+  if (spec_.path == "wander" && !rally_.active) {
+    bool moved = !wasPlaced || std::fabs(nx - prevX) > 0.05 || std::fabs(nz - prevZ) > 0.05 ||
+                 std::fabs(ny - prevY) > 0.01;
+    if (moved) wanderSettle_ = 2;
+  }
   if (yanked) sentAbilities_ = false;
 
   Buf ans;
@@ -856,6 +865,10 @@ double Bot::wanderStep() const {
 }
 
 void Bot::updateY() {
+  if (spec_.path == "wander" && !rally_.active && !shared_->altitudeOn && !ramping_) {
+    y_ = surfaceY_;
+    return;
+  }
   double clearanceY = surfaceY_ + spec_.clearance;
   if (shared_->altitudeOn) {
     ramping_ = true;
@@ -866,6 +879,18 @@ void Bot::updateY() {
   } else {
     y_ = clearanceY;
   }
+}
+
+void Bot::sendWalkPose(bool onGround) {
+  Buf move;
+  move.wF64(x_);
+  move.wF64(y_);
+  move.wF64(z_);
+  move.wF32(yaw_);
+  move.wF32(0.f);
+  move.wU8(onGround ? 1 : 0);
+  send(pid(SbPlay::MOVE_PLAYER_POS_ROT), move.b);
+  sendEmpty(pid(SbPlay::CLIENT_TICK_END));
 }
 
 void Bot::sendFlyPose(bool withInput) {
@@ -889,8 +914,64 @@ void Bot::sendFlyPose(bool withInput) {
   sendEmpty(pid(SbPlay::CLIENT_TICK_END));
 }
 
+void Bot::tickJavaWander(double step) {
+  constexpr int kJumpTicks = 12;
+  constexpr double kJumpHeight = 1.25;
+  if (jumpUnstick_ > 0) {
+    int t = kJumpTicks - jumpUnstick_;
+    int half = kJumpTicks / 2;
+    double sendY = t < half ? surfaceY_ + kJumpHeight * (t + 1) / static_cast<double>(half)
+                            : surfaceY_ + kJumpHeight * (kJumpTicks - t) / static_cast<double>(half);
+    double dx = 0;
+    double dz = 0;
+    javaWanderDelta(javaWander_.yaw, step, dx, dz);
+    x_ += dx;
+    z_ += dz;
+    yaw_ = javaWander_.yaw;
+    y_ = sendY;
+    sendWalkPose(sendY <= surfaceY_ + 0.001);
+    jumpUnstick_--;
+    return;
+  }
+  double dx = 0;
+  double dz = 0;
+  bool opened = javaWander_.tick(javaRng_, step, dx, dz);
+  if (opened) {
+    say(spec_.name + " heading yaw=" + std::to_string(javaWander_.yaw));
+  }
+  x_ += dx;
+  z_ += dz;
+  yaw_ = javaWander_.yaw;
+  bool onGround = !shared_->altitudeOn && !ramping_ && std::fabs(y_ - surfaceY_) <= 0.001;
+  sendWalkPose(onGround);
+  if (serverObserved_) {
+    if (!wanderStallSet_) {
+      wanderStallX_ = serverX_;
+      wanderStallZ_ = serverZ_;
+      wanderStallSet_ = true;
+      wanderStallTicks_ = 0;
+    } else if (std::hypot(serverX_ - wanderStallX_, serverZ_ - wanderStallZ_) > 2.0) {
+      wanderStallX_ = serverX_;
+      wanderStallZ_ = serverZ_;
+      wanderStallTicks_ = 0;
+    } else if (++wanderStallTicks_ >= 200) {
+      x_ = serverX_;
+      z_ = serverZ_;
+      jumpUnstick_ = kJumpTicks;
+      javaWander_.yaw = nextJavaWanderYaw(javaWander_.yaw, javaRng_);
+      javaWander_.legTicks = 160 + javaRng_.nextInt(240);
+      wanderStallTicks_ = 0;
+      say(spec_.name + " wander unstick");
+    }
+  }
+}
+
 void Bot::tickWander() {
   double step = wanderStep();
+  if (javaWanderPath()) {
+    tickJavaWander(step);
+    return;
+  }
   double dx = 0;
   double dz = 0;
   bool approaching = false;
@@ -916,6 +997,11 @@ void Bot::tickWander() {
 }
 
 void Bot::tickMotion() {
+  if (javaWanderPath() && wanderSettle_ > 0) {
+    wanderSettle_--;
+    sendEmpty(pid(SbPlay::CLIENT_TICK_END));
+    return;
+  }
   updateY();
   if (rally_.active || spec_.path == "wander") {
     tickWander();
@@ -1033,7 +1119,9 @@ void Bot::tickMotion() {
 void Bot::sayStatus() {
   statusNow_ = false;
   say(spec_.name + " phase=play placed=1 x=" + f3(x_) + " y=" + f3(y_) + " z=" + f3(z_) +
-      " walkY=" + f3(surfaceY_) + " dir=" + (direction_ > 0 ? "east" : "west") +
+      " walkY=" + f3(surfaceY_) +
+      (spec_.path == "wander" ? " path=wander heading=" + std::to_string(javaWander_.yaw) : "") +
+      " dir=" + (direction_ > 0 ? "east" : "west") +
       (escaping_ ? " lane" : "") + " east_pauses=" + std::to_string(eastPauses_) +
       " west_pauses=" + std::to_string(westPauses_) + " north_pauses=" + std::to_string(northPauses_) +
       " transfers=" + std::to_string(transfersFollowed_) + " rejoins=" + std::to_string(rejoins_) +

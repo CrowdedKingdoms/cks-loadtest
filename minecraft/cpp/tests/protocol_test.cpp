@@ -534,6 +534,48 @@ static double angleBetween(double a, double b) {
   return d;
 }
 
+static void testJavaWander() {
+  check(javaStringHash("Load1") == 73590763, "java hash Load1");
+  check(javaStringHash("") == 0, "java hash empty");
+  JavaRandom rng(javaStringHash("Load1"));
+  JavaWander w;
+  double x = 2000.5;
+  double z = 2000.5;
+  const double step = 0.1;
+  const double wantX[5] = {2000.4803908604342, 2000.4607817208685, 2000.4411725813027, 2000.421563441737,
+                           2000.4019543021711};
+  const double wantZ[5] = {2000.4019414376737, 2000.3038828753474, 2000.2058243130211, 2000.1077657506949,
+                           2000.0097071883686};
+  for (int t = 0; t < 5; t++) {
+    double dx = 0;
+    double dz = 0;
+    bool opened = w.tick(rng, step, dx, dz);
+    x += dx;
+    z += dz;
+    if (t == 0) {
+      check(opened, "java wander: the first tick opens a heading");
+      check(std::fabs(w.yaw - 168.69151f) < 0.001f, "java wander: first yaw " + std::to_string(w.yaw));
+    } else {
+      check(!opened, "java wander: the leg holds");
+    }
+    check(std::fabs(x - wantX[t]) < 1e-6 && std::fabs(z - wantZ[t]) < 1e-6,
+          "java wander: step " + std::to_string(t) + " at " + std::to_string(x) + " " + std::to_string(z));
+  }
+  check(w.legTicks == 288, "java wander: leg ticks left " + std::to_string(w.legTicks));
+  JavaRandom turns(7);
+  float yaw = 0.f;
+  bool past90 = false;
+  for (int i = 0; i < 40; i++) {
+    float next = nextJavaWanderYaw(yaw, turns);
+    float turn = std::fabs(next - yaw);
+    if (turn > 180.f) turn = 360.f - turn;
+    check(turn + 1e-3f >= 30.f, "java wander: turn " + std::to_string(turn));
+    if (turn > 90.f) past90 = true;
+    yaw = next;
+  }
+  check(past90, "java wander: a turn can be more than 90 degrees");
+}
+
 static void testWander() {
   WanderBox box;
   box.enabled = true;
@@ -879,9 +921,8 @@ static void testSurvival() {
   for (size_t i = 1; i < moves.size(); i++) {
     check(std::fabs(moves[i].y - moves[i - 1].y) <= 0.4 + 1e-9, "survival: climbed more than 0.4 in one tick");
     check(moves[i].airborne, "survival: on the ground");
-  }
-  for (const Move& m : moves) {
-    check(m.x >= 1985 && m.x <= 1995 && m.z >= -60 && m.z <= -50, "survival: left its own box");
+    double dist = std::hypot(moves[i].x - moves[i - 1].x, moves[i].z - moves[i - 1].z);
+    check(std::fabs(dist - 0.1) < 1e-6, "survival: wander step " + std::to_string(dist));
   }
   // 64.4, 64.8, ... 70.0 is fifteen moves, and four more at 70 make the five that end the wait.
   check(moves.size() >= 19, "survival: the 6-block climb took " + std::to_string(moves.size() - 4) + " moves, not 15");
@@ -950,8 +991,8 @@ static void testSurvival() {
   check(moves.front().y <= 64.4 + 1e-9, "survival: after the respawn the climb starts from the server Y");
   for (size_t i = 1; i < moves.size(); i++) {
     check(std::fabs(moves[i].y - moves[i - 1].y) <= 0.4 + 1e-9, "survival: climbed more than 0.4 after the respawn");
-    // 55 blocks east of its box: every step goes back west.
-    check(moves[i].x < moves[i - 1].x, "survival: outside its box the bot flies straight back");
+    double dist = std::hypot(moves[i].x - moves[i - 1].x, moves[i].z - moves[i - 1].z);
+    check(std::fabs(dist - 0.1) < 1e-6, "survival: wander step after respawn " + std::to_string(dist));
   }
 
   // A respawn packet with no death. The keep-alive answer marks the point the bot has read it.
@@ -1014,7 +1055,7 @@ static void testSurvival() {
   check(journalCount("Surv1 crossed c1559->c1560") == 1, "survival: the crossed line");
   check(journalCount("Surv1 respawn packet, waiting for a position") == 2, "survival: the respawn packet lines");
   check(journalCount("Surv1 no position after respawn, flying on") == 1, "survival: the fly-on line");
-  check(journalCount("Surv1 box 1985.0000 -60.0000 1995.0000 -50.0000") == 1, "survival: the box line");
+  check(journalCount("Surv1 box off") == 1, "survival: wander has no box");
 
   fleet.stopAll();
   waitFor([&] { return fleet.stats().closed == 1; }, kPatienceMs, "survival: stop-all");
@@ -1366,6 +1407,7 @@ int main(int argc, char** argv) {
   if (wanted("unit")) {
     testControlLines();
     testStatsFormat();
+    testJavaWander();
     testWander();
     testAltitudeRamp();
     testRejoinBackoff();

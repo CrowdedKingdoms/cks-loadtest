@@ -46,6 +46,70 @@ void Wander::turn(Rng& rng) {
   hold = rng.rangeInt(kWanderHoldMinTicks, kWanderHoldMaxTicks);
 }
 
+void JavaRandom::setSeed(int64_t seed) {
+  seed_ = (static_cast<uint64_t>(seed) ^ 0x5DEECE66DULL) & ((1ULL << 48) - 1);
+}
+
+int JavaRandom::next(int bits) {
+  seed_ = (seed_ * 0x5DEECE66DULL + 0xBULL) & ((1ULL << 48) - 1);
+  return static_cast<int>(seed_ >> (48 - bits));
+}
+
+bool JavaRandom::nextBoolean() { return next(1) != 0; }
+
+double JavaRandom::nextDouble() {
+  auto hi = static_cast<int64_t>(next(26));
+  auto lo = static_cast<int64_t>(next(27));
+  return static_cast<double>((hi << 27) + lo) / static_cast<double>(1ULL << 53);
+}
+
+int JavaRandom::nextInt(int bound) {
+  if (bound <= 0) return 0;
+  int r = next(31);
+  int m = bound - 1;
+  if ((bound & m) == 0) return static_cast<int>((static_cast<int64_t>(bound) * r) >> 31);
+  // Java's rejection loop. The compare is a signed 32-bit subtract, so it wraps.
+  for (int u = r;;) {
+    r = u % bound;
+    auto diff = static_cast<int32_t>(static_cast<uint32_t>(u) - static_cast<uint32_t>(r) + static_cast<uint32_t>(m));
+    if (diff >= 0) return r;
+    u = next(31);
+  }
+}
+
+int32_t javaStringHash(std::string_view name) {
+  int32_t h = 0;
+  for (unsigned char c : name) h = static_cast<int32_t>(static_cast<uint32_t>(h) * 31u + c);
+  return h;
+}
+
+float nextJavaWanderYaw(float previous, JavaRandom& rng) {
+  double mag = 30.0 + rng.nextDouble() * (180.0 - 30.0);
+  double signedTurn = rng.nextBoolean() ? mag : -mag;
+  float yaw = previous + static_cast<float>(signedTurn);
+  yaw = std::fmod(yaw, 360.f);
+  if (yaw <= -180.f) yaw += 360.f;
+  if (yaw > 180.f) yaw -= 360.f;
+  return yaw;
+}
+
+void javaWanderDelta(float yawDeg, double blocksPerTick, double& dx, double& dz) {
+  double yawRad = static_cast<double>(yawDeg) * kPi / 180.0;
+  dx = -std::sin(yawRad) * blocksPerTick;
+  dz = std::cos(yawRad) * blocksPerTick;
+}
+
+bool JavaWander::tick(JavaRandom& rng, double blocksPerTick, double& dx, double& dz) {
+  bool opened = legTicks <= 0;
+  if (opened) {
+    yaw = nextJavaWanderYaw(yaw, rng);
+    legTicks = 160 + rng.nextInt(240);
+  }
+  legTicks--;
+  javaWanderDelta(yaw, blocksPerTick, dx, dz);
+  return opened;
+}
+
 void Wander::step(Rng& rng, const WanderBox& box, double x, double z, double stepLen, double& dx, double& dz) {
   dx = 0;
   dz = 0;

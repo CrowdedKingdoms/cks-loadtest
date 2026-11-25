@@ -21,7 +21,7 @@ struct BotSpec {
   // seam (east/west shuttle), triangle, or wander.
   std::string path = "seam";
   // "x,y,z,side;..." for triangle. The y is not a fly height.
-  // "minX,minZ,maxX,maxZ" for wander: this bot's own box.
+  // Wander ignores this. LoadWalker does not aim a wander at a rectangle.
   std::string waypoints;
   double bps = 2.0;
   double clearance = 8.0;
@@ -130,6 +130,9 @@ class Bot {
   const Shared* shared_;
   std::shared_ptr<BotView> view_;
   Rng rng_;
+  // LoadWalker's wander: Java Random(name.hashCode()), not the rally box wander.
+  JavaRandom javaRng_{};
+  JavaWander javaWander_{};
   std::shared_ptr<LogSink> sink_;
 
   Phase phase_ = Phase::Login;
@@ -197,6 +200,16 @@ class Bot {
   // Set while `altitude` is on, and afterwards until the bot is back at the clearance height.
   bool ramping_ = false;
   double serverX_ = 0;
+  double serverZ_ = 0;
+  bool serverObserved_ = false;
+  // Ticks to wait after a server position before the next wander step. LoadWalker holds 2.
+  int wanderSettle_ = 0;
+  // Recovery hop after the server position has not moved for 10 s.
+  int jumpUnstick_ = 0;
+  double wanderStallX_ = 0;
+  double wanderStallZ_ = 0;
+  bool wanderStallSet_ = false;
+  int wanderStallTicks_ = 0;
   double progressX_ = 0;
   bool progressSet_ = false;
   float yaw_ = -90.f;
@@ -238,8 +251,12 @@ class Bot {
   void settle();
   void publish();
   void sendFlyPose(bool withInput);
+  // LoadWalker's move: position and yaw, no input and no punch. onGround when the feet are on walk Y.
+  void sendWalkPose(bool onGround);
   void tickMotion();
   void tickWander();
+  void tickJavaWander(double step);
+  bool javaWanderPath() const { return spec_.path == "wander" && !rally_.active; }
   void updateY();
   void noteCell();
   void sayStatus();
