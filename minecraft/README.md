@@ -1,5 +1,7 @@
 # Minecraft seam worker (cks-loadtest control shell)
 
+> A mesh of many servers under thousands of bots, with scenarios and a camera on it, is in [mesh/README.md](mesh/README.md) (2026-11-25). This page is the earlier two-server seam worker.
+
 This directory is the **Minecraft** worker for the SoftMax-style ladder. It speaks
 the same HTTP control API as `cks-loadtest` (`/health`, `/v1/status`, `/v1/stats`,
 `/v1/clients/add`, `/v1/rung/open`, `/v1/rung/close`, `/v1/shutdown`) but each
