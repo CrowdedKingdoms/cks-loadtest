@@ -1,18 +1,15 @@
+#include "control.hpp"
 #include "fleet.hpp"
+#include "journal.hpp"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
 #include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <sys/resource.h>
 
 #include <atomic>
 #include <chrono>
-#include <cstring>
+#include <exception>
 #include <iostream>
-#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,14 +21,17 @@ void onSignal(int) { gRun = false; }
 
 void usage() {
   std::cerr
-      << "ck-mc-load — many flying Minecraft 26.3 clients in one process\n"
-      << "  --control host:port     line protocol: add, stop, stop-all, quit\n"
-      << "  --threads N             epoll workers (default 1)\n"
+      << "ck-mc-load: many flying Minecraft 26.3 clients in one process\n"
+      << "  --control host:port     line protocol: add, stop, stop-all, quit, stats, list,\n"
+      << "                          bounds, rally, unrally, speed, altitude, grid\n"
+      << "  --threads N             worker threads (default 1)\n"
+      << "  --journal PATH          every bot's lines go to PATH, not to stdout\n"
+      << "  --bounds minX,minZ,maxX,maxZ   wander turns back at this rectangle\n"
+      << "  --grid originX,originZ,cellBlocks,cols,rows   count line crossings on this grid\n"
       << "  --name NAME --host H --port P   one bot, no control socket\n"
       << "  --path seam|triangle|wander     default seam\n"
       << "  --waypoints x,y,z,side;...      triangle only\n"
       << "  --bps N                 wander speed, blocks per second (default 2)\n"
-      << "  --bounds minX,minZ,maxX,maxZ   wander turns back at this rectangle\n"
       << "  --clearance N           blocks above the last server feet Y (default 8)\n"
       << "  --max-seconds N         default 180\n"
       << "  --log PATH              also append this bot's lines to PATH\n";
@@ -50,20 +50,6 @@ bool has(const std::vector<std::string>& args, const std::string& key) {
   return false;
 }
 
-void applyBounds(const std::vector<std::string>& args) {
-  std::string raw = argValue(args, "--bounds", "");
-  if (raw.empty()) return;
-  ckmc::WanderBox box;
-  char comma;
-  std::stringstream in(raw);
-  if (!(in >> box.minX >> comma >> box.minZ >> comma >> box.maxX >> comma >> box.maxZ) || box.minX >= box.maxX ||
-      box.minZ >= box.maxZ) {
-    throw std::runtime_error("--bounds needs minX,minZ,maxX,maxZ");
-  }
-  box.enabled = true;
-  ckmc::setWanderBox(box);
-}
-
 ckmc::BotSpec specFrom(const std::vector<std::string>& args) {
   ckmc::BotSpec s;
   s.name = argValue(args, "--name", "Load1");
@@ -78,57 +64,21 @@ ckmc::BotSpec specFrom(const std::vector<std::string>& args) {
   return s;
 }
 
-ckmc::BotSpec specFromAdd(const std::vector<std::string>& tok) {
-  // add name host port path bps clearance maxSeconds waypoints logpath
-  if (tok.size() != 10) throw std::runtime_error("add needs 9 fields");
-  ckmc::BotSpec s;
-  s.name = tok[1];
-  s.host = tok[2];
-  s.port = std::stoi(tok[3]);
-  s.path = tok[4];
-  s.bps = std::stod(tok[5]);
-  s.clearance = std::stod(tok[6]);
-  s.maxSeconds = std::stoi(tok[7]);
-  s.waypoints = tok[8];
-  s.logPath = tok[9];
-  return s;
-}
-
-int listenOn(const std::string& where) {
-  auto colon = where.rfind(':');
-  if (colon == std::string::npos) throw std::runtime_error("control bind needs host:port");
-  std::string host = where.substr(0, colon);
-  int port = std::stoi(where.substr(colon + 1));
-#if defined(__APPLE__)
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd >= 0) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
-#else
-  int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-#endif
-  if (fd < 0) throw std::runtime_error("socket");
-  int one = 1;
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(port));
-  if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
-    throw std::runtime_error("control host must be an ipv4 address");
+// Each bot is one socket. Ask for as many descriptors as the system allows this process.
+void raiseFdLimit() {
+  rlimit lim{};
+  if (getrlimit(RLIMIT_NOFILE, &lim) != 0) return;
+  rlim_t want = lim.rlim_max;
+  if (want == RLIM_INFINITY || want > 1048576) want = 1048576;
+  if (lim.rlim_cur == RLIM_INFINITY || lim.rlim_cur >= want) return;
+  rlim_t had = lim.rlim_cur;
+  lim.rlim_cur = want;
+  if (setrlimit(RLIMIT_NOFILE, &lim) == 0) return;
+  // macOS refuses more than its per-process maximum even when the hard limit says otherwise.
+  if (had < 10240 && want > 10240) {
+    lim.rlim_cur = 10240;
+    (void)setrlimit(RLIMIT_NOFILE, &lim);
   }
-  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 || ::listen(fd, 1) < 0) {
-    ::close(fd);
-    throw std::runtime_error("bind control");
-  }
-  return fd;
-}
-
-void reply(int fd, const std::string& line) {
-  std::string out = line + "\n";
-#if defined(__APPLE__)
-  (void)::send(fd, out.data(), out.size(), 0);
-#else
-  (void)::send(fd, out.data(), out.size(), MSG_NOSIGNAL);
-#endif
 }
 
 }  // namespace
@@ -142,100 +92,72 @@ int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
   signal(SIGINT, onSignal);
   signal(SIGTERM, onSignal);
+  raiseFdLimit();
 
+  ckmc::WanderBox bounds;
+  ckmc::Grid grid;
+  int threads = 1;
+  ckmc::BotSpec single;
+  std::string control = argValue(args, "--control", "");
   try {
-    applyBounds(args);
+    std::string rawBounds = argValue(args, "--bounds", "");
+    if (!rawBounds.empty()) {
+      try {
+        bounds = ckmc::parseBounds(ckmc::splitCommas(rawBounds));
+      } catch (const std::exception&) {
+        throw std::runtime_error("--bounds needs minX,minZ,maxX,maxZ");
+      }
+    }
+    std::string rawGrid = argValue(args, "--grid", "");
+    if (!rawGrid.empty()) {
+      try {
+        grid = ckmc::parseGrid(ckmc::splitCommas(rawGrid));
+      } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("--grid needs originX,originZ,cellBlocks,cols,rows: ") + e.what());
+      }
+    }
+    threads = std::stoi(argValue(args, "--threads", "1"));
+    if (control.empty()) single = specFrom(args);
+    std::string journal = argValue(args, "--journal", "");
+    if (!journal.empty()) ckmc::Journal::get().open(journal);
   } catch (const std::exception& e) {
     std::cerr << "ck-mc-load: " << e.what() << "\n";
     return 2;
   }
 
-  int threads = std::stoi(argValue(args, "--threads", "1"));
+  if (control.empty() && !has(args, "--host") && !has(args, "--name")) {
+    usage();
+    return 2;
+  }
+
   ckmc::Fleet fleet(threads);
   fleet.start();
+  // These reach every worker before any bot does: each worker reads its inbox in order.
+  if (bounds.enabled) fleet.setBounds(bounds);
+  if (grid.enabled) fleet.setGrid(grid);
 
-  std::string control = argValue(args, "--control", "");
+  int rc = 0;
   if (control.empty()) {
-    if (!has(args, "--host") && !has(args, "--name")) {
-      usage();
-      fleet.stop();
-      return 2;
-    }
-    fleet.add(specFrom(args));
+    fleet.add(single);
     while (gRun.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       if (fleet.started() > 0 && fleet.finished() >= fleet.started()) break;
     }
-    fleet.stop();
-    return 0;
-  }
-
-  int lst = -1;
-  try {
-    lst = listenOn(control);
-  } catch (const std::exception& e) {
-    std::cerr << "ck-mc-load: " << e.what() << "\n";
-    fleet.stop();
-    return 2;
-  }
-  std::cerr << "ck-mc-load: control on " << control << "\n";
-  while (gRun.load()) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(lst, &fds);
-    timeval tv{0, 200000};
-    int rc = select(lst + 1, &fds, nullptr, nullptr, &tv);
-    if (rc <= 0) continue;
-    int client = ::accept(lst, nullptr, nullptr);
-    if (client < 0) continue;
-    std::string buf;
-    bool quit = false;
-    while (gRun.load() && !quit) {
-      char tmp[1024];
-      fd_set cfds;
-      FD_ZERO(&cfds);
-      FD_SET(client, &cfds);
-      timeval ctv{0, 200000};
-      int cr = select(client + 1, &cfds, nullptr, nullptr, &ctv);
-      if (cr <= 0) continue;
-      ssize_t n = ::recv(client, tmp, sizeof(tmp), 0);
-      if (n <= 0) break;
-      buf.append(tmp, tmp + n);
-      size_t nl;
-      while ((nl = buf.find('\n')) != std::string::npos) {
-        std::string line = buf.substr(0, nl);
-        buf.erase(0, nl + 1);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        std::stringstream ss(line);
-        std::vector<std::string> tok;
-        std::string word;
-        while (ss >> word) tok.push_back(word);
-        if (tok.empty()) continue;
-        try {
-          if (tok[0] == "add") {
-            fleet.add(specFromAdd(tok));
-            reply(client, "ok");
-          } else if (tok[0] == "stop" && tok.size() == 2) {
-            fleet.stopBot(tok[1]);
-            reply(client, "ok");
-          } else if (tok[0] == "stop-all") {
-            fleet.stopAll();
-            reply(client, "ok");
-          } else if (tok[0] == "quit") {
-            reply(client, "ok");
-            quit = true;
-            gRun = false;
-          } else {
-            reply(client, "err unknown");
-          }
-        } catch (const std::exception& e) {
-          reply(client, std::string("err ") + e.what());
-        }
-      }
+  } else {
+    ckmc::ControlServer server(fleet, gRun);
+    try {
+      server.listen(control);
+      std::cerr << "ck-mc-load: control on " << control << "\n";
+      server.start();
+      // The control socket has its own threads. This one only waits for the end.
+      while (gRun.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } catch (const std::exception& e) {
+      std::cerr << "ck-mc-load: " << e.what() << "\n";
+      rc = 2;
     }
-    ::close(client);
+    server.stop();
   }
-  ::close(lst);
   fleet.stop();
-  return 0;
+  ckmc::Journal::get().stop();
+  return rc;
 }
