@@ -2,9 +2,9 @@
 
 The tools that put 3,009 players in one survival world on 2026-11-25: a grid of CrowdyCraft servers (the server mod in
 `cks-minecraft-mod`), each running its own chunks, with the C++ load client's bots wandering across all of them and
-real game clients among them. The record of that run is
-`cks-project-root/project-root-docs/HANDOFF-2026-11-25-minecraft-mesh-3000.md`; what the mod had to change is in
-`cks-minecraft-mod/docs/seamless-handoff.md`, "A hundred servers, 3,000 players".
+real game clients among them. What the mod had to change, and what was measured, is in the mod's
+`docs/seamless-handoff.md`, "A hundred servers, 3,000 players"; the platform team's handoff of that date has the
+rest of the record.
 
 | File | What it does |
 | --- | --- |
@@ -119,6 +119,6 @@ rate is in `stats.csv` and on the F3 overlay in the frames.
   corner where four servers meet does not hold**: with 72 to 111 players on each of the four, two fell to 7 and 11
   ticks a second, their players timed out and joined again, and the burst of sign-ins slowed CK for everyone.
 - CK's dev tier took 12 sign-ins a second. Its service that runs hubs needed two settings changed to carry 3,000
-  players' hubs (the handoff has them).
+  players' hubs (the platform team's handoff of 2026-11-25 has them).
 - The bots fly above the clouds and cannot be hurt (`loadAccounts` in the server's config): the run measures servers
   with mob spawning on, not players fighting mobs.
