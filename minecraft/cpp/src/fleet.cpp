@@ -144,7 +144,8 @@ struct Fleet::Worker {
           if (!b || b->dead) continue;
           int before = b->fd;
           b->tick();
-          if (b->dead) dropFd(before);
+          if (b->fd != before) dropFd(before);
+          if (b->dead) dropFd(b->fd);
           else arm(*b);
         }
         next += std::chrono::milliseconds(50);
@@ -216,8 +217,9 @@ struct Fleet::Worker {
           continue;
         }
         if (ready[i].out) bot->onWritable();
-        if (!bot->dead && ready[i].in) bot->onReadable();
-        if (bot->dead) dropFd(fd);
+        if (!bot->dead && bot->fd == fd && ready[i].in) bot->onReadable();
+        if (bot->fd != fd) dropFd(fd);
+        if (bot->dead) dropFd(bot->fd);
         else arm(*bot);
       }
 #else
@@ -239,8 +241,9 @@ struct Fleet::Worker {
           continue;
         }
         if (evs[i].events & EPOLLOUT) bot->onWritable();
-        if (!bot->dead && (evs[i].events & EPOLLIN)) bot->onReadable();
-        if (bot->dead) dropFd(fd);
+        if (!bot->dead && bot->fd == fd && (evs[i].events & EPOLLIN)) bot->onReadable();
+        if (bot->fd != fd) dropFd(fd);
+        if (bot->dead) dropFd(bot->fd);
         else arm(*bot);
       }
 #endif

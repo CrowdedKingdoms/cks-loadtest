@@ -16,7 +16,7 @@ The source is `cks-loadtest/minecraft/cpp` on `feature/cpp-flying-load-clients` 
    - a client tick end
 5. Stops at `--max-seconds` (default 180), on disconnect, or when told to stop.
 
-A `ClientboundTransferPacket` is a failure. The bot logs it and drops the socket. It does not follow the transfer. A relay handoff is not a transfer: the same TCP connection stays up, and the server that accepted the login plays the bot on the other side. That is a successful crossing.
+A relay handoff is not a transfer: the same TCP connection stays up, and the server that accepted the login plays the bot on the other side. When that handoff cannot start, the server sends `ClientboundTransferPacket`. The bot follows it, the way the game client and the headless Java client do: it reconnects to the named host, with handshake state 3, and keeps the cookies the last server stored. The log line is `Load1 transferred to host:port`. A relay crossing has no such line.
 
 The bot does not answer an age menu. If the server is waiting for a birthday, it will hold the bot on the spot it spawned. Seed an adult answer first, or run a server that is not asking.
 
@@ -41,19 +41,19 @@ These are the lines to count. They also go to `--log` when that path is set.
 | `Load1 connecting to 127.0.0.1:25599` | TCP connect started. |
 | `Load1 login packet, waiting for a position` | Configuration finished, play started, no position yet. |
 | `Load1 at 1990.5000 74.0000 -55.0000` | The server's position packet. x y z are feet, four decimals. This is the line whose x changes side on a crossing the server confirms with a position packet. |
-| `Load1 phase=play placed=1 x=... y=... z=... walkY=... dir=east ... transfer=0 path=seam` | Still in play. Printed every 2 s. `y` is about `walkY + clearance`. `x` here is where the bot is trying to be, not a new server position. |
+| `Load1 phase=play placed=1 x=... y=... z=... walkY=... dir=east ... transfers=N path=seam` | Still in play. Printed every 2 s. `y` is about `walkY + clearance`. `transfers` is how many transfer packets this bot has followed. |
 | `Load1 east pause start` / `Load1 east pause done east_pauses=1` | Reached the east end of `seam` or a triangle point labeled east. Same shape for `west` and `north`. A pause by itself is not a crossing. |
 | `Load1 blocked at x=1990.5000` | Server x has not moved toward the target. The bot is about to change Z lane. |
-| `TRANSFER FAILURE Load1 ClientboundTransferPacket to 127.0.0.1:25600` | The server told this connection to leave. Count it as a failed hold. The bot is dead. |
+| `Load1 transferred to 127.0.0.1:25600` | The server could not keep the connection and named the next one. The bot joins it and keeps playing. |
 | `Load1 closed: ...` | Socket closed. Reasons include `login disconnect`, `config disconnect`, `play disconnect`, `connection closed`, `max runtime`. |
 
-A relay crossing often does not print a new `at` line, because the server does not send another position packet on the original connection. The server log is the other record: `Load1 crossed into east's chunks and was handed on`. Count a clean crossing as fully west (x ≤ 1991) to fully east (x ≥ 2008) or the reverse, on that same process, with no `TRANSFER FAILURE`.
+A relay crossing often does not print a new `at` line, because the server does not send another position packet on the original connection. The server log is the other record: `Load1 crossed into east's chunks and was handed on`. A followed transfer does print `transferred to`, and the next `phase=play` line is on the new connection.
 
 ## Server requirements
 
 The dedicated server has to be offline-mode. Whitelist the offline UUID above, not just the name. `allow-flight=true`. For a local mesh leave `server-ip=127.0.0.1`. The mod refuses offline mode when the listen address is not this machine, so do not bind `0.0.0.0` and do not put the client on a Docker bridge in front of that server.
 
-A bot that joins the wrong side of a cluster for its saved position gets a transfer at login (`belongs on east; sending them there`). That is the `TRANSFER FAILURE` line. Clear the saved record, or join the server that owns the spawn, before counting it as a capacity failure.
+A bot that joins the wrong side of a cluster for its saved position gets a transfer at login (`belongs on east; sending them there`). The bot follows that transfer and plays on the server that owns the spot.
 
 `protocol_test` has to pass before any bot touches a mesh. It checks the offline UUID, the flying bit, the airborne move, forward and sprint input, the arm swing, and that ten bots in one process stay under one Java walker's 512 MB heap.
 

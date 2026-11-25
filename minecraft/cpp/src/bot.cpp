@@ -23,6 +23,14 @@
 namespace ckmc {
 namespace {
 
+WanderBox gWander;
+
+}  // namespace
+
+void setWanderBox(WanderBox box) { gWander = box; }
+
+namespace {
+
 std::mutex gLogMu;
 
 constexpr double kEastAt = 2008.0;
@@ -52,6 +60,7 @@ Bot::Bot(BotSpec spec) : spec_(std::move(spec)) {
   if (spec_.path.empty()) spec_.path = "seam";
   if (spec_.clearance < 1.0) spec_.clearance = 1.0;
   parseWaypoints();
+  parseWanderBox();
   std::mt19937 rng(static_cast<uint32_t>(std::hash<std::string>{}(spec_.name)));
   std::uniform_real_distribution<double> turn(0.0, 6.283185307179586);
   wanderHeading_ = turn(rng);
@@ -67,6 +76,17 @@ Bot::~Bot() {
     std::fclose(log_);
     log_ = nullptr;
   }
+}
+
+void Bot::parseWanderBox() {
+  if (spec_.path != "wander" || spec_.waypoints.empty() || spec_.waypoints == "-") return;
+  std::stringstream in(spec_.waypoints);
+  char comma;
+  WanderBox box;
+  if (!(in >> box.minX >> comma >> box.minZ >> comma >> box.maxX >> comma >> box.maxZ)) return;
+  if (box.minX >= box.maxX || box.minZ >= box.maxZ) return;
+  box.enabled = true;
+  box_ = box;
 }
 
 void Bot::parseWaypoints() {
@@ -194,6 +214,36 @@ void Bot::beginConfigFromPlay() {
   placed_ = false;
 }
 
+void Bot::followTransfer(const std::string& host, uint32_t port) {
+  if (host.empty() || port == 0 || port > 65535) {
+    fail("transfer to " + host + ":" + std::to_string(port));
+    return;
+  }
+  say(spec_.name + " transferred to " + host + ":" + std::to_string(port));
+  reconnect(host, static_cast<int>(port), 3);
+  transfersFollowed_++;
+}
+
+void Bot::reconnect(const std::string& host, int port, int handshakeState) {
+  if (fd >= 0) {
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+    fd = -1;
+  }
+  spec_.host = host;
+  spec_.port = port;
+  established_ = false;
+  compression_ = -1;
+  phase_ = Phase::Login;
+  placed_ = false;
+  sentAbilities_ = false;
+  in_.clear();
+  out_.clear();
+  handshakeState_ = handshakeState;
+  if (handshakeState == 2) cookies_.clear();
+  start();
+}
+
 void Bot::onWritable() {
   if (dead || fd < 0) return;
   if (!established_) {
@@ -212,7 +262,7 @@ void Bot::onWritable() {
     handshake.wVar(static_cast<uint32_t>(kProtocolVersion));
     handshake.wUtf(spec_.host);
     handshake.wU16(static_cast<uint16_t>(spec_.port));
-    handshake.wVar(2);
+    handshake.wVar(static_cast<uint32_t>(handshakeState_));
     // Handshake is uncompressed and uses its own id, then login hello on the same socket.
     compression_ = -1;
     send(pid(SbHandshake::CLIENT_INTENTION), handshake.b);
@@ -235,12 +285,14 @@ void Bot::onWritable() {
 
 void Bot::onReadable() {
   if (dead || fd < 0) return;
+  int reading = fd;
+  bool eof = false;
   uint8_t tmp[65536];
   while (true) {
     ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
     if (n == 0) {
-      fail("connection closed");
-      return;
+      eof = true;
+      break;
     }
     if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -250,15 +302,15 @@ void Bot::onReadable() {
     in_.insert(in_.end(), tmp, tmp + n);
     if (n < static_cast<ssize_t>(sizeof(tmp))) break;
   }
-  while (!dead) {
+  while (!dead && fd == reading) {
     std::vector<uint8_t> packet;
     std::string err;
     size_t before = in_.size();
     if (!decodeFrame(in_, compression_, packet, err)) {
       if (!err.empty()) fail(err);
-      return;
+      break;
     }
-    if (in_.size() == before) return;
+    if (in_.size() == before) break;
     Buf body;
     int id = packetIdOf(packet, body);
     if (id < 0 || !body.ok) {
@@ -266,6 +318,23 @@ void Bot::onReadable() {
       return;
     }
     handle(id, body.b.data(), body.b.size());
+  }
+  // A transfer closes this socket after the packet that names the next server.
+  // That end is the handoff, not a drop, once the bot has followed it. A new
+  // connection that closes before play is the destination still busy; try again.
+  if (eof && !dead && fd == reading) {
+    if (phase_ != Phase::Play && transfersFollowed_ > 0 && transferRetries_ < 4 && !spec_.host.empty()) {
+      transferRetries_++;
+      reconnect(spec_.host, spec_.port, 3);
+      return;
+    }
+    if (placed_ && transferRetries_ < 6 && !spec_.host.empty()) {
+      transferRetries_++;
+      say(spec_.name + " rejoining " + spec_.host + ":" + std::to_string(spec_.port));
+      reconnect(spec_.host, spec_.port, 2);
+      return;
+    }
+    fail("connection closed");
   }
 }
 
@@ -408,9 +477,11 @@ void Bot::handleConfig(int packetId, const uint8_t* body, size_t len) {
     Buf b = bufFrom(body, len);
     std::string host = b.rUtf();
     uint32_t port = b.rVar();
-    transfer_ = true;
-    say("TRANSFER FAILURE " + spec_.name + " ClientboundTransferPacket to " + host + ":" + std::to_string(port));
-    stop("transfer");
+    if (!b.ok) {
+      fail("transfer packet short");
+      return;
+    }
+    followTransfer(host, port);
     return;
   }
   if (packetId == pid(CbConfig::FINISH_CONFIGURATION)) {
@@ -461,9 +532,11 @@ void Bot::handlePlay(int packetId, const uint8_t* body, size_t len) {
     Buf b = bufFrom(body, len);
     std::string host = b.rUtf();
     uint32_t port = b.rVar();
-    transfer_ = true;
-    say("TRANSFER FAILURE " + spec_.name + " ClientboundTransferPacket to " + host + ":" + std::to_string(port));
-    stop("transfer");
+    if (!b.ok) {
+      fail("transfer packet short");
+      return;
+    }
+    followTransfer(host, port);
     return;
   }
   if (packetId == pid(CbPlay::DISCONNECT)) {
@@ -507,6 +580,7 @@ void Bot::onPosition(const uint8_t* body, size_t len) {
     progressX_ = nx;
     progressSet_ = true;
   }
+  transferRetries_ = 0;
   bool toward = direction_ > 0 ? nx > progressX_ + 0.05 : nx < progressX_ - 0.05;
   if (toward) {
     progressX_ = nx;
@@ -609,6 +683,17 @@ void Bot::tickMotion() {
     }
     double dx = std::cos(wanderHeading_) * step;
     double dz = std::sin(wanderHeading_) * step;
+    if (gWander.enabled || box_.enabled) {
+      const WanderBox& box = box_.enabled ? box_ : gWander;
+      // Already outside: walk back in. Inside: bounce off the next step that would leave.
+      if (x_ < box.minX) dx = std::fabs(dx);
+      else if (x_ > box.maxX) dx = -std::fabs(dx);
+      else if (x_ + dx < box.minX || x_ + dx > box.maxX) dx = -dx;
+      if (z_ < box.minZ) dz = std::fabs(dz);
+      else if (z_ > box.maxZ) dz = -std::fabs(dz);
+      else if (z_ + dz < box.minZ || z_ + dz > box.maxZ) dz = -dz;
+      wanderHeading_ = std::atan2(dz, dx);
+    }
     x_ += dx;
     z_ += dz;
     yaw_ = yawOf(dx, dz);
@@ -681,23 +766,30 @@ void Bot::tickMotion() {
 void Bot::tick() {
   if (dead || !established_) return;
   ticks_++;
+  if (ticks_ == 1) {
+    if (box_.enabled) {
+      say(spec_.name + " box " + f3(box_.minX) + " " + f3(box_.minZ) + " " + f3(box_.maxX) + " " + f3(box_.maxZ));
+    } else {
+      say(spec_.name + " box off");
+    }
+  }
   if (ticks_ > maxTicks_) {
     say(spec_.name + " max runtime (~" + std::to_string(spec_.maxSeconds) + "s)");
     stop("max runtime");
     return;
   }
-  if (phase_ != Phase::Play || !placed_ || transfer_) {
-    if (phase_ == Phase::Play && !transfer_) sendEmpty(pid(SbPlay::CLIENT_TICK_END));
+  if (phase_ != Phase::Play || !placed_) {
+    if (phase_ == Phase::Play) sendEmpty(pid(SbPlay::CLIENT_TICK_END));
     return;
   }
   if (!sentAbilities_) sendAbilities();
   tickMotion();
-  if (ticks_ % 40 == 0) {
+  if (ticks_ % 200 == 0) {
     say(spec_.name + " phase=play placed=1 x=" + f3(x_) + " y=" + f3(y_) + " z=" + f3(z_) +
         " walkY=" + f3(surfaceY_) + " dir=" + (direction_ > 0 ? "east" : "west") +
         (escaping_ ? " lane" : "") + " east_pauses=" + std::to_string(eastPauses_) +
         " west_pauses=" + std::to_string(westPauses_) + " north_pauses=" + std::to_string(northPauses_) +
-        " transfer=0 path=" + spec_.path);
+        " transfers=" + std::to_string(transfersFollowed_) + " path=" + spec_.path);
   }
 }
 

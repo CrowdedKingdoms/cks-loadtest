@@ -21,6 +21,17 @@ struct BotSpec {
   std::string logPath;
 };
 
+// Process-wide rectangle for wander. Unset leaves wander unbounded.
+struct WanderBox {
+  bool enabled = false;
+  double minX = 0;
+  double minZ = 0;
+  double maxX = 0;
+  double maxZ = 0;
+};
+
+void setWanderBox(WanderBox box);
+
 // One Minecraft 26.3 TCP client. The worker thread calls the socket and tick methods.
 class Bot {
  public:
@@ -60,7 +71,10 @@ class Bot {
   std::vector<std::pair<std::string, std::string>> cookies_;
 
   bool placed_ = false;
-  bool transfer_ = false;
+  // Handshake next-state: 2 is a fresh login, 3 is a transfer (the client is following a move).
+  int handshakeState_ = 2;
+  int transfersFollowed_ = 0;
+  int transferRetries_ = 0;
   bool sentAbilities_ = false;
   int ticks_ = 0;
   int maxTicks_ = 3600;
@@ -85,6 +99,7 @@ class Bot {
   float yaw_ = -90.f;
   float pitch_ = 8.f;
   double wanderHeading_ = 0;
+  WanderBox box_{};
   int waypointIndex_ = 0;
   std::vector<Waypoint> waypoints_;
   std::FILE* log_ = nullptr;
@@ -94,6 +109,10 @@ class Bot {
   void sendEmpty(int packetId);
   void enterPlay();
   void beginConfigFromPlay();
+  // The server could not keep this connection and named the server to join. Reconnect there,
+  // keeping the cookies the last server stored, the way a game client follows a transfer.
+  void followTransfer(const std::string& host, uint32_t port);
+  void reconnect(const std::string& host, int port, int handshakeState);
   void handle(int packetId, const uint8_t* body, size_t len);
   void handleLogin(int packetId, const uint8_t* body, size_t len);
   void handleConfig(int packetId, const uint8_t* body, size_t len);
@@ -104,6 +123,7 @@ class Bot {
   void sendAbilities();
   void fail(const std::string& why);
   void parseWaypoints();
+  void parseWanderBox();
 };
 
 }  // namespace ckmc

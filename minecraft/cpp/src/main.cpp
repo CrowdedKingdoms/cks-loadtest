@@ -31,6 +31,7 @@ void usage() {
       << "  --path seam|triangle|wander     default seam\n"
       << "  --waypoints x,y,z,side;...      triangle only\n"
       << "  --bps N                 wander speed, blocks per second (default 2)\n"
+      << "  --bounds minX,minZ,maxX,maxZ   wander turns back at this rectangle\n"
       << "  --clearance N           blocks above the last server feet Y (default 8)\n"
       << "  --max-seconds N         default 180\n"
       << "  --log PATH              also append this bot's lines to PATH\n";
@@ -47,6 +48,20 @@ bool has(const std::vector<std::string>& args, const std::string& key) {
   for (const auto& a : args)
     if (a == key) return true;
   return false;
+}
+
+void applyBounds(const std::vector<std::string>& args) {
+  std::string raw = argValue(args, "--bounds", "");
+  if (raw.empty()) return;
+  ckmc::WanderBox box;
+  char comma;
+  std::stringstream in(raw);
+  if (!(in >> box.minX >> comma >> box.minZ >> comma >> box.maxX >> comma >> box.maxZ) || box.minX >= box.maxX ||
+      box.minZ >= box.maxZ) {
+    throw std::runtime_error("--bounds needs minX,minZ,maxX,maxZ");
+  }
+  box.enabled = true;
+  ckmc::setWanderBox(box);
 }
 
 ckmc::BotSpec specFrom(const std::vector<std::string>& args) {
@@ -127,6 +142,13 @@ int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
   signal(SIGINT, onSignal);
   signal(SIGTERM, onSignal);
+
+  try {
+    applyBounds(args);
+  } catch (const std::exception& e) {
+    std::cerr << "ck-mc-load: " << e.what() << "\n";
+    return 2;
+  }
 
   int threads = std::stoi(argValue(args, "--threads", "1"));
   ckmc::Fleet fleet(threads);

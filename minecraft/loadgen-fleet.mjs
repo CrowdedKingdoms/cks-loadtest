@@ -323,7 +323,7 @@ async function up(count, flavorName) {
           vm.tailnetIp = tip;
           vm.tailnetName = vm.name;
           execSync(
-            `tailscale ssh -o ConnectTimeout=10 ubuntu@${tip} -- 'echo ok && uname -a && nproc'`,
+            `tailscale ssh ubuntu@${tip} 'echo ok && uname -a && nproc'`,
             { stdio: "pipe" },
           );
           log(`${vm.name} reachable over Tailscale ${tip}`);
