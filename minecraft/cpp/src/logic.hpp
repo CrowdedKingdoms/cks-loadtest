@@ -191,9 +191,8 @@ inline constexpr int16_t kNoColumn = static_cast<int16_t>(-32768);
 // column has no motion-blocking block.
 bool motionColumnFeet(const uint64_t* data, int count, int localX, int localZ, int& feetY);
 
-// One tick toward `feet`. A gap of at most 8 blocks closes in that tick (a clearance of 8
-// is accepted; a much larger single step is rejected). A longer fall uses vanilla gravity
-// (subtract 0.08, then * 0.98) and does not pass `feet`. A longer climb is 8 blocks a tick.
+// One tick toward `feet`. Vanilla gravity downward (0.08, then * 0.98), never past `feet`.
+// Upward at most 0.4, the same step the altitude ramp uses.
 void approachGround(double& y, double& vy, double feet);
 
 // ChunkPos as FriendlyByteBuf writes it: x in the low 32 bits, z in the high 32.

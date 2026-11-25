@@ -582,17 +582,62 @@ static void testGroundColumns() {
   double y = 90;
   double vy = 0;
   approachGround(y, vy, 84);
-  check(y == 84 && vy == 0, "ground: a short drop lands in one tick");
-  y = 100;
-  vy = 0;
-  approachGround(y, vy, 64);
-  check(y < 100 && y > 64, "ground: a long drop starts falling, y=" + std::to_string(y));
-  for (int i = 0; i < 80 && y > 64; i++) approachGround(y, vy, 64);
-  check(y == 64 && vy == 0, "ground: the fall stops on the surface, y=" + std::to_string(y));
+  check(y < 90 && y > 84, "ground: a drop starts falling, y=" + std::to_string(y));
+  for (int i = 0; i < 80 && std::fabs(y - 84) > 1e-6; i++) approachGround(y, vy, 84);
+  check(y == 84 && vy == 0, "ground: the fall stops on the surface, y=" + std::to_string(y));
   y = 40;
   vy = 0;
   approachGround(y, vy, 64);
-  check(y == 48, "ground: a long climb is 8 blocks");
+  check(std::fabs(y - 40.4) < 1e-9, "ground: a climb is 0.4, y=" + std::to_string(y));
+}
+
+// A wander bot given a chunk stands on that motion-blocking surface, and does not
+// keep the flying bit that would stop the server from agreeing.
+static void testWanderLands() {
+  int port = 0;
+  int lst = listenEphemeral(port);
+  Fleet fleet(1);
+  fleet.start();
+  BotSpec spec;
+  spec.name = "Ground1";
+  spec.host = "127.0.0.1";
+  spec.port = port;
+  spec.path = "wander";
+  spec.bps = 2;
+  spec.clearance = 8;
+  spec.maxSeconds = 30;
+  spec.logPath = "/dev/null";
+  fleet.add(spec);
+
+  Peer p;
+  p.fd = acceptWithin(lst, kPatienceMs);
+  if (p.fd < 0) fail("ground: no connection");
+  JoinOptions o;
+  o.x = 8.5;
+  o.y = 100.0;
+  o.z = 8.5;
+  joinWorld(p, o);
+  sendPacket(p, pid(CbPlay::LEVEL_CHUNK_WITH_LIGHT), flatChunk(0, 0, 64));
+
+  bool flying = false;
+  bool landed = false;
+  double lowest = 1000;
+  collect(p, kPatienceMs, [&](int id, Buf& body) {
+    if (id == pid(SbPlay::PLAYER_ABILITIES) && !body.b.empty() && (body.b[0] & 0x02)) flying = true;
+    Move m;
+    if (id == pid(SbPlay::MOVE_PLAYER_POS_ROT) && readMove(body, m)) {
+      if (m.y < lowest) lowest = m.y;
+      if (std::fabs(m.y - 64.0) < 1e-6 && !m.airborne) landed = true;
+    }
+    return landed;
+  });
+  check(!flying, "ground: wander sent the flying bit");
+  check(landed, "ground: did not stand on the heightmap, lowest y=" + std::to_string(lowest));
+
+  fleet.stopAll();
+  fleet.stop();
+  ::close(p.fd);
+  ::close(lst);
 }
 
 static void testJavaWander() {
@@ -1521,6 +1566,7 @@ int main(int argc, char** argv) {
     testControlLines();
     testStatsFormat();
     testGroundColumns();
+    testWanderLands();
     testJavaWander();
     testGround();
     testWander();

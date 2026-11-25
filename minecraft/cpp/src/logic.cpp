@@ -219,14 +219,7 @@ bool motionColumnFeet(const uint64_t* data, int count, int localX, int localZ, i
 }
 
 void approachGround(double& y, double& vy, double feet) {
-  constexpr double kSnap = 8.0;
-  double gap = y - feet;
-  if (std::fabs(gap) <= 1e-6 || std::fabs(gap) <= kSnap) {
-    y = feet;
-    vy = 0;
-    return;
-  }
-  if (gap > 0) {
+  if (y > feet + 1e-6) {
     vy = (vy - 0.08) * 0.98;
     if (vy < -3.92) vy = -3.92;
     y += vy;
@@ -236,8 +229,13 @@ void approachGround(double& y, double& vy, double feet) {
     }
     return;
   }
+  if (y < feet - 1e-6) {
+    vy = 0;
+    y = rampAltitude(y, feet);
+    return;
+  }
+  y = feet;
   vy = 0;
-  y = std::min(feet, y + kSnap);
 }
 
 bool readChunkGround(const uint8_t* body, size_t len, ChunkGround& out) {
