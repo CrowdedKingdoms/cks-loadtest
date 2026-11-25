@@ -39,6 +39,7 @@ import net.minecraft.client.player.LocalPlayer;
  * walk &lt;yaw&gt; &lt;seconds&gt; [sprint] [jump]    holds forward, as a player would
  * hold &lt;attack|use|sneak|jump|tab&gt; &lt;seconds&gt;  holds that key (attack and use act on the block under the crosshair; tab shows the player list)
  * f3 &lt;on|off&gt;                              the game's debug overlay, which shows its frames a second
+ * respawn                                  presses Respawn for a player who died
  * </pre>
  * Frames are numbered from 00000; ffmpeg turns a folder into a movie at 20 frames a second, the game's tick rate.
  * The movie's smoothness is the tick rate's, not the frame rate's: that is in stats.csv.
@@ -200,6 +201,10 @@ public final class MeshCam implements ClientModInitializer {
 					stepLength = ticks(w[2]);
 				}
 				case "f3" -> minecraft.debugEntries.setOverlayVisible(w[1].equals("on"));
+				case "respawn" -> {
+					player.respawn();
+					minecraft.gui.setScreen(null);
+				}
 				default -> log("unknown step: " + next.line());
 			}
 		} catch (RuntimeException | IOException e) {

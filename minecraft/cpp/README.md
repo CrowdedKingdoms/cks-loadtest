@@ -51,3 +51,10 @@ stop <name>
 stop-all
 quit
 ```
+
+Since 2026-11-25 the control socket has its own thread, takes many connections and many lines a write, and answers
+more commands: `stats` (counts by phase, rejoins, crossings), `list <phase>`, `bounds`, `grid`, `rally x z radius
+[count]` and `unrally`, `speed`, `altitude`. A bot that loses its connection joins the server it first joined again,
+with backoff; one that dies respawns. `--journal <file>` writes one log for every bot, off the tick. Each of these is
+described in [CK-MC-LOAD.md](CK-MC-LOAD.md); the tool that drives many generators at once is
+[../mesh/README.md](../mesh/README.md).

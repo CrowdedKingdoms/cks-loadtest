@@ -469,7 +469,9 @@ cp -n ages/*.json world/crowdedkingdoms/ages/ 2>/dev/null || true
 chmod 600 crowdy.env
 cat > server.properties <<'PROP'
 {properties(mesh, settings, server)}PROP
-[ -f steps.txt ] || cat > steps.txt <<'STEPS'
+# Written anew at every start: a server reads its step file from the top when it starts, so steps a test appended
+# while it ran (a scenario's, a console line) would otherwise all play again.
+cat > steps.txt <<'STEPS'
 {chr(10).join(first_steps(mesh))}
 STEPS
 sudo tee /etc/systemd/system/mc-mesh.service >/dev/null <<'UNIT'

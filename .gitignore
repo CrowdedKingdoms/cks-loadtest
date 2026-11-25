@@ -8,3 +8,5 @@ loadtest.env
 roster.json
 loadtest-roster.json
 *-roster.json
+
+__pycache__/

@@ -119,6 +119,7 @@ def main():
     p.add_argument("--out", help="a folder for the clients' logs and this run's record (default: <run>/scenarios/<scenario>)")
     p.add_argument("--timeout", type=int, default=1500)
     p.add_argument("--names", help="a prefix: the scenario's Tester1..4 play as <prefix>1..4, players new to the world, and nobody is put home first")
+    p.add_argument("--drop", help="a regular expression: steps that match are left out (and listed in the result)")
     p.add_argument("--no-home", action="store_true", help="do not put the scenario's test players on the west server first")
     p.add_argument("--home-seconds", type=int, default=40)
     args = p.parse_args()
@@ -137,6 +138,13 @@ def main():
     home_x, home_z = home_spot(sides["west"])
     for side in steps:
         steps[side] = [re.sub(r"^tp (\S+) 0 0$", rf"tp \1 {home_x} {home_z}", line) for line in steps[side]]
+    dropped = []
+    if args.drop:
+        # A step written for two servers alone: "?relays 1" (exactly one relay on this server) can never be met on a
+        # mesh server that relays dozens of other players.
+        for side in steps:
+            dropped += [f"{side}: {line}" for line in steps[side] if re.search(args.drop, line)]
+            steps[side] = [line for line in steps[side] if not re.search(args.drop, line)]
     if args.names:
         # Players nobody has been: each starts where it first joins (the west server's chunks), so nothing has to be
         # put back between scenarios. Tester1 becomes <prefix>1, and so on; the names must be on the whitelist.
@@ -249,7 +257,7 @@ def main():
             except (RuntimeError, subprocess.TimeoutExpired):
                 pass
     record = {"scenario": args.scenario, "west": args.west, "east": args.east, "result": "pass" if not misses else "fail", "seconds": seconds,
-              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
+              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
     (out / "result.json").write_text(json.dumps(record, indent=1) + "\n")
     print(json.dumps(record))
     return 0 if not misses else 1
