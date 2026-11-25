@@ -42,6 +42,24 @@ target_link_libraries(cks-loadtest PRIVATE loadtest_core)
 add_executable(cks-loadtest-ctl src/ctl.cpp)
 target_link_libraries(cks-loadtest-ctl PRIVATE loadtest_core)
 
+# ck-fleet-load: the fleet session load client (docs/FLEET-LOAD.md). It reuses
+# the harness's wire, HMAC, GraphQL and Provisioner code from loadtest_core.
+add_library(fleet_load_core STATIC
+  src/fleet/FleetStats.cpp
+  src/fleet/FleetConfig.cpp
+  src/fleet/FleetApi.cpp
+  src/fleet/Roster.cpp
+  src/fleet/FleetWorker.cpp
+  src/fleet/FakeRealtime.cpp
+  src/fleet/FleetRun.cpp
+  src/fleet/DryRun.cpp
+  src/fleet/SelfTest.cpp
+)
+target_link_libraries(fleet_load_core PUBLIC loadtest_core)
+
+add_executable(ck-fleet-load src/fleet/main.cpp)
+target_link_libraries(ck-fleet-load PRIVATE fleet_load_core)
+
 enable_testing()
 add_executable(wire_test tests/wire_test.cpp)
 target_link_libraries(wire_test PRIVATE loadtest_core)

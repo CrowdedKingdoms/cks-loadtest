@@ -1,0 +1,80 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+namespace lt::fleet {
+
+/// Options of ck-fleet-load. The org token is never an option: it is read from
+/// the environment variable CK_ORG_TOKEN, and nothing prints it.
+struct FleetConfig {
+    // What to run against.
+    std::string api;              // --api: the Application API's GraphQL endpoint
+    int64_t appId = 0;            // --app: an app of the organization
+
+    // Scale.
+    int servers = 100;            // --servers: simulated game servers, one fleet session each
+    int players = 3000;           // --players: players carried in total
+    int durationS = 1800;         // --duration-s: the measured window, after every player has joined
+    double updateHz = 5.0;        // --update-hz: actor updates a second for each carried player
+    double crossRate = 75.0;      // --cross-rate: target crossings a second over all players
+    double signinRate = 20.0;     // --signin-rate: mintManagedPlayerToken calls a second
+    // Region side in chunks. A player within `distance` chunks of a border is in
+    // replication range of players standing just across it. With the default
+    // distance of 8, a 16-chunk region has every player within 8 chunks of a
+    // border, so each server keeps receiving its neighbours' players.
+    int regionChunks = 16;        // --region-chunks
+    uint64_t seed = 1;            // --seed: placement and walks
+    bool ownState = false;        // --own-state: set the FLEET_OWN_STATE capability bit
+    std::string rosterFile;       // --roster-file: minted player tokens, saved and reused
+    bool dryRun = false;          // --dry-run: no network
+    bool selfTest = false;        // --self-test
+
+    // Wire and world details.
+    int distance = 8;             // --distance: replication distance of an actor update, chunks
+    int decay = 1;                // --decay: 0 none, 1 exponential, 2..5 linear
+    double chunkSizeUnits = 1600; // --chunk-size-units: chunk edge in position units (UE5 state)
+    int latencySample = 100;      // --latency-sample: players whose updates carry a send time
+    double heartbeatS = 2.0;      // --heartbeat-s: the session's own keep-alive (0 turns it off)
+    int capsIntervalS = 15;       // --caps-interval-s: CLIENT_CAPABILITIES again this often
+    int sessionSettleMs = 1500;   // --session-settle-ms: wait after the API authorizes a session
+    int rxSilentS = 0;            // --rx-silent-s: move a session that hears nothing this long (0 off)
+    int socketRcvbufBytes = 1024 * 1024; // --socket-rcvbuf-bytes (0 keeps the kernel default)
+
+    // The generator.
+    int threads = 4;              // --threads: realtime worker threads
+    int apiThreads = 8;           // --api-threads: Application API threads
+    int statsIntervalS = 5;       // --stats-interval-s: the progress line on stderr
+    int tokenRefreshLeadS = 120;  // --token-refresh-lead-s: refresh a player's token this early
+    int drainS = 6;               // --drain-s: wait for open carries and releases at the end
+    bool tlsInsecure = false;     // --tls-insecure
+    std::string summaryFile;      // --summary-file: also write the summary JSON here
+
+    // Dry run.
+    double dryRunS = 5.0;         // --dry-run-s: how long the world runs in a dry run
+
+    // Fixed by the contract; kept here so tests can shorten them.
+    int carryResendMs = 250;      // resend FLEET_CARRY until its result arrives
+    int carryGiveUpMs = 5000;     // give up on a carry and count it
+    int carryRetryMs = 1000;      // start again after giving up
+    int releaseWaitMs = 5000;     // FLEET_RELEASED reason 1 counted missing after this
+    int permWindowRadiusChunks = 8;
+    int permReloadGraceMs = 5000;
+    int firstContactGraceMs = 2000;
+
+    // Whether the command line set these: a dry run picks its own otherwise.
+    bool signinRateGiven = false;
+    bool sessionSettleGiven = false;
+
+    /// Read from CK_ORG_TOKEN by load(). Never printed, never in the summary.
+    std::string orgToken;
+
+    /// Parse argv. Prints usage and exits on --help or a bad option.
+    static FleetConfig load(int argc, char** argv);
+    /// Empty when the options make a run possible, otherwise what is wrong.
+    std::string validate() const;
+    /// The `--api` value with /graphql removed: what a roster records.
+    std::string apiOrigin() const;
+};
+
+} // namespace lt::fleet
