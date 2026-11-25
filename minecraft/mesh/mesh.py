@@ -391,6 +391,32 @@ def ssh(server, command, timeout=120, input=None):
     return result.stdout
 
 
+def allowed(run):
+    """The addresses that may reach the game and link ports besides the servers' own: the run's machines (allow.json,
+    from `hosts`) and the ones an operator added (allow-extra.json, from `allow`: a camera's, say)."""
+    out = set()
+    for name in ("allow.json", "allow-extra.json"):
+        if (run / name).exists():
+            out |= set(json.loads((run / name).read_text()))
+    return out
+
+
+def cmd_allow(args):
+    """One more address may reach every server's game port: now, and after any later `up`."""
+    import ipaddress
+    address = str(ipaddress.ip_address(args.address))
+    run = Path(args.run)
+    mesh = load(run)
+    if mesh.get("local"):
+        sys.exit("allow: a local mesh has no firewall")
+    extra = run / "allow-extra.json"
+    known = set(json.loads(extra.read_text())) if extra.exists() else set()
+    extra.write_text(json.dumps(sorted(known | {address})))
+    rule = f"-s {address}/32 -j ACCEPT"
+    done = each(mesh["servers"], lambda server: ssh(server, f"sudo iptables -C MESH {rule} 2>/dev/null || sudo iptables -I MESH 2 {rule}", timeout=60), "allow")
+    print(f"allow: {address} on {len(done)} of {len(mesh['servers'])} servers")
+
+
 def each(servers, work, what, workers=24):
     """Runs work(server) for every server at once; prints who failed; returns {id: result}."""
     results = {}
@@ -404,15 +430,15 @@ def each(servers, work, what, workers=24):
             except Exception as e:  # noqa: BLE001 - every failure is reported by name
                 failed.append(f"{server['id']}: {e}")
     if failed:
-        print(f"{what}: {len(failed)} of {len(servers)} failed")
+        print(f"{what}: {len(failed)} of {len(servers)} failed", file=sys.stderr)
         for line in sorted(failed)[:20]:
-            print("  " + line)
+            print("  " + line, file=sys.stderr)
     return results
 
 
 def remote_up(run, mesh, settings, servers, args):
     payload = run / "payload.tar"
-    peers = sorted({s["host"] for s in mesh["servers"]} | set(json.loads((run / "allow.json").read_text()) if (run / "allow.json").exists() else []))
+    peers = sorted({s["host"] for s in mesh["servers"]} | allowed(run))
 
     def bring(server):
         if not args.restart_only:
@@ -755,6 +781,9 @@ def main():
 
     p = add("down", cmd_down)
     p.add_argument("--only")
+
+    p = add("allow", cmd_allow)
+    p.add_argument("address", help="an address outside the run (a camera's, a tester's) that may join the servers")
 
     p = add("watch", cmd_watch)
     p.add_argument("--all", action="store_true")

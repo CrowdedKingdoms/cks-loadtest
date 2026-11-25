@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "meshcam",
+  "version": "1.0.0",
+  "name": "Mesh camera",
+  "description": "Writes the game's own frames to files and plays a short camera script, for filming a load test's crowd.",
+  "environment": "client",
+  "entrypoints": { "client": ["com.crowdedkingdoms.meshcam.MeshCam"] },
+  "depends": { "fabricloader": ">=0.16.0", "fabric-lifecycle-events-v1": "*" }
+}
