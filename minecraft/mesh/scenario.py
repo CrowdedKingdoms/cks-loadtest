@@ -105,6 +105,37 @@ def shift_z(line, dz, unshifted):
     return " ".join(words)
 
 
+# On this pair the line is block x 2000 and the margin is 8. A teleport to 2012 crossed.
+# A step aimed at 2009 did not. Coordinates already at or past 2012 stay. Coordinates still
+# west of the margin (below 2008), including the band the handoff scenario stands in, stay.
+CROSS_X = 2012
+CROSS_FROM = 2008
+CROSS_PAIRS = PAIRS | {"drive"}
+
+
+def nudge_cross_x(line, nudged):
+    """Land a step that means cross east at x 2012, the teleport that crossed on this pair."""
+    words = line.split(" ")
+    kind = words[0] if words[0] != "console" else " ".join(words[:2])
+    step = 3 if kind in TRIPLES else 2 if kind in CROSS_PAIRS else 0
+    if not step:
+        return line
+    i = 0
+    while i < len(words):
+        if NUMBER.match(words[i]) and 1880 <= float(words[i]) <= 2300:
+            at = i + step - 1
+            if at < len(words) and all(NUMBER.match(w) for w in words[i:at + 1]):
+                x = float(words[i])
+                if CROSS_FROM <= x < CROSS_X:
+                    was = words[i]
+                    words[i] = str(CROSS_X) if "." not in was else f"{float(CROSS_X):.1f}"
+                    nudged.append(f"{was} -> {words[i]}")
+                i = at + 1
+                continue
+        i += 1
+    return " ".join(words)
+
+
 def follow(server, offset, pattern, seconds):
     """The first line of the server's log past that offset that matches, or None after that long."""
     until = time.time() + seconds
@@ -245,6 +276,26 @@ def main():
         else:
             for side in steps:
                 steps[side] = [re.sub(r"\bTester([0-9]+)\b", rf"{args.names}\1", line) for line in steps[side]]
+    if args.pair:
+        # The step's 25599 or 25600 chooses the side. On this pair the headless client joins that side's own port.
+        for side in steps:
+            join = str(sides[side].get("port") or 25565)
+            rewritten = []
+            for line in steps[side]:
+                words = line.split()
+                if words and words[0] == "client" and len(words) >= 3 and words[2] in ("25599", "25600"):
+                    words[2] = join
+                    line = " ".join(words)
+                rewritten.append(line)
+            steps[side] = rewritten
+        # This pair's east chunks start at block x 2000. A cross has to finish at 2012, as handoff's
+        # teleport did. 2008 and 2009 are still short of that. The step files stay written for the
+        # local cluster; only this pair's copy of a step moves.
+        nudged = []
+        for side in steps:
+            steps[side] = [nudge_cross_x(line, nudged) for line in steps[side]]
+    else:
+        nudged = []
     for side, lines in steps.items():
         for line in lines:
             words = line.split()
@@ -360,7 +411,7 @@ def main():
             except (RuntimeError, subprocess.TimeoutExpired):
                 pass
     record = {"scenario": args.scenario, "west": args.west, "east": args.east, "result": "pass" if not misses else "fail", "seconds": seconds,
-              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "shiftZ": args.shift_z, "unshifted": unshifted[:20], "stepsThatFailed": len(noted), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
+              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "shiftZ": args.shift_z, "unshifted": unshifted[:20], "nudgedX": nudged[:20], "stepsThatFailed": len(noted), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
     (out / "result.json").write_text(json.dumps(record, indent=1) + "\n")
     print(json.dumps(record))
     return 0 if not misses else 1
