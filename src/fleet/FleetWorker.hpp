@@ -166,6 +166,7 @@ private:
         int64_t firstSentNs = 0;     // 0 until the first FLEET_CARRY went out (it may wait its turn)
         int64_t lastSentNs = 0;
         bool waited = false;         // it waited for the session's carry rate
+        int resends = 0;             // times it was sent again: each wait is twice the last
     };
 
     struct Player {
@@ -254,6 +255,7 @@ private:
         bool movePending = false;    // told to move while the last move was settling
         MoveTrigger pendingTrigger = MoveTrigger::ReconnectCommand;
         bool pendingToldToMove = false;
+        bool toldToMove = false;     // the move in progress was asked for by a realtime server
         int errStreak = 0;           // session-level errors in the current two seconds
         int64_t errWindowNs = 0;
         int sendErrStreak = 0;

@@ -73,7 +73,8 @@ struct FleetConfig {
     double dryRunS = 5.0;         // --dry-run-s: how long the world runs in a dry run
 
     // Timeouts; tests shorten them.
-    int carryResendMs = 250;      // --carry-resend-ms: send FLEET_CARRY again, with a new time and proof
+    int carryResendMs = 250;      // --carry-resend-ms: send FLEET_CARRY again, with a new time and
+                                  //   proof; each wait is twice the last, up to eight times this
     int carryGiveUpMs = 5000;     // give up on a carry and count it
     int carryRetryMs = 1000;      // start again after giving up
     int releaseWaitMs = 5000;     // FLEET_RELEASED reason 1 counted missing after this

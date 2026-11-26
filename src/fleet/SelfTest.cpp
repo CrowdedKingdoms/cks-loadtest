@@ -99,8 +99,11 @@ void wireChecks() {
           "wire: the marker in the update's payload reads back");
 
     // The contract's golden proof (fleet id 9001, player id 4242, app 7).
-    const std::string goldenFleet = fixture("", "") + "fleet-token-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP";
-    const std::string goldenPlayer = fixture("", "") + "player-token-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO";
+    // The contract's two fixture strings, each 64 octets: a 12- or 13-character
+    // head, then the digits, the lower case and as much of the upper case as fits.
+    const std::string alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const std::string goldenFleet = "fleet-" + std::string("token-") + alphabet.substr(0, 52);
+    const std::string goldenPlayer = "player-" + std::string("token-") + alphabet.substr(0, 51);
     uint8_t golden[hmac::TAG_SIZE];
     check(goldenFleet.size() == 64 && goldenPlayer.size() == 64 &&
               carryProof(reinterpret_cast<const uint8_t*>(goldenPlayer.data()), 9001, 4242,

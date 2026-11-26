@@ -270,17 +270,20 @@ void FleetWorker::drainMail(int64_t now) {
                 }
                 inc(world_.stats.sessionMovesCompleted);
                 s->lastMoveNs = now;
-                if (m.info.server == s->info.server) {
+                if (m.info.server == s->info.server && !s->toldToMove) {
                     // The same server: the refresh authorized the same token again and
                     // the carries stand. Capabilities again (activate), and no carry.
                     inc(world_.stats.sessionReturnsSameServer);
                 } else {
                     // Another server holds no carry: capabilities, then a new carry,
                     // with a new time and proof, for every player, at the carry rate.
+                    // (A server that asked the session to leave keeps no carry for it
+                    // either, whatever server the answer names.)
                     inc(world_.stats.sessionReturnsOtherServer);
                     forgetCarries(*s);
                     s->needCarryAll = true;
                 }
+                s->toldToMove = false;
                 activate(*s, m.info, now);
                 break;
             case Mail::Kind::Arrive:
@@ -492,9 +495,13 @@ void FleetWorker::tickCarry(Session& s, Player& p, int64_t now) {
             p.retryCause = p.carry.cause;
             endCarryEpisode(s, p);
             p.retryAtNs = now + static_cast<int64_t>(cfg.carryRetryMs) * MS;
-        } else if (now - p.carry.lastSentNs >= static_cast<int64_t>(cfg.carryResendMs) * MS &&
+        } else if (now - p.carry.lastSentNs >=
+                       (static_cast<int64_t>(cfg.carryResendMs) << std::min(p.carry.resends, 3)) * MS &&
                    takeCarryToken(s, now)) {
             // A 49 can go unanswered: send it again, with a new time and proof.
+            // Each wait is twice the last (250 ms, 500 ms, 1 s, then 2 s), so a
+            // server that is slow to answer is not sent more because of it.
+            ++p.carry.resends;
             inc(st.carryResends);
             sendCarry(s, p, now);
         }
@@ -591,7 +598,7 @@ void FleetWorker::sweep(int64_t now) {
             ApiRequest r;
             r.kind = ApiRequest::Kind::MoveSession;
             r.index = s.index;
-            r.current = s.info.server;
+            if (!s.toldToMove) r.current = s.info.server;
             r.gameTokenId = s.info.gameTokenId;
             requestApi(r);
         }
@@ -735,6 +742,7 @@ void FleetWorker::startCarry(Session& s, Player& p, CarryCause cause, int64_t no
     p.carry.firstSentNs = 0;
     p.carry.lastSentNs = 0;
     p.carry.waited = false;
+    p.carry.resends = 0;
     p.retryCause = cause;
     p.retryAtNs = 0;
     s.byId[id] = &p;
@@ -883,6 +891,7 @@ void FleetWorker::requestMove(Session& s, MoveTrigger trigger, int64_t now, bool
     closeSocket(s);
     s.state = Session::State::Moving;
     s.moveRetryAtNs = 0;
+    s.toldToMove = toldToMove;
     ApiRequest r;
     r.kind = ApiRequest::Kind::MoveSession;
     r.index = s.index;

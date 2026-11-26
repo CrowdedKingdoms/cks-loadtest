@@ -576,8 +576,13 @@ none. Fleet sessions are in development and run on the dev tier only.
 ./build/ck-fleet-load --dry-run     # the full population against a stand-in, no network
 ```
 
+`--rules-check` checks the per-player rules on carried players (a block, a player
+under 18's voice, the idle release, another player's actor), and `--delete-players`
+removes the players the client made.
+
 [docs/FLEET-LOAD.md](docs/FLEET-LOAD.md) says what a run proves, how to run one
-against dev, what each number in the summary means, and when a run passes.
+against a tier and what it needs set up first, what it leaves behind, what each number
+in the summary means, and when a run passes.
 
 ## Scope
 
@@ -614,6 +619,8 @@ src/
     FleetStats.*      counters and latency histograms
     FakeRealtime.*    the in-process stand-in behind --dry-run, --self-test and the tests
     DryRun.*          a run against the stand-in
+    Modes.*           --delete-players
+    RulesCheck.cpp    --rules-check: the per-player rules on carried players
     SelfTest.cpp      --self-test
 tests/                wire, config, stats merge, hot-add, HTTP control; fleet_* for ck-fleet-load
 docs/FLEET-LOAD.md    ck-fleet-load: what it proves, how to run it, the summary

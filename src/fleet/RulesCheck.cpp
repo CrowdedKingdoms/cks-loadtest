@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <random>
 #include <thread>
 
@@ -227,12 +228,13 @@ struct RSession {
         note(std::move(s));
     }
 
-    /// The error that answered sequence `seq`, among what was seen from `from` on.
-    const Seen* errorFor(uint8_t wanted, size_t from) const {
+    /// The code of the error that answered sequence `seq`, among what was seen
+    /// from `from` on. A value, because `seen` grows as the check goes on.
+    std::optional<uint8_t> errorFor(uint8_t wanted, size_t from) const {
         for (size_t i = from; i < seen.size(); ++i) {
-            if (seen[i].kind == Seen::Kind::Error && seen[i].seq == wanted) return &seen[i];
+            if (seen[i].kind == Seen::Kind::Error && seen[i].seq == wanted) return seen[i].code;
         }
-        return nullptr;
+        return std::nullopt;
     }
 };
 
@@ -591,7 +593,7 @@ private:
         const size_t fromX = x_.seen.size(), fromY = y_.seen.size();
         const uint8_t seq = y_.message(CLIENT_AUDIO_PACKET, minor.uuid, voice, minor.tok.gameTokenId);
         spin(step());
-        const Seen* refusal = y_.errorFor(seq, fromY);
+        const auto refusal = y_.errorFor(seq, fromY);
         const size_t delivered = deliveries(x_, fromX, CLIENT_AUDIO_NOTIFICATION, voice).size() +
                                  deliveries(y_, fromY, CLIENT_AUDIO_NOTIFICATION, voice).size();
         // The same from an adult beside it, to show voice is delivered here at all.
@@ -601,10 +603,10 @@ private:
         spin(step());
         const auto heard = listedIn(deliveries(x_, fromX2, CLIENT_AUDIO_NOTIFICATION, control));
         verdict("a player under 18's voice",
-                refusal && refusal->code == wire::ERR_UNAUTHORIZED && delivered == 0,
+                refusal && *refusal == wire::ERR_UNAUTHORIZED && delivered == 0,
                 std::string("the 16-year-old's voice was ") +
-                    (refusal ? "answered " + std::string(errorCodeName(refusal->code)) + " (" +
-                                   std::to_string(refusal->code) + ")"
+                    (refusal ? "answered " + std::string(errorCodeName(*refusal)) + " (" +
+                                   std::to_string(*refusal) + ")"
                              : "not answered") +
                     " and delivered in " + std::to_string(delivered) +
                     " FLEET_DELIVERY (it must be refused UNAUTHORIZED and delivered in none). An "
@@ -620,14 +622,14 @@ private:
         const uint8_t s1 = x_.update(c, a.uuid, c.tok.gameTokenId);
         const uint8_t s2 = y_.update(b, a.uuid, b.tok.gameTokenId);
         spin(0.8 * step());
-        const Seen* r1 = x_.errorFor(s1, fromX);
-        const Seen* r2 = y_.errorFor(s2, fromY);
-        auto say = [](const Seen* r) {
-            return r ? std::string(errorCodeName(r->code)) + " (" + std::to_string(r->code) + ")"
+        const auto r1 = x_.errorFor(s1, fromX);
+        const auto r2 = y_.errorFor(s2, fromY);
+        auto say = [](const std::optional<uint8_t>& r) {
+            return r ? std::string(errorCodeName(*r)) + " (" + std::to_string(*r) + ")"
                      : std::string("not refused");
         };
         verdict("another player's actor",
-                r1 && r1->code == wire::ERR_UNAUTHORIZED && r2 && r2->code == wire::ERR_UNAUTHORIZED,
+                r1 && *r1 == wire::ERR_UNAUTHORIZED && r2 && *r2 == wire::ERR_UNAUTHORIZED,
                 "an update under a's actor sent for c (same session): " + say(r1) +
                     "; sent for b (the other session): " + say(r2) + ". Both must be UNAUTHORIZED");
     }
@@ -638,10 +640,10 @@ private:
         const size_t from = x_.seen.size();
         const uint8_t seq = x_.update(b, b.uuid, b.tok.gameTokenId);
         spin(0.6 * step());
-        const Seen* r = x_.errorFor(seq, from);
-        verdict("a player the session does not carry", r && r->code == wire::ERR_UNAUTHORIZED,
+        const auto r = x_.errorFor(seq, from);
+        verdict("a player the session does not carry", r && *r == wire::ERR_UNAUTHORIZED,
                 std::string("an update session X sent for b, whom session Y carries, was ") +
-                    (r ? "answered " + std::string(errorCodeName(r->code)) : "not refused") +
+                    (r ? "answered " + std::string(errorCodeName(*r)) : "not refused") +
                     " (it must be UNAUTHORIZED)");
     }
 
@@ -659,14 +661,14 @@ private:
                                reinterpret_cast<const uint8_t*>(caps.data()), caps.size(),
                                c.tok.gameTokenId, x_.seq, x_.token));
         spin(0.6 * step());
-        const Seen* r1 = x_.errorFor(s1, from);
-        const Seen* r2 = x_.errorFor(s2, from);
+        const auto r1 = x_.errorFor(s1, from);
+        const auto r2 = x_.errorFor(s2, from);
         verdict("what a session may send under its own id",
-                r1 && r1->code == wire::ERR_UNAUTHORIZED && r2 && r2->code == ERR_INVALID_REQUEST,
+                r1 && *r1 == wire::ERR_UNAUTHORIZED && r2 && *r2 == ERR_INVALID_REQUEST,
                 std::string("an actor update under the session's own id was ") +
-                    (r1 ? "answered " + std::string(errorCodeName(r1->code)) : "not refused") +
+                    (r1 ? "answered " + std::string(errorCodeName(*r1)) : "not refused") +
                     " (it must be UNAUTHORIZED); capabilities under a player's id were " +
-                    (r2 ? "answered " + std::string(errorCodeName(r2->code)) : "not refused") +
+                    (r2 ? "answered " + std::string(errorCodeName(*r2)) : "not refused") +
                     " (they must be INVALID_REQUEST)");
     }
 
@@ -721,7 +723,8 @@ private:
                          limit - waited, cfg_.rulesIdleTimeoutS);
         }
         if (limit > waited) spin(limit - waited, [&] { return released() != nullptr; });
-        const Seen* r = released();
+        std::optional<Seen> r;
+        if (const Seen* found = released()) r = *found;
         size_t others = 0;
         for (const RSession* s : {&x_, &y_}) {
             for (const auto& e : s->seen) {

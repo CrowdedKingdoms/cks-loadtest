@@ -739,6 +739,18 @@ int FleetRun::run() {
                                "refreshes that fell due: " + what);
         }
     }
+    if (log_ && ranWindow) {
+        const uint64_t inPhase = sum(stats_.api.duringWindow);
+        const uint64_t due =
+            get(stats_.api.duringWindowByCause[static_cast<size_t>(ApiCause::TokenRefresh)]) +
+            get(stats_.api.duringWindowByCause[static_cast<size_t>(ApiCause::SessionKeep)]);
+        std::fprintf(log_,
+                     "[fleet] Application API calls in the measured phase: %" PRIu64
+                     " (refreshes that fell due: %" PRIu64 ", anything else: %" PRIu64
+                     ", because of a crossing: %" PRIu64 ") over %" PRIu64 " crossings\n",
+                     inPhase, due, inPhase - due, crossingCalls,
+                     crossingsAtWindowEnd_ - crossingsAtWindowStart_);
+    }
     if (get(stats_.plainCommunications) > 0) {
         failures.push_back(std::to_string(get(stats_.plainCommunications)) +
                            " communication(s) arrived outside a FLEET_DELIVERY: a server defect");

@@ -573,12 +573,10 @@ void testComingBack() {
         // stand: capabilities only, and no new carry.
         const int before = g_failures;
         bool done = false;
-        uint64_t carriesBefore = 0;
         const FakeRunResult r = runAgainstFake(
             base(), FakeRealtime::Options{}, stop, nullptr, [&](double t, FakeRealtime& fake) {
                 if (!done && t > 0.4) {
                     done = true;
-                    carriesBefore = fake.counters().capabilities.load();
                     fake.deauthorize(3);
                 }
             });
@@ -594,7 +592,6 @@ void testComingBack() {
         check(s["players"]["not_carried_at_end"] == 0 && s["crossings"]["lost"] == 0 &&
                   u(s["refused"]["errors_by_code"][0]["code"]) == 5,
               "coming back: the carries stood, and the refusals are reported by code");
-        (void)carriesBefore;
         dumpOnFailure(r, before);
     }
     {
