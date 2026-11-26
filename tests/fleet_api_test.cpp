@@ -275,6 +275,56 @@ void testCloseAndRefreshSession() {
           "refresh session: the server to reconnect to, with the same token and id");
     check(rig.calls(ApiKind::RefreshFleetSession, ApiCause::SessionMove) == 1,
           "refresh session: counted as refreshFleetSession for a session move");
+
+    // After a realtime server told the session to move, currentServer is left
+    // out, and the API names a new server.
+    rig.transport->script.push_back([] { return sessionAnswer("refreshFleetSession"); });
+    rig.api->refreshFleetSession(7000000001LL, ServerAddr{}, ApiCause::SessionMove);
+    check(rig.sent.at(2).variables ==
+              nlohmann::json({{"i", {{"appId", "7"}, {"gameTokenId", "7000000001"}}}}),
+          "refresh session: told to move, the input leaves currentServer out");
+    check(rig.sent.at(0).bearer == kOrgBearer && rig.sent.at(1).bearer == kOrgBearer &&
+              rig.sent.at(2).bearer == kOrgBearer,
+          "refresh session: one org token opens, refreshes and closes");
+}
+
+void testDeleteAndBlock() {
+    Rig rig;
+    rig.transport->script.push_back([] { return nlohmann::json{{"deleteManagedPlayer", true}}; });
+    rig.transport->script.push_back([] { return nlohmann::json{{"deleteManagedPlayer", false}}; });
+    check(rig.api->deleteManagedPlayer(77, "fleet-load-12", ApiCause::Cleanup),
+          "delete: true when the player was deleted");
+    check(!rig.api->deleteManagedPlayer(77, "fleet-load-13", ApiCause::Cleanup),
+          "delete: false when there was no such player");
+    const Sent& d = rig.sent.at(0);
+    check(d.query.find("mutation($o: BigInt!, $e: String!) { deleteManagedPlayer(orgId: $o, "
+                       "externalId: $e) }") != std::string::npos,
+          "delete: deleteManagedPlayer(orgId, externalId)");
+    check(d.variables == nlohmann::json({{"o", "77"}, {"e", "fleet-load-12"}}) && d.bearer == kOrgBearer,
+          "delete: the organization's id as a decimal string, the externalId, the org token");
+    check(rig.calls(ApiKind::DeleteManagedPlayer, ApiCause::Cleanup) == 2,
+          "delete: counted as deleteManagedPlayer for cleanup");
+
+    rig.transport->script.push_back(
+        [] { return nlohmann::json{{"blockPlayer", {{"__typename", "PlayerBlock"}}}}; });
+    rig.api->blockPlayer(kPlayerKey, 5001, ApiCause::RulesCheck);
+    const Sent& b = rig.sent.at(2);
+    check(b.query.find("blockPlayer(appId: $a, userId: $u)") != std::string::npos &&
+              b.variables == nlohmann::json({{"a", "7"}, {"u", "5001"}}),
+          "block: blockPlayer(appId, userId) with both as decimal strings");
+    check(b.bearer == kPlayerKey, "block: the bearer is the blocking player's own app token");
+
+    // A sign-in for the rule check: any externalId, any age.
+    rig.transport->script.push_back([] {
+        return nlohmann::json{{"mintManagedPlayerToken",
+                               {{"token", kPlayerKey},
+                                {"gameTokenId", "9000000002"},
+                                {"expiresAt", "2026-11-25T20:30:00.000Z"}}}};
+    });
+    rig.api->mintManagedPlayerToken("fleet-rules-minor", 16, ApiCause::RulesCheck);
+    check(rig.sent.at(3).variables["i"]["externalId"] == "fleet-rules-minor" &&
+              rig.sent.at(3).variables["i"]["ageYears"] == 16,
+          "mint: a named player with its age");
 }
 
 void testRefreshAppToken() {
@@ -388,6 +438,24 @@ void testOrgTokenNeverLeaks() {
           "options: the defaults are the proof's (100 servers, 3,000 players, 30 minutes, 5 Hz, 75/s, 20/s)");
     check(defaults.carryResendMs == 250 && defaults.carryGiveUpMs == 5000 && defaults.releaseWaitMs == 5000,
           "options: resend a carry every 250 ms, give up after 5 s, wait 5 s for a release");
+    check(!defaults.releaseFirst && defaults.carryRate == 60.0 && defaults.signedBundles &&
+              defaults.boundControl,
+          "options: the destination carries at a crossing, 60 carries a second a session at most");
+    const char* planArgv[] = {"ck-fleet-load", "--dry-run", "--crossing-plan", "release-first",
+                              "--signed-bundles=false", "--bound-control=false", "--carry-rate", "40"};
+    FleetConfig plan = FleetConfig::load(8, const_cast<char**>(planArgv));
+    check(plan.releaseFirst && !plan.signedBundles && !plan.boundControl && plan.carryRate == 40.0 &&
+              plan.validate().empty(),
+          "options: --crossing-plan release-first, --signed-bundles=false, --bound-control=false");
+    plan.carryRate = 65;
+    check(!plan.validate().empty(), "options: a carry rate above the server's 64 a second is refused");
+    setenv("CK_ORG_TOKEN", kOrgBearer.c_str(), 1);
+    const char* deleteArgv[] = {"ck-fleet-load", "--api", "https://api.example.invalid", "--app", "7",
+                                "--delete-players"};
+    FleetConfig del = FleetConfig::load(6, const_cast<char**>(deleteArgv));
+    check(del.deletePlayers && del.validate().find("--org") != std::string::npos,
+          "options: --delete-players needs --org");
+    unsetenv("CK_ORG_TOKEN");
     FleetConfig wrong;
     wrong.dryRun = true;
     wrong.servers = 0;
@@ -487,6 +555,7 @@ int main() {
     testOpen();
     testMintAndRetries();
     testCloseAndRefreshSession();
+    testDeleteAndBlock();
     testRefreshAppToken();
     testCountingAndCrossingGuard();
     testOrgTokenNeverLeaks();

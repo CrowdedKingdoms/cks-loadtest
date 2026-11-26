@@ -36,6 +36,17 @@ FleetConfig FleetConfig::load(int argc, char** argv) {
         ("dry-run", "No network: an in-process stand-in answers the API and the realtime wire", cxxopts::value<bool>())
         ("dry-run-s", "Seconds the world runs in a dry run", cxxopts::value<double>())
         ("self-test", "Run the built-in checks and exit", cxxopts::value<bool>())
+        ("delete-players", "Delete the players this client made (fleet-load-0 to --players - 1, and the rule check's) and exit; needs --org", cxxopts::value<bool>())
+        ("org", "The organization's id, for --delete-players", cxxopts::value<int64_t>())
+        ("rules-check", "Run the per-player rule checks on carried players and exit", cxxopts::value<bool>())
+        ("rules-idle-timeout-s", "The app's idle timeout as the operator set it, for the idle check (0 skips it)", cxxopts::value<double>())
+        ("rules-step-s", "Seconds a rule check waits for what it expects", cxxopts::value<double>())
+        ("crossing-plan", "carry: the destination session carries and the old one is released (default). release-first: the old session sends FLEET_RELEASE first", cxxopts::value<std::string>())
+        ("carry-rate", "FLEET_CARRY a second a session, resends included (the server drops past 64)", cxxopts::value<double>())
+        ("carry-burst", "FLEET_CARRY a session may send at once", cxxopts::value<int>())
+        ("carry-resend-ms", "Send an unanswered FLEET_CARRY again after this long, with a new time and proof", cxxopts::value<int>())
+        ("signed-bundles", "Advertise BUNDLE_SIGNED (--signed-bundles=false reads every frame with its own HMAC)", cxxopts::value<bool>()->default_value("true"))
+        ("bound-control", "Advertise BOUND_CONTROL with a nonce, so move commands are 44 and 45", cxxopts::value<bool>()->default_value("true"))
         ("distance", "Replication distance of an actor update, in chunks", cxxopts::value<int>())
         ("decay", "Decay rate 0=none 1=exponential 2..5=linear", cxxopts::value<int>())
         ("chunk-size-units", "Chunk edge in position units", cxxopts::value<double>())
@@ -87,6 +98,26 @@ FleetConfig FleetConfig::load(int argc, char** argv) {
     flag("dry-run", c.dryRun);
     dbl("dry-run-s", c.dryRunS);
     flag("self-test", c.selfTest);
+    flag("delete-players", c.deletePlayers);
+    if (cli.count("org")) c.orgId = cli["org"].as<int64_t>();
+    flag("rules-check", c.rulesCheck);
+    dbl("rules-idle-timeout-s", c.rulesIdleTimeoutS);
+    dbl("rules-step-s", c.rulesStepS);
+    c.rulesStepGiven = cli.count("rules-step-s") > 0;
+    if (cli.count("crossing-plan")) {
+        const std::string plan = cli["crossing-plan"].as<std::string>();
+        if (plan == "release-first") {
+            c.releaseFirst = true;
+        } else if (plan != "carry") {
+            std::fprintf(stderr, "error: --crossing-plan is carry or release-first\n");
+            std::exit(2);
+        }
+    }
+    dbl("carry-rate", c.carryRate);
+    num("carry-burst", c.carryBurst);
+    num("carry-resend-ms", c.carryResendMs);
+    c.signedBundles = cli["signed-bundles"].as<bool>();
+    c.boundControl = cli["bound-control"].as<bool>();
     num("distance", c.distance);
     num("decay", c.decay);
     dbl("chunk-size-units", c.chunkSizeUnits);
@@ -106,6 +137,7 @@ FleetConfig FleetConfig::load(int argc, char** argv) {
 
     c.signinRateGiven = cli.count("signin-rate") > 0;
     c.sessionSettleGiven = cli.count("session-settle-ms") > 0;
+    c.rulesIdleGiven = cli.count("rules-idle-timeout-s") > 0;
 
     // The credential comes from the environment only, so it is never in argv
     // (which ps shows) and never in a shell history line.
@@ -128,12 +160,20 @@ std::string FleetConfig::validate() const {
     if (durationS < 0) return "--duration-s must be 0 or more";
     if (chunkSizeUnits <= 0) return "--chunk-size-units must be above 0";
     if (latencySample < 0) return "--latency-sample must be 0 or more";
+    if (carryRate <= 0 || carryRate > 64) return "--carry-rate must be above 0 and at most 64";
+    if (carryBurst < 1) return "--carry-burst must be at least 1";
+    if (carryResendMs < 20) return "--carry-resend-ms must be at least 20";
+    if (rulesIdleTimeoutS < 0) return "--rules-idle-timeout-s must be 0 or more";
+    if (rulesStepS <= 0) return "--rules-step-s must be above 0";
+    if (deletePlayers && rulesCheck) return "--delete-players and --rules-check are separate modes";
     if (dryRun || selfTest) return "";
     if (api.empty()) return "--api is required (the Application API's GraphQL endpoint)";
     if (appId <= 0) return "--app is required (an app of the organization)";
     if (orgToken.empty())
         return "the environment variable CK_ORG_TOKEN is not set (an org token with the scopes "
-               "players:mint and fleet:session)";
+               "players:mint and fleet:session; players:manage as well for --delete-players)";
+    if (deletePlayers && orgId <= 0)
+        return "--delete-players needs --org (the organization's id)";
     return "";
 }
 

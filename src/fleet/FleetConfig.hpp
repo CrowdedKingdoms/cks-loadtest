@@ -30,6 +30,25 @@ struct FleetConfig {
     bool dryRun = false;          // --dry-run: no network
     bool selfTest = false;        // --self-test
 
+    // Other modes.
+    bool deletePlayers = false;   // --delete-players: delete the players this client made, and exit
+    int64_t orgId = 0;            // --org: the organization's id (deleteManagedPlayer needs it)
+    bool rulesCheck = false;      // --rules-check: the per-player rule checks, and exit
+    double rulesIdleTimeoutS = 60; // --rules-idle-timeout-s: the app's idle timeout (0 skips that check)
+    double rulesStepS = 2.5;      // --rules-step-s: how long a check waits for what it expects
+
+    // The crossing the plan makes. False (the default): the destination session
+    // sends FLEET_CARRY and the session that carried before is sent FLEET_RELEASED
+    // reason 1, with no coordination between the two servers. True: the old
+    // session sends FLEET_RELEASE first, then the destination carries.
+    bool releaseFirst = false;    // --crossing-plan release-first
+    // A realtime server drops carries past 64 a second a session (burst
+    // max_players + 32), unanswered. The client stays under that.
+    double carryRate = 60.0;      // --carry-rate: FLEET_CARRY a second a session, resends included
+    int carryBurst = 32;          // --carry-burst
+    bool signedBundles = true;    // --signed-bundles: advertise BUNDLE_SIGNED
+    bool boundControl = true;     // --bound-control: advertise BOUND_CONTROL with a nonce (44, 45)
+
     // Wire and world details.
     int distance = 8;             // --distance: replication distance of an actor update, chunks
     int decay = 1;                // --decay: 0 none, 1 exponential, 2..5 linear
@@ -53,8 +72,8 @@ struct FleetConfig {
     // Dry run.
     double dryRunS = 5.0;         // --dry-run-s: how long the world runs in a dry run
 
-    // Fixed by the contract; kept here so tests can shorten them.
-    int carryResendMs = 250;      // resend FLEET_CARRY until its result arrives
+    // Timeouts; tests shorten them.
+    int carryResendMs = 250;      // --carry-resend-ms: send FLEET_CARRY again, with a new time and proof
     int carryGiveUpMs = 5000;     // give up on a carry and count it
     int carryRetryMs = 1000;      // start again after giving up
     int releaseWaitMs = 5000;     // FLEET_RELEASED reason 1 counted missing after this
@@ -65,6 +84,8 @@ struct FleetConfig {
     // Whether the command line set these: a dry run picks its own otherwise.
     bool signinRateGiven = false;
     bool sessionSettleGiven = false;
+    bool rulesIdleGiven = false;
+    bool rulesStepGiven = false;
 
     /// Read from CK_ORG_TOKEN by load(). Never printed, never in the summary.
     std::string orgToken;

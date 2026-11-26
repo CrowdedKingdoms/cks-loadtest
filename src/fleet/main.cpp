@@ -7,6 +7,7 @@
 #include "fleet/DryRun.hpp"
 #include "fleet/FleetConfig.hpp"
 #include "fleet/FleetRun.hpp"
+#include "fleet/Modes.hpp"
 
 #include <atomic>
 #include <csignal>
@@ -75,11 +76,27 @@ int main(int argc, char** argv) {
         // Nothing to wait for in a dry run: no API to pace, no authorization to settle.
         if (!cfg.signinRateGiven) cfg.signinRate = 5000;
         if (!cfg.sessionSettleGiven) cfg.sessionSettleMs = 0;
-        const lt::fleet::FakeRunResult r =
-            lt::fleet::runAgainstFake(cfg, lt::fleet::FakeRealtime::Options{}, g_stop, stderr);
-        code = r.exitCode;
-        summary = r.summary;
-        printDryRunRates(summary);
+        if (!cfg.rulesIdleGiven) cfg.rulesIdleTimeoutS = 3;
+        if (!cfg.rulesStepGiven) cfg.rulesStepS = 0.5;
+        lt::fleet::FakeRealtime::Options options;
+        if (cfg.rulesCheck)
+            options.idleTimeoutMs = static_cast<int64_t>(cfg.rulesIdleTimeoutS * 1000);
+        lt::fleet::FakeRealtime fake(cfg.appId > 0 ? cfg.appId : 4242, options);
+        fake.start();
+        if (cfg.rulesCheck || cfg.deletePlayers) {
+            const lt::fleet::FleetConfig fakeCfg = lt::fleet::configForFake(cfg, fake);
+            const lt::fleet::RunDeps deps = lt::fleet::fakeDeps(fake);
+            code = cfg.rulesCheck
+                       ? lt::fleet::runRulesCheck(fakeCfg, deps, g_stop, summary, stderr)
+                       : lt::fleet::runDeletePlayers(fakeCfg, deps, g_stop, summary, stderr);
+        } else {
+            const lt::fleet::FakeRunResult r =
+                lt::fleet::runAgainstFake(fake, cfg, g_stop, stderr);
+            code = r.exitCode;
+            summary = r.summary;
+            printDryRunRates(summary);
+        }
+        fake.stop();
     } else {
         lt::GraphQLClient::globalInit();
         {
@@ -91,9 +108,15 @@ int main(int argc, char** argv) {
             deps.connect = [&cfg](const lt::fleet::FleetSessionInfo& info, std::string& error) {
                 return lt::fleet::connectUdp(info, cfg.socketRcvbufBytes, error);
             };
-            lt::fleet::FleetRun run(cfg, deps, g_stop);
-            code = run.run();
-            summary = run.summary();
+            if (cfg.rulesCheck) {
+                code = lt::fleet::runRulesCheck(cfg, deps, g_stop, summary, stderr);
+            } else if (cfg.deletePlayers) {
+                code = lt::fleet::runDeletePlayers(cfg, deps, g_stop, summary, stderr);
+            } else {
+                lt::fleet::FleetRun run(cfg, deps, g_stop);
+                code = run.run();
+                summary = run.summary();
+            }
         }
         lt::GraphQLClient::globalCleanup();
     }
@@ -110,8 +133,12 @@ int main(int argc, char** argv) {
         }
     }
     if (code != 0) {
-        for (const auto& why : summary["fail_reasons"]) {
-            std::fprintf(stderr, "[fleet] FAILED: %s\n", why.get<std::string>().c_str());
+        if (summary.contains("fail_reasons")) {
+            for (const auto& why : summary["fail_reasons"]) {
+                std::fprintf(stderr, "[fleet] FAILED: %s\n", why.get<std::string>().c_str());
+            }
+        } else {
+            std::fprintf(stderr, "[fleet] FAILED\n");
         }
     } else {
         std::fprintf(stderr, "[fleet] passed\n");

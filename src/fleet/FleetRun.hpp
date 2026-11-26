@@ -73,6 +73,8 @@ private:
     void housekeeping();
     void progress(double windowS);
     void buildSummary(int exitCode, const std::vector<std::string>& failures);
+    nlohmann::json carriesByStatus() const;
+    nlohmann::json releasesByReason() const;
     int sumPending() const;
     int sumCarried() const;
     int sumAwaiting() const;
@@ -126,6 +128,8 @@ private:
     int64_t lastHousekeepingNs_ = 0;
     bool interrupted_ = false;
     FleetWorker::End end_;
+    std::vector<FleetWorker::MinuteUse> usage_;
+    int peakCarried_ = 0;
     nlohmann::json summary_;
 };
 

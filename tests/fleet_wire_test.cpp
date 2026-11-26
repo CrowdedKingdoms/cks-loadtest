@@ -182,6 +182,73 @@ void testOtherControlBytes() {
     uint32_t flags = 0;
     std::memcpy(&flags, caps + wire::HEADER_SIZE, 4);
     check(CAP_FLEET_OWN_STATE == 8 && flags == 9, "capabilities: FLEET_OWN_STATE is bit 3 (value 8)");
+
+    // This client's own builder: the same bytes without a nonce, and with one the
+    // BOUND_CONTROL bit and the 8-byte nonce after the flags.
+    uint8_t mine[CAPABILITIES_BOUND_SIZE];
+    size_t len = buildCapabilities(mine, APP, FLEET_ID, wire::CAP_BUNDLE_SIGNED | CAP_FLEET_OWN_STATE,
+                                   nullptr, SEQ, FLEET);
+    check(len == wire::CAPABILITIES_SIZE && toHex(mine, len) == fleet_vectors::CAPABILITIES_HEX,
+          "capabilities: without a nonce, the harness's bytes");
+    const uint8_t nonce[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    len = buildCapabilities(mine, APP, FLEET_ID, wire::CAP_BUNDLE_SIGNED | CAP_FLEET_OWN_STATE, nonce,
+                            SEQ, FLEET);
+    check(len == 121 && toHex(mine, len) == fleet_vectors::CAPABILITIES_BOUND_HEX,
+          "capabilities: with a nonce, 121 bytes matching the bytes computed outside this code");
+    std::memcpy(&flags, mine + wire::HEADER_SIZE, 4);
+    check(CAP_BOUND_CONTROL == 2 && flags == 11 && std::memcmp(mine + 72, nonce, 8) == 0 &&
+              wire::readI64(mine + 112) == FLEET_ID,
+          "capabilities: BOUND_CONTROL is bit 1, the nonce follows the flags, the tail is the session's");
+
+    // A heartbeat that keeps a carried player's actor present goes under the PLAYER's id.
+    uint8_t phb[HEARTBEAT_SIZE];
+    len = buildPlayerHeartbeat(phb, APP, 1, -2, 3, "0123456789ABCDEF0123456789ABCDEF", PLAYER_ID, SEQ,
+                               FLEET);
+    check(len == 109 && toHex(phb, len) == fleet_vectors::PLAYER_HEARTBEAT_HEX,
+          "player heartbeat: matches the bytes computed outside this code");
+    check(phb[0] == wire::CLIENT_ACTOR_HEARTBEAT && wire::readI64(phb + 100) == PLAYER_ID &&
+              wire::readI64(hb + 100) == FLEET_ID && std::memcmp(phb + wire::off::UUID, "0123", 4) == 0,
+          "player heartbeat: the player's id and actor; the session's keepalive has its own id and no actor");
+    uint8_t expected[hmac::TAG_SIZE];
+    check(hmac::spatialSign(phb, 68, FLEET, expected) && hmac::tagEquals(expected, phb + 68) &&
+              hmac::spatialSign(phb, 68, PLAYER, expected) && !hmac::tagEquals(expected, phb + 68),
+          "player heartbeat: signed with the fleet token");
+}
+
+void testGoldenVectors() {
+    // The vectors the contract fixes for every client. The C++ SDK's tests hold the same.
+    const auto* fleet = reinterpret_cast<const uint8_t*>(fleet_vectors::GOLDEN_FLEET_TOKEN);
+    const auto* player = reinterpret_cast<const uint8_t*>(fleet_vectors::GOLDEN_PLAYER_TOKEN);
+    check(std::strlen(fleet_vectors::GOLDEN_FLEET_TOKEN) == 64 &&
+              std::strlen(fleet_vectors::GOLDEN_PLAYER_TOKEN) == 64,
+          "golden: both tokens are 64 octets");
+    uint8_t proof[hmac::TAG_SIZE];
+    carryProof(player, fleet_vectors::GOLDEN_FLEET_ID, fleet_vectors::GOLDEN_PLAYER_ID,
+               fleet_vectors::GOLDEN_EPOCH_MS, proof);
+    check(toHex(proof, 32) == fleet_vectors::GOLDEN_PROOF_HEX, "golden: the carry proof");
+
+    uint8_t buf[MAX_CLIENT_DATAGRAM];
+    size_t len = buildCarry(buf, APP, fleet_vectors::GOLDEN_FLEET_ID, fleet_vectors::GOLDEN_PLAYER_ID,
+                            fleet_vectors::GOLDEN_EPOCH_MS, player, 0, fleet);
+    check(len == 157 && toHex(buf, len) == fleet_vectors::GOLDEN_CARRY_HEX,
+          "golden: FLEET_CARRY, 157 bytes");
+    len = buildRelease(buf, APP, fleet_vectors::GOLDEN_FLEET_ID, fleet_vectors::GOLDEN_PLAYER_ID, 2,
+                       fleet);
+    check(len == 117 && toHex(buf, len) == fleet_vectors::GOLDEN_RELEASE_HEX,
+          "golden: FLEET_RELEASE, 117 bytes");
+    const uint8_t payload[4] = {0xde, 0xad, 0xbe, 0xef};
+    len = buildLongForm(buf, wire::ACTOR_UPDATE_REQUEST_2, APP, 1, -2, 3, 8, 0,
+                        "0123456789abcdef0123456789abcdef", payload, sizeof(payload),
+                        fleet_vectors::GOLDEN_PLAYER_ID, 1, fleet);
+    check(len == 113 && toHex(buf, len) == fleet_vectors::GOLDEN_UPDATE_HEX,
+          "golden: a carried player's actor update, 113 bytes");
+    const wire::InboundView view{buf, len};
+    check(wire::verifyNotification(view, fleet) && !wire::verifyNotification(view, player) &&
+              wire::readI64(buf + len - 9) == fleet_vectors::GOLDEN_PLAYER_ID,
+          "golden: its tail names the player and its HMAC verifies with the fleet token only");
+    check(buildLongForm(buf, wire::CLIENT_TEXT_PACKET_2, APP, 0, 0, 0, 8, 0, nullptr, buf, 1124,
+                        PLAYER_ID, 0, fleet) == 0,
+          "long form: a message that would pass 1,232 bytes is not built");
 }
 
 void testCarriedPlayersUpdate() {
@@ -236,142 +303,235 @@ void testCarriedPlayersUpdate() {
           "carried update: costs no more bytes than the player's own, and differs in the HMAC only");
 }
 
-std::vector<uint8_t> longForm(uint8_t type, const std::vector<uint8_t>& payload, bool withHmac) {
+/// An unsigned long-spatial notification, as a player's own session is sent it
+/// inside a signed bundle and as a FLEET_DELIVERY wraps it: the 68-byte header
+/// with containsAuth 0, the payload, and the 9-byte tail.
+std::vector<uint8_t> notificationOf(uint8_t type, const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> m(wire::HEADER_SIZE, 0);
     m[0] = type;
     wire::writeI64(m.data() + wire::off::APP_ID, APP);
-    m[wire::off::CONTAINS_AUTH] = withHmac ? 1 : 0;
+    wire::writeI64(m.data() + wire::off::CHUNK_X, 1);
+    wire::writeI64(m.data() + wire::off::CHUNK_Y, -2);
+    wire::writeI64(m.data() + wire::off::CHUNK_Z, 3);
+    m[wire::off::DISTANCE] = 8;
+    m[wire::off::DECAY] = 1;
+    std::memcpy(m.data() + wire::off::UUID, "0123456789ABCDEF0123456789ABCDEF", 32);
     m.insert(m.end(), payload.begin(), payload.end());
-    if (withHmac) {
-        uint8_t mac[32];
-        hmac::spatialSign(m.data(), m.size(), FLEET, mac);
-        m.insert(m.end(), mac, mac + 32);
-    }
     appendI64(m, 1795000000999LL); // epoch millis
     m.push_back(5);                // sequence
     return m;
 }
 
-void testCarryResultParsing() {
-    std::vector<uint8_t> payload;
-    appendI64(payload, PLAYER_ID);
-    appendI64(payload, 4242);
-    payload.push_back(0);
+/// The frame followed by its own HMAC: HMAC(fleet token, frame || fleet token), by hand.
+std::vector<uint8_t> withOwnHmac(std::vector<uint8_t> frame) {
+    std::vector<uint8_t> signedBytes = frame;
+    signedBytes.insert(signedBytes.end(), FLEET, FLEET + 64);
+    const auto mac = hmacByHand(FLEET, signedBytes);
+    frame.insert(frame.end(), mac.begin(), mac.end());
+    return frame;
+}
 
-    std::vector<uint8_t> compact = {FLEET_CARRY_RESULT};
-    compact.insert(compact.end(), payload.begin(), payload.end());
-    auto r = parseCarryResult(wire::InboundView{compact.data(), compact.size()}, APP);
-    check(compact.size() == 18 && r && r->playerGameTokenId == PLAYER_ID && r->userId == 4242 &&
-              r->status == CARRY_CARRIED,
-          "FLEET_CARRY_RESULT: [8B player][8B user][1B status] after the type");
+wire::InboundView viewOf(const std::vector<uint8_t>& v) {
+    return wire::InboundView{v.data(), v.size()};
+}
+
+void testCarryResultParsing() {
+    std::vector<uint8_t> frame = {FLEET_CARRY_RESULT};
+    appendI64(frame, PLAYER_ID);
+    appendI64(frame, 4242);
+    frame.push_back(0);
+
+    // As a member of a verified signed bundle: 18 bytes, no HMAC of its own.
+    FleetFrame f = readFleetFrame(viewOf(frame), /*inVerifiedSignedBundle*/ true, FLEET);
+    check(frame.size() == 18 && CARRY_RESULT_SIZE == 18 && f.auth == FrameAuth::SignedBundle,
+          "FLEET_CARRY_RESULT: 18 bytes inside a signed bundle");
+    auto r = parseCarryResult(f.frame);
+    check(r && r->playerGameTokenId == PLAYER_ID && r->userId == 4242 && r->status == CARRY_CARRIED,
+          "FLEET_CARRY_RESULT: [51][8B player][8B user][1B status]");
+
+    // To a session that did not advertise BUNDLE_SIGNED: followed by its own HMAC, 50 bytes.
+    const auto signedFrame = withOwnHmac(frame);
+    check(signedFrame.size() == 50 && toHex(signedFrame.data(), signedFrame.size()) ==
+                                          fleet_vectors::CARRY_RESULT_SIGNED_HEX,
+          "FLEET_CARRY_RESULT: with its own HMAC it is 50 bytes, as computed outside this code");
+    f = readFleetFrame(viewOf(signedFrame), false, FLEET);
+    r = parseCarryResult(f.frame);
+    check(f.auth == FrameAuth::OwnHmac && f.frame.len == 18 && r && r->playerGameTokenId == PLAYER_ID &&
+              r->userId == 4242 && r->status == 0,
+          "FLEET_CARRY_RESULT: its own HMAC verifies with the fleet token and the frame reads back");
+    check(readFleetFrame(viewOf(signedFrame), false, PLAYER).auth == FrameAuth::Failed,
+          "FLEET_CARRY_RESULT: the HMAC does not verify with a player's token");
+    auto tampered = signedFrame;
+    tampered[17] = 4; // the status
+    check(readFleetFrame(viewOf(tampered), false, FLEET).auth == FrameAuth::Failed,
+          "FLEET_CARRY_RESULT: a rewritten status fails the HMAC");
+    tampered = signedFrame;
+    tampered[40] ^= 1; // a byte of the HMAC
+    check(readFleetFrame(viewOf(tampered), false, FLEET).auth == FrameAuth::Failed,
+          "FLEET_CARRY_RESULT: a flipped HMAC byte fails");
+    check(readFleetFrame(viewOf(frame), false, FLEET).auth == FrameAuth::Failed,
+          "FLEET_CARRY_RESULT: outside a signed bundle, a frame with no HMAC is refused");
 
     for (uint8_t status : {uint8_t{1}, uint8_t{2}, uint8_t{3}, uint8_t{4}}) {
-        compact[9] = compact[10] = 0; // the user id is 0 unless carried
-        compact[17] = status;
-        r = parseCarryResult(wire::InboundView{compact.data(), compact.size()}, APP);
-        check(r && r->status == status, "FLEET_CARRY_RESULT: a refusal status reads back");
+        frame[9] = frame[10] = 0; // the user id is 0 unless carried
+        frame[17] = status;
+        r = parseCarryResult(viewOf(frame));
+        check(r && r->status == status && r->userId == 0, "FLEET_CARRY_RESULT: a refusal status reads back");
     }
-
-    auto truncated = compact;
+    auto truncated = frame;
     truncated.pop_back();
-    check(!parseCarryResult(wire::InboundView{truncated.data(), truncated.size()}, APP),
-          "FLEET_CARRY_RESULT: a short frame is refused");
-    auto wrongType = compact;
+    check(!parseCarryResult(viewOf(truncated)), "FLEET_CARRY_RESULT: 17 bytes is not a frame");
+    auto longer = frame;
+    longer.push_back(0);
+    check(!parseCarryResult(viewOf(longer)), "FLEET_CARRY_RESULT: 19 bytes is not a frame");
+    auto wrongType = frame;
     wrongType[0] = FLEET_RELEASED;
-    check(!parseCarryResult(wire::InboundView{wrongType.data(), wrongType.size()}, APP),
-          "FLEET_CARRY_RESULT: another type is refused");
+    check(!parseCarryResult(viewOf(wrongType)), "FLEET_CARRY_RESULT: another type is refused");
 
-    // A tail after the payload does not change what is read.
-    auto withTail = compact;
-    appendI64(withTail, 1795000000999LL);
-    withTail.push_back(7);
-    r = parseCarryResult(wire::InboundView{withTail.data(), withTail.size()}, APP);
-    check(r && r->playerGameTokenId == PLAYER_ID && r->status == 4,
-          "FLEET_CARRY_RESULT: trailing bytes are ignored");
-
-    // The same payload framed as a long-form app payload, unsigned and signed.
-    payload[16] = 3;
-    for (bool withHmac : {false, true}) {
-        const auto m = longForm(FLEET_CARRY_RESULT, payload, withHmac);
-        r = parseCarryResult(wire::InboundView{m.data(), m.size()}, APP);
-        check(looksLongForm(wire::InboundView{m.data(), m.size()}, APP) && r &&
-                  r->playerGameTokenId == PLAYER_ID && r->userId == 4242 && r->status == 3,
-              withHmac ? "FLEET_CARRY_RESULT: read from a signed long-form frame"
-                       : "FLEET_CARRY_RESULT: read from a long-form frame");
-    }
-    check(!looksLongForm(wire::InboundView{compact.data(), compact.size()}, APP),
-          "FLEET_CARRY_RESULT: the compact frame is not taken for a long-form one");
+    // The names a summary reports carries by.
+    check(std::string(carryStatusName(0)) == "0_carried" &&
+              std::string(carryStatusName(1)) == "1_no_live_token" &&
+              std::string(carryStatusName(2)) == "2_other_organization" &&
+              std::string(carryStatusName(3)) == "3_proof_time_or_replay" &&
+              std::string(carryStatusName(4)) == "4_session_full" &&
+              std::string(carryStatusName(9)) == "other",
+          "FLEET_CARRY_RESULT: the five statuses have the contract's names");
 }
 
 void testReleasedParsing() {
-    std::vector<uint8_t> payload;
-    appendI64(payload, PLAYER_ID);
-    payload.push_back(RELEASED_CARRIED_ELSEWHERE);
-    std::vector<uint8_t> compact = {FLEET_RELEASED};
-    compact.insert(compact.end(), payload.begin(), payload.end());
-    auto r = parseReleased(wire::InboundView{compact.data(), compact.size()}, APP);
-    check(compact.size() == 10 && r && r->playerGameTokenId == PLAYER_ID && r->reason == 1,
-          "FLEET_RELEASED: [8B player][1B reason], reason 1 carried by another session");
+    std::vector<uint8_t> frame = {FLEET_RELEASED};
+    appendI64(frame, PLAYER_ID);
+    frame.push_back(RELEASED_CARRIED_ELSEWHERE);
+    auto r = parseReleased(viewOf(frame));
+    check(frame.size() == 10 && RELEASED_SIZE == 10 && r && r->playerGameTokenId == PLAYER_ID &&
+              r->reason == 1,
+          "FLEET_RELEASED: [52][8B player][1B reason], reason 1 another session carries the player");
+
+    const auto signedFrame = withOwnHmac(frame);
+    check(signedFrame.size() == 42 &&
+              toHex(signedFrame.data(), signedFrame.size()) == fleet_vectors::RELEASED_SIGNED_HEX,
+          "FLEET_RELEASED: with its own HMAC it is 42 bytes, as computed outside this code");
+    const FleetFrame f = readFleetFrame(viewOf(signedFrame), false, FLEET);
+    r = parseReleased(f.frame);
+    check(f.auth == FrameAuth::OwnHmac && r && r->playerGameTokenId == PLAYER_ID && r->reason == 1,
+          "FLEET_RELEASED: its own HMAC verifies and the frame reads back");
+    auto tampered = signedFrame;
+    tampered[9] = 5; // the reason
+    check(readFleetFrame(viewOf(tampered), false, FLEET).auth == FrameAuth::Failed,
+          "FLEET_RELEASED: a rewritten reason fails the HMAC");
+
     for (uint8_t reason : {uint8_t{2}, uint8_t{5}}) {
-        compact[9] = reason;
-        r = parseReleased(wire::InboundView{compact.data(), compact.size()}, APP);
+        frame[9] = reason;
+        r = parseReleased(viewOf(frame));
         check(r && r->reason == reason, "FLEET_RELEASED: reasons 2 and 5 read back");
     }
-    auto truncated = compact;
+    auto truncated = frame;
     truncated.pop_back();
-    check(!parseReleased(wire::InboundView{truncated.data(), truncated.size()}, APP),
-          "FLEET_RELEASED: a short frame is refused");
-    const auto m = longForm(FLEET_RELEASED, payload, false);
-    r = parseReleased(wire::InboundView{m.data(), m.size()}, APP);
-    check(r && r->playerGameTokenId == PLAYER_ID && r->reason == 1,
-          "FLEET_RELEASED: read from a long-form frame");
+    check(!parseReleased(viewOf(truncated)), "FLEET_RELEASED: 9 bytes is not a frame");
+    check(std::string(releaseReasonName(1)) == "1_carried_by_another_session" &&
+              std::string(releaseReasonName(2)) == "2_sign_in_ended" &&
+              std::string(releaseReasonName(5)) == "5_idle" &&
+              std::string(releaseReasonName(3)) == "other",
+          "FLEET_RELEASED: the three reasons have the contract's names");
 }
 
 void testDeliveryParsing() {
-    // A text notification as a player's own session would be sent it.
+    // The notification inside is the unsigned form: its 9-byte tail, containsAuth 0, no HMAC.
     const std::vector<uint8_t> text = {'h', 'e', 'l', 'l', 'o'};
-    auto notification = longForm(137 /*CLIENT_TEXT_NOTIFICATION*/, text, false);
-    wire::writeI64(notification.data() + wire::off::CHUNK_X, 12); // a real chunk, not (0,0,0)
+    const auto notification = notificationOf(CLIENT_TEXT_NOTIFICATION, text);
+    check(notification.size() == 68 + 5 + 9 && notification[wire::off::CONTAINS_AUTH] == 0,
+          "FLEET_DELIVERY: the wrapped notification is 68 + payload + 9 bytes with containsAuth 0");
 
-    std::vector<uint8_t> frame = {FLEET_DELIVERY, 3};
-    for (int64_t id : {PLAYER_ID, PLAYER_ID + 1, PLAYER_ID + 2}) appendI64(frame, id);
+    std::vector<uint8_t> frame = {FLEET_DELIVERY, 2};
+    for (int64_t id : {PLAYER_ID, PLAYER_ID + 1}) appendI64(frame, id);
     frame.insert(frame.end(), notification.begin(), notification.end());
 
-    auto d = parseDelivery(wire::InboundView{frame.data(), frame.size()}, APP);
-    check(d && d->count == 3, "FLEET_DELIVERY: the count");
-    check(d && d->player(0) == PLAYER_ID && d->player(1) == PLAYER_ID + 1 &&
-              d->player(2) == PLAYER_ID + 2,
-          "FLEET_DELIVERY: count x 8-byte player gameTokenIds");
-    check(d && d->notification.len == notification.size() &&
+    auto d = parseDelivery(viewOf(frame));
+    check(d && d->count == 2 && d->player(0) == PLAYER_ID && d->player(1) == PLAYER_ID + 1,
+          "FLEET_DELIVERY: [53][1B count][count x 8B player gameTokenId]");
+    check(d && d->notification.len == frame.size() - (2 + 8 * 2) &&
+              d->notification.len == notification.size() &&
               std::memcmp(d->notification.data, notification.data(), notification.size()) == 0 &&
               d->notification.type() == 137,
-          "FLEET_DELIVERY: then the notification, byte for byte");
+          "FLEET_DELIVERY: the notification's length is the frame's minus 2 + 8 x count");
     const auto inner = d ? notificationPayload(d->notification) : std::nullopt;
     check(inner && inner->len == 5 && std::memcmp(inner->data, "hello", 5) == 0,
-          "FLEET_DELIVERY: the notification's own payload is reachable");
+          "FLEET_DELIVERY: the notification's own payload is found before its 9-byte tail");
+
+    // With its own HMAC, after the wrapped notification: 2 + 8 x count + notification + 32.
+    const auto signedFrame = withOwnHmac(frame);
+    check(signedFrame.size() == 2 + 16 + 82 + 32 &&
+              toHex(signedFrame.data(), signedFrame.size()) == fleet_vectors::DELIVERY_SIGNED_HEX,
+          "FLEET_DELIVERY: with its own HMAC it is 132 bytes here, as computed outside this code");
+    FleetFrame f = readFleetFrame(viewOf(signedFrame), false, FLEET);
+    d = parseDelivery(f.frame);
+    check(f.auth == FrameAuth::OwnHmac && d && d->count == 2 && d->notification.len == notification.size(),
+          "FLEET_DELIVERY: its own HMAC verifies, and the notification ends before it");
+    auto tampered = signedFrame;
+    tampered[2] ^= 1; // a listed player
+    check(readFleetFrame(viewOf(tampered), false, FLEET).auth == FrameAuth::Failed,
+          "FLEET_DELIVERY: a rewritten player id fails the HMAC");
+
+    // A channel notification inside is byte for byte what any session receives.
+    std::vector<uint8_t> channel = {CHANNEL_MESSAGE_NOTIFICATION};
+    appendI64(channel, 100);                       // channelId
+    channel.insert(channel.end(), 32, 'u');        // sender uuid
+    channel.push_back(2);                          // payload length, little endian
+    channel.push_back(0);
+    channel.push_back('h');
+    channel.push_back('i');
+    appendI64(channel, 1795000000999LL);
+    channel.push_back(7);
+    std::vector<uint8_t> channelFrame = {FLEET_DELIVERY, 1};
+    appendI64(channelFrame, PLAYER_ID);
+    channelFrame.insert(channelFrame.end(), channel.begin(), channel.end());
+    d = parseDelivery(viewOf(channelFrame));
+    check(d && d->count == 1 && d->notification.type() == 18 && d->notification.len == channel.size() &&
+              std::memcmp(d->notification.data, channel.data(), channel.size()) == 0,
+          "FLEET_DELIVERY: a channel notification inside is byte for byte");
 
     auto none = frame;
     none[1] = 0;
-    check(!parseDelivery(wire::InboundView{none.data(), none.size()}, APP),
-          "FLEET_DELIVERY: a count of 0 is refused");
+    check(!parseDelivery(viewOf(none)), "FLEET_DELIVERY: a count of 0 is refused");
     auto tooMany = frame;
     tooMany[1] = 33;
-    check(!parseDelivery(wire::InboundView{tooMany.data(), tooMany.size()}, APP),
-          "FLEET_DELIVERY: more than 32 players is refused");
-    std::vector<uint8_t> shortFrame(frame.begin(), frame.begin() + 2 + 24); // ids, no notification
-    check(!parseDelivery(wire::InboundView{shortFrame.data(), shortFrame.size()}, APP),
-          "FLEET_DELIVERY: a frame with no notification is refused");
+    check(!parseDelivery(viewOf(tooMany)), "FLEET_DELIVERY: more than 32 players is refused");
+    std::vector<uint8_t> shortFrame(frame.begin(), frame.begin() + 2 + 16); // ids, no notification
+    check(!parseDelivery(viewOf(shortFrame)), "FLEET_DELIVERY: a frame with no notification is refused");
 
     // 32 players, the most a frame holds.
     std::vector<uint8_t> full = {FLEET_DELIVERY, 32};
     for (int i = 0; i < 32; ++i) appendI64(full, PLAYER_ID + i);
     full.insert(full.end(), notification.begin(), notification.end());
-    d = parseDelivery(wire::InboundView{full.data(), full.size()}, APP);
+    d = parseDelivery(viewOf(full));
     check(d && d->count == 32 && d->player(31) == PLAYER_ID + 31 &&
               d->notification.len == notification.size(),
           "FLEET_DELIVERY: 32 players a frame");
 
-    // Inside a signed bundle, as a session that advertised it receives its frames.
+    // The largest datagram a fleet session is sent: a 53 with one player, wrapping the
+    // largest notification, alone, with its own HMAC. 1,242 bytes.
+    const std::vector<uint8_t> big(MAX_CLIENT_DATAGRAM - wire::HEADER_SIZE - wire::TAIL_WITH_HMAC, 'x');
+    const auto bigNotification = notificationOf(CLIENT_TEXT_NOTIFICATION, big);
+    std::vector<uint8_t> bigFrame = {FLEET_DELIVERY, 1};
+    appendI64(bigFrame, PLAYER_ID);
+    bigFrame.insert(bigFrame.end(), bigNotification.begin(), bigNotification.end());
+    const auto bigSigned = withOwnHmac(bigFrame);
+    check(big.size() == 1123 && bigFrame.size() > MAX_BUNDLED_DELIVERY && bigSigned.size() == 1242 &&
+              MAX_SERVER_DATAGRAM == 1242,
+          "FLEET_DELIVERY: the largest is 1,242 bytes, too large to be a member of a signed bundle");
+    f = readFleetFrame(viewOf(bigSigned), false, FLEET);
+    d = parseDelivery(f.frame);
+    const auto bigInner = d ? notificationPayload(d->notification) : std::nullopt;
+    check(f.auth == FrameAuth::OwnHmac && d && d->count == 1 && bigInner && bigInner->len == 1123,
+          "FLEET_DELIVERY: a 1,242-byte datagram is read, and its HMAC verified");
+    // The harness's walk takes a datagram that is not a bundle as one message.
+    int walked = 0;
+    wire::forEachMessage(bigSigned.data(), bigSigned.size(), [&](const wire::InboundView& m) {
+        if (m.len == bigSigned.size() && m.type() == FLEET_DELIVERY) ++walked;
+    });
+    check(walked == 1, "FLEET_DELIVERY: alone in its datagram, it is the datagram");
+
+    // Form two: members of a MESSAGE_BUNDLE_SIGNED, none with an HMAC of its own.
     std::vector<uint8_t> result = {FLEET_CARRY_RESULT};
     appendI64(result, PLAYER_ID);
     appendI64(result, 4242);
@@ -393,13 +553,45 @@ void testDeliveryParsing() {
     check(!wire::verifySignedBundle(bundle.data(), bundle.size(), PLAYER),
           "signed bundle: does not verify with a player's token");
     int results = 0, releases = 0, deliveries = 0;
-    const bool walked = wire::forEachMessage(bundle.data(), bundle.size(), [&](const wire::InboundView& m) {
-        if (parseCarryResult(m, APP)) ++results;
-        if (parseReleased(m, APP)) ++releases;
-        if (auto dd = parseDelivery(m, APP); dd && dd->count == 3) ++deliveries;
+    bool walkedAll = wire::forEachMessage(bundle.data(), bundle.size(), [&](const wire::InboundView& m) {
+        const FleetFrame member = readFleetFrame(m, true, FLEET);
+        if (parseCarryResult(member.frame)) ++results;
+        if (parseReleased(member.frame)) ++releases;
+        if (auto dd = parseDelivery(member.frame); dd && dd->count == 2) ++deliveries;
     });
-    check(walked && results == 1 && releases == 1 && deliveries == 1,
-          "signed bundle: the three fleet frames are read from its members");
+    check(walkedAll && results == 1 && releases == 1 && deliveries == 1,
+          "signed bundle: the three fleet frames are read from its members, with no HMAC each");
+
+    // Form one: members of a MESSAGE_BUNDLE, whose length prefix counts the frame and its HMAC.
+    std::vector<uint8_t> plain = {wire::MESSAGE_BUNDLE};
+    for (const auto& m : {withOwnHmac(result), withOwnHmac(released), withOwnHmac(frame)}) {
+        plain.push_back(static_cast<uint8_t>(m.size() & 0xFF));
+        plain.push_back(static_cast<uint8_t>(m.size() >> 8));
+        plain.insert(plain.end(), m.begin(), m.end());
+    }
+    results = releases = deliveries = 0;
+    int verified = 0;
+    std::vector<size_t> lengths;
+    walkedAll = wire::forEachMessage(plain.data(), plain.size(), [&](const wire::InboundView& m) {
+        lengths.push_back(m.len);
+        const FleetFrame member = readFleetFrame(m, false, FLEET);
+        if (member.auth == FrameAuth::OwnHmac) ++verified;
+        if (parseCarryResult(member.frame)) ++results;
+        if (parseReleased(member.frame)) ++releases;
+        if (auto dd = parseDelivery(member.frame); dd && dd->count == 2) ++deliveries;
+    });
+    check(walkedAll && lengths == std::vector<size_t>({50, 42, 132}),
+          "plain bundle: each member's length counts the frame and its HMAC");
+    check(verified == 3 && results == 1 && releases == 1 && deliveries == 1,
+          "plain bundle: each frame's own HMAC verifies and the three read back");
+
+    // What must come in a 53, and what comes plain.
+    check(isCommunication(135) && isCommunication(137) && isCommunication(144) && isCommunication(142) &&
+              isCommunication(18) && isCommunication(36),
+          "communications: voice, text, video, single-actor messages, channel text and audio");
+    check(isState(130) && isState(133) && isState(138) && isState(139) && isState(140) && isState(145) &&
+              isState(146) && !isState(137) && !isCommunication(130) && !isCommunication(140),
+          "state: actor updates and departures, voxel edits, events, generic messages, chunk changes");
 }
 
 void testControlCommands() {
@@ -422,6 +614,31 @@ void testControlCommands() {
           "COMMAND_SESSION_RELEASED: a rewritten reason fails");
     check(!verifySessionReleased(released.data(), 20, token),
           "COMMAND_SESSION_RELEASED: a short frame fails");
+
+    // The bound forms, with the public reference's vectors and nonce.
+    const uint8_t nonce[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const uint8_t otherNonce[8] = {1, 2, 3, 4, 5, 6, 7, 9};
+    auto bound = fromHex(fleet_vectors::RECONNECT_BOUND_HEX);
+    check(bound.size() == 41 && verifyReconnectBound(bound.data(), bound.size(), token, nonce),
+          "COMMAND_RECONNECT_BOUND (44): the public test vector verifies with its nonce");
+    check(!verifyReconnectBound(bound.data(), bound.size(), token, otherNonce),
+          "COMMAND_RECONNECT_BOUND: another assignment's nonce is refused");
+    check(!verifyReconnectBound(bound.data(), bound.size(), FLEET, nonce),
+          "COMMAND_RECONNECT_BOUND: another token is refused");
+    check(!verifyReconnect(bound.data(), bound.size(), token), "COMMAND_RECONNECT_BOUND: is not a 22");
+    auto boundReleased = fromHex(fleet_vectors::SESSION_RELEASED_BOUND_HEX);
+    reason = verifySessionReleasedBound(boundReleased.data(), boundReleased.size(), token, nonce);
+    check(boundReleased.size() == 42 && reason && *reason == 5,
+          "COMMAND_SESSION_RELEASED_BOUND (45): the public test vector verifies and gives reason 5");
+    check(!verifySessionReleasedBound(boundReleased.data(), boundReleased.size(), token, otherNonce),
+          "COMMAND_SESSION_RELEASED_BOUND: another nonce is refused");
+    boundReleased[1] = 3;
+    check(!verifySessionReleasedBound(boundReleased.data(), boundReleased.size(), token, nonce),
+          "COMMAND_SESSION_RELEASED_BOUND: a rewritten reason fails");
+    auto ack = fromHex(fleet_vectors::BOUND_ACK_HEX);
+    check(ack.size() == 41 && verifyBoundAck(ack.data(), ack.size(), token, nonce),
+          "CONTROL_BOUND_ACK (46): the public test vector verifies");
+    check(!verifyBoundAck(bound.data(), bound.size(), token, nonce), "CONTROL_BOUND_ACK: a 44 is not a 46");
 }
 
 void testMarker() {
@@ -481,6 +698,7 @@ int main() {
     testCarryProof();
     testCarryBytes();
     testOtherControlBytes();
+    testGoldenVectors();
     testCarriedPlayersUpdate();
     testCarryResultParsing();
     testReleasedParsing();

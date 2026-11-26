@@ -93,6 +93,8 @@ const char* apiKindName(ApiKind k) {
         case ApiKind::CloseFleetSession: return "closeFleetSession";
         case ApiKind::RefreshFleetSession: return "refreshFleetSession";
         case ApiKind::RefreshAppToken: return "refreshAppToken";
+        case ApiKind::DeleteManagedPlayer: return "deleteManagedPlayer";
+        case ApiKind::BlockPlayer: return "blockPlayer";
         default: return "unknown";
     }
 }
@@ -106,6 +108,8 @@ const char* apiCauseName(ApiCause c) {
         case ApiCause::TokenRefresh: return "token_refresh";
         case ApiCause::SignInAgain: return "sign_in_again";
         case ApiCause::Crossing: return "crossing";
+        case ApiCause::Cleanup: return "cleanup";
+        case ApiCause::RulesCheck: return "rules_check";
         default: return "unknown";
     }
 }
@@ -152,8 +156,10 @@ uint64_t ApiCounters::total() const {
 
 void ApiCounters::count(ApiKind k, ApiCause c) {
     calls[static_cast<size_t>(k)][static_cast<size_t>(c)].fetch_add(1, std::memory_order_relaxed);
-    if (windowOpen.load(std::memory_order_relaxed))
+    if (windowOpen.load(std::memory_order_relaxed)) {
         duringWindow[static_cast<size_t>(k)].fetch_add(1, std::memory_order_relaxed);
+        duringWindowByCause[static_cast<size_t>(c)].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 FleetStats::FleetStats(int sessionCount) {
@@ -189,7 +195,6 @@ const char* messageTypeName(int type) {
         case wire::GENERIC_ERROR_MESSAGE: return "GENERIC_ERROR_MESSAGE";
         case 18: return "CHANNEL_MESSAGE_NOTIFICATION";
         case 36: return "CHANNEL_AUDIO_NOTIFICATION";
-        case 46: return "CONTROL_BOUND_ACK";
         case FLEET_CARRY_RESULT: return "FLEET_CARRY_RESULT";
         case FLEET_RELEASED: return "FLEET_RELEASED";
         case FLEET_DELIVERY: return "FLEET_DELIVERY";

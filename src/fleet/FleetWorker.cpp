@@ -151,6 +151,9 @@ FleetWorker::FleetWorker(int index, World& world, Connector connect,
       requestApi_(std::move(requestApi)) {
     epollFd_ = epoll_create1(EPOLL_CLOEXEC);
     updateIntervalNs_ = static_cast<int64_t>(1e9 / world_.cfg.updateHz);
+    std::random_device entropy;
+    nonceRng_.seed((static_cast<uint64_t>(entropy()) << 32) ^ entropy() ^
+                   mix64(static_cast<uint64_t>(nowNs()) + static_cast<uint64_t>(index)));
     localOf_.assign(static_cast<size_t>(world_.cfg.servers), -1);
     for (int s = 0; s < world_.cfg.servers; ++s) {
         if (world_.workerOf(s) != index_) continue;
@@ -236,6 +239,9 @@ void FleetWorker::drainMail(int64_t now) {
     }
     for (auto& m : incoming) {
         if (m.kind == Mail::Kind::ReleaseAll) {
+            // The run is over. From here the sessions only listen: a carry still
+            // on its way must not land in the room a release has just made.
+            leaving_ = true;
             for (auto& s : sessions_) {
                 if (s.state != Session::State::Active) continue;
                 for (auto& p : s.players) {
@@ -262,20 +268,19 @@ void FleetWorker::drainMail(int64_t now) {
                     if (s->state == Session::State::Moving) s->moveRetryAtNs = now + MOVE_RETRY_NS;
                     break;
                 }
-                if (s->state == Session::State::Active) {
-                    // The API named another server while the session was up (a keep
-                    // refresh): leave the old one as a move does.
-                    closeSocket(*s);
-                    for (auto& p : s->players) {
-                        if (p->carry.active) endCarryEpisode(*s, *p);
-                        p->carried = false;
-                        p->retryAtNs = 0;
-                    }
-                    s->byId.clear();
-                }
                 inc(world_.stats.sessionMovesCompleted);
                 s->lastMoveNs = now;
-                s->needCarryAll = true;
+                if (m.info.server == s->info.server) {
+                    // The same server: the refresh authorized the same token again and
+                    // the carries stand. Capabilities again (activate), and no carry.
+                    inc(world_.stats.sessionReturnsSameServer);
+                } else {
+                    // Another server holds no carry: capabilities, then a new carry,
+                    // with a new time and proof, for every player, at the carry rate.
+                    inc(world_.stats.sessionReturnsOtherServer);
+                    forgetCarries(*s);
+                    s->needCarryAll = true;
+                }
                 activate(*s, m.info, now);
                 break;
             case Mail::Kind::Arrive:
@@ -331,6 +336,46 @@ void FleetWorker::activate(Session& s, const FleetSessionInfo& info, int64_t now
     s.errStreak = 0;
     s.sendErrStreak = 0;
     s.movePending = false;
+    // A new control nonce for each assignment, so the move commands of one never
+    // verify in the next.
+    const uint64_t nonce = nonceRng_();
+    std::memcpy(s.nonce, &nonce, sizeof(s.nonce));
+    s.boundAcked = false;
+    s.carryTokens = world_.cfg.carryBurst;
+    s.carryRefillNs = now;
+    s.lastCarriedTallyNs = now;
+}
+
+void FleetWorker::forgetCarries(Session& s) {
+    for (auto& p : s.players) {
+        if (p->carry.active) endCarryEpisode(s, *p);
+        p->carried = false;
+        p->retryAtNs = 0;
+    }
+    s.byId.clear();
+}
+
+bool FleetWorker::takeCarryToken(Session& s, int64_t now) {
+    // The realtime servers drop a FLEET_CARRY past 64 a second a session,
+    // unanswered. Every carry, a resend too, takes one token here.
+    const double refill = static_cast<double>(now - s.carryRefillNs) * 1e-9 * world_.cfg.carryRate;
+    s.carryRefillNs = now;
+    s.carryTokens = std::min(static_cast<double>(world_.cfg.carryBurst), s.carryTokens + refill);
+    if (s.carryTokens < 1.0) return false;
+    s.carryTokens -= 1.0;
+    return true;
+}
+
+FleetWorker::MinuteUse& FleetWorker::minuteOf(Session& s) {
+    if (s.minuteKey != minuteNow_ || !s.minute) {
+        MinuteUse& m = s.minutes[minuteNow_];
+        m.session = s.index;
+        m.gameTokenId = s.info.gameTokenId;
+        m.minute = minuteNow_;
+        s.minute = &m;
+        s.minuteKey = minuteNow_;
+    }
+    return *s.minute;
 }
 
 void FleetWorker::closeSocket(Session& s) {
@@ -361,9 +406,10 @@ void FleetWorker::run() {
     epoll_event events[MAX_EVENTS];
     while (running_.load(std::memory_order_acquire)) {
         const int64_t now = nowNs();
+        minuteNow_ = epochMs() / 60000;
         drainMail(now);
         for (auto& s : sessions_) {
-            if (s.state == Session::State::Active) tickSession(s, now);
+            if (s.state == Session::State::Active && !leaving_) tickSession(s, now);
         }
         if (now - lastSweepNs_ >= 100 * MS) {
             lastSweepNs_ = now;
@@ -432,14 +478,25 @@ void FleetWorker::tickCarry(Session& s, Player& p, int64_t now) {
     const FleetConfig& cfg = world_.cfg;
     FleetStats& st = world_.stats;
     if (p.carry.active) {
-        if (now - p.carry.firstSentNs >= static_cast<int64_t>(cfg.carryGiveUpMs) * MS) {
+        if (p.carry.firstSentNs == 0) {
+            // Not sent yet: it waits for the session's carry rate.
+            if (takeCarryToken(s, now)) {
+                sendCarry(s, p, now);
+            } else if (!p.carry.waited) {
+                p.carry.waited = true;
+                inc(st.carryPacedWaits);
+            }
+        } else if (now - p.carry.firstSentNs >= static_cast<int64_t>(cfg.carryGiveUpMs) * MS) {
             // No result in five seconds: give up, count it, and start again shortly.
             inc(st.carryTimedOut);
             p.retryCause = p.carry.cause;
             endCarryEpisode(s, p);
             p.retryAtNs = now + static_cast<int64_t>(cfg.carryRetryMs) * MS;
-        } else if (now - p.carry.lastSentNs >= static_cast<int64_t>(cfg.carryResendMs) * MS) {
-            sendCarry(s, p, now); // a fresh time and proof
+        } else if (now - p.carry.lastSentNs >= static_cast<int64_t>(cfg.carryResendMs) * MS &&
+                   takeCarryToken(s, now)) {
+            // A 49 can go unanswered: send it again, with a new time and proof.
+            inc(st.carryResends);
+            sendCarry(s, p, now);
         }
         return;
     }
@@ -488,6 +545,13 @@ void FleetWorker::sweep(int64_t now) {
         carried += sCarried;
         s.io->players.store(static_cast<int>(s.players.size()), std::memory_order_relaxed);
         s.io->carried.store(sCarried, std::memory_order_relaxed);
+        if (s.state == Session::State::Active && s.lastCarriedTallyNs) {
+            // The seconds this session's players were carried, as the tier's usage
+            // row counts them for the bill's first band.
+            minuteOf(s).carriedPlayerSeconds +=
+                sCarried * static_cast<double>(now - s.lastCarriedTallyNs) * 1e-9;
+        }
+        s.lastCarriedTallyNs = now;
 
         for (auto it = s.departed.begin(); it != s.departed.end();) {
             Departed& d = it->second;
@@ -516,7 +580,7 @@ void FleetWorker::sweep(int64_t now) {
         if (s.state == Session::State::Active) {
             ++active;
             if (s.movePending && now - s.lastMoveNs >= MOVE_COOLDOWN_NS)
-                requestMove(s, s.pendingTrigger, now);
+                requestMove(s, s.pendingTrigger, now, s.pendingToldToMove);
             if (cfg.rxSilentS > 0 && now >= s.activateAtNs && !s.players.empty() &&
                 now - s.lastRxNs > static_cast<int64_t>(cfg.rxSilentS) * SEC) {
                 requestMove(s, MoveTrigger::RxSilence, now);
@@ -570,6 +634,9 @@ bool FleetWorker::sendOn(Session& s, const uint8_t* buf, size_t len, SendKind ki
         inc(s.io->txDatagrams);
         inc(world_.stats.txBytes, len);
         inc(world_.stats.txDatagrams);
+        MinuteUse& minute = minuteOf(s);
+        minute.txBytes += len;
+        ++minute.txDatagrams;
         s.sendErrStreak = 0;
         return true;
     }
@@ -582,19 +649,22 @@ bool FleetWorker::sendOn(Session& s, const uint8_t* buf, size_t len, SendKind ki
         s.sendErrStreak = 0;
         s.movePending = true;
         s.pendingTrigger = MoveTrigger::SendErrors;
+        s.pendingToldToMove = false;
     }
     return false;
 }
 
 void FleetWorker::sendCapabilities(Session& s, int64_t now) {
     s.lastCapsNs = now;
-    uint32_t flags = wire::CAP_BUNDLE_SIGNED;
+    uint32_t flags = 0;
+    if (world_.cfg.signedBundles) flags |= wire::CAP_BUNDLE_SIGNED;
     if (world_.cfg.ownState) flags |= CAP_FLEET_OWN_STATE;
-    uint8_t buf[wire::CAPABILITIES_SIZE];
-    if (wire::buildCapabilities(buf, world_.cfg.appId, s.info.gameTokenId, flags, s.seq, s.token) &&
-        sendOn(s, buf, sizeof(buf), SendKind::Capabilities, s.info.gameTokenId, now)) {
+    uint8_t buf[CAPABILITIES_BOUND_SIZE];
+    const size_t len =
+        buildCapabilities(buf, world_.cfg.appId, s.info.gameTokenId, flags,
+                          world_.cfg.boundControl ? s.nonce : nullptr, s.seq, s.token);
+    if (len && sendOn(s, buf, len, SendKind::Capabilities, s.info.gameTokenId, now))
         inc(world_.stats.capabilitiesSent);
-    }
 }
 
 void FleetWorker::sendHeartbeat(Session& s, int64_t now) {
@@ -606,10 +676,14 @@ void FleetWorker::sendHeartbeat(Session& s, int64_t now) {
 }
 
 void FleetWorker::sendCarry(Session& s, Player& p, int64_t now) {
+    if (p.carry.firstSentNs == 0) p.carry.firstSentNs = now;
     p.carry.lastSentNs = now;
+    // Each FLEET_CARRY names a later time than the one before: a carry older than
+    // the session's last accepted carry of the player is refused as a replay.
+    p.lastCarryMs = std::max(epochMs(), p.lastCarryMs + 1);
     uint8_t buf[FLEET_CARRY_SIZE];
     const size_t len = buildCarry(buf, world_.cfg.appId, s.info.gameTokenId, p.carry.id,
-                                  epochMs(), p.carry.token, s.seq, s.token);
+                                  p.lastCarryMs, p.carry.token, s.seq, s.token);
     if (len && sendOn(s, buf, len, SendKind::Carry, p.carry.id, now))
         inc(world_.stats.carryDatagrams);
 }
@@ -658,12 +732,20 @@ void FleetWorker::startCarry(Session& s, Player& p, CarryCause cause, int64_t no
     p.carry.cause = cause;
     p.carry.id = id;
     p.carry.version = version;
-    p.carry.firstSentNs = now;
+    p.carry.firstSentNs = 0;
+    p.carry.lastSentNs = 0;
+    p.carry.waited = false;
     p.retryCause = cause;
     p.retryAtNs = 0;
     s.byId[id] = &p;
     inc(world_.stats.carryAttempts[static_cast<size_t>(cause)]);
-    sendCarry(s, p, now);
+    // Sent now if the session's carry rate allows, otherwise at its turn (tickCarry).
+    if (takeCarryToken(s, now)) {
+        sendCarry(s, p, now);
+    } else {
+        p.carry.waited = true;
+        inc(world_.stats.carryPacedWaits);
+    }
 }
 
 void FleetWorker::endCarryEpisode(Session& s, Player& p) {
@@ -709,9 +791,27 @@ void FleetWorker::depart(Session& s, size_t slot, int toRegion, int64_t now) {
         if (it != s.byId.end() && it->second == p.get()) s.byId.erase(it);
     }
     ++p->crossingSeq;
-    if (p->carried) {
-        // This session carried the player: FLEET_RELEASED reason 1 is due here
-        // once the new session's carry lands.
+    if (p->carried && world_.cfg.releaseFirst) {
+        // The release-first plan: this session lets go of the player itself, so
+        // no FLEET_RELEASED is due. One that comes anyway (the release was lost,
+        // or overtaken by the new carry) is counted apart.
+        uint8_t buf[FLEET_RELEASE_SIZE];
+        const size_t len =
+            buildRelease(buf, world_.cfg.appId, s.info.gameTokenId, p->curId, s.seq, s.token);
+        if (len && sendOn(s, buf, len, SendKind::Release, p->curId, now)) {
+            inc(st.releasesSent);
+            inc(st.crossingReleasesFirst);
+        }
+        Departed d;
+        d.player = p->index;
+        d.departNs = now;
+        d.late = true;
+        d.releasedFirst = true;
+        s.departed[p->curId] = d;
+        p->originSession = -1;
+    } else if (p->carried) {
+        // The default plan: the destination session carries with no word to this
+        // one, and FLEET_RELEASED reason 1 is due here once that carry lands.
         auto old = s.departed.find(p->curId);
         if (old != s.departed.end() && !old->second.late) inc(st.releaseUnpaired);
         Departed d;
@@ -765,30 +865,30 @@ void FleetWorker::requestSignInAgain(Player& p, int64_t now) {
     }
 }
 
-void FleetWorker::requestMove(Session& s, MoveTrigger trigger, int64_t now) {
+void FleetWorker::requestMove(Session& s, MoveTrigger trigger, int64_t now, bool toldToMove) {
     if (s.state != Session::State::Active) return;
     if (s.lastMoveNs && now - s.lastMoveNs < MOVE_COOLDOWN_NS) {
         // The last move is still settling. Do it when that is over (sweep), so a
         // command that arrives now is not lost.
         s.movePending = true;
         s.pendingTrigger = trigger;
+        s.pendingToldToMove = toldToMove;
         return;
     }
     s.movePending = false;
     inc(world_.stats.sessionMoves[static_cast<size_t>(trigger)]);
+    // The session goes quiet until the API has answered. Its carries are kept: if
+    // the answer names the same server they stand, and only another server needs
+    // every player carried again.
     closeSocket(s);
     s.state = Session::State::Moving;
     s.moveRetryAtNs = 0;
-    for (auto& p : s.players) {
-        if (p->carry.active) endCarryEpisode(s, *p);
-        p->carried = false;
-        p->retryAtNs = 0;
-    }
-    s.byId.clear();
     ApiRequest r;
     r.kind = ApiRequest::Kind::MoveSession;
     r.index = s.index;
-    r.current = s.info.server;
+    // Told to move: leave the current server out, so the API names a new one.
+    // Otherwise name it, and the session stays if the API still has it serve the app.
+    if (!toldToMove) r.current = s.info.server;
     r.gameTokenId = s.info.gameTokenId;
     requestApi(r);
 }
@@ -803,31 +903,68 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
     inc(s.io->rxDatagrams);
     inc(st.rxBytes, len);
     inc(st.rxDatagrams);
+    MinuteUse& minute = minuteOf(s);
+    minute.rxBytes += len;
+    ++minute.rxDatagrams;
     s.lastRxNs = now;
     if (len == 0) return;
+    const uint8_t first = data[0];
 
-    // The two commands that tell a session to move are always their own datagram.
-    if (data[0] == wire::COMMAND_RECONNECT) {
-        if (!verifyReconnect(data, len, s.token)) {
+    // The commands that tell a session to move are always their own datagram,
+    // signed with the fleet token. A session that advertised BOUND_CONTROL is
+    // sent 44 and 45, bound to its nonce, in place of 22 and 28.
+    if (first == wire::COMMAND_RECONNECT || first == COMMAND_RECONNECT_BOUND) {
+        bool ok = false;
+        if (first == COMMAND_RECONNECT_BOUND) {
+            ok = world_.cfg.boundControl && verifyReconnectBound(data, len, s.token, s.nonce);
+        } else if (s.boundAcked) {
+            // This server acknowledged the nonce, so it sends only the bound forms:
+            // a 22 now was captured earlier and sent again.
+            inc(st.legacyControlDropped);
+            return;
+        } else {
+            ok = verifyReconnect(data, len, s.token);
+        }
+        if (!ok) {
             inc(st.rxHmacFailures);
             return;
         }
         inc(st.reconnectCommands);
-        requestMove(s, MoveTrigger::ReconnectCommand, now);
+        requestMove(s, MoveTrigger::ReconnectCommand, now, /*toldToMove*/ true);
         return;
     }
-    if (data[0] == COMMAND_SESSION_RELEASED) {
-        const auto reason = verifySessionReleased(data, len, s.token);
+    if (first == COMMAND_SESSION_RELEASED || first == COMMAND_SESSION_RELEASED_BOUND) {
+        std::optional<uint8_t> reason;
+        if (first == COMMAND_SESSION_RELEASED_BOUND) {
+            if (world_.cfg.boundControl)
+                reason = verifySessionReleasedBound(data, len, s.token, s.nonce);
+        } else if (s.boundAcked) {
+            inc(st.legacyControlDropped);
+            return;
+        } else {
+            reason = verifySessionReleased(data, len, s.token);
+        }
         if (!reason) {
             inc(st.rxHmacFailures);
             return;
         }
         inc(st.sessionReleasedByReason[*reason]);
-        requestMove(s, MoveTrigger::SessionReleased, now);
+        // Reasons 3 (overload) and 4 (rebalance): the server wants the session on
+        // another one. Any other reason: ask the API to authorize it again.
+        requestMove(s, MoveTrigger::SessionReleased, now, *reason == 3 || *reason == 4);
+        return;
+    }
+    if (first == CONTROL_BOUND_ACK) {
+        if (world_.cfg.boundControl && verifyBoundAck(data, len, s.token, s.nonce)) {
+            s.boundAcked = true;
+            inc(st.boundAcks);
+        } else {
+            inc(st.rxHmacFailures);
+        }
         return;
     }
 
-    const bool signedBundle = data[0] == wire::MESSAGE_BUNDLE_SIGNED;
+    const bool signedBundle = first == wire::MESSAGE_BUNDLE_SIGNED;
     if (signedBundle) {
         // One HMAC over the datagram, keyed with the fleet token; the members
         // carry none. forEachMessage strips the tail.
@@ -836,7 +973,7 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
             inc(st.rxHmacFailures);
             return;
         }
-    } else if (data[0] == wire::MESSAGE_BUNDLE) {
+    } else if (first == wire::MESSAGE_BUNDLE) {
         inc(st.rxPlainBundles);
     }
     const bool ok = wire::forEachMessage(data, len, [&](const wire::InboundView& m) {
@@ -850,56 +987,63 @@ void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, bool tru
     FleetStats& st = world_.stats;
     const uint8_t type = m.type();
     if (s.state != Session::State::Active) return; // a handler in this datagram moved the session
-    switch (type) {
-        case wire::GENERIC_ERROR_MESSAGE:
-            inc(st.rxByType[type]);
-            onError(s, m, now);
+    if (type == wire::GENERIC_ERROR_MESSAGE) {
+        inc(st.rxByType[type]);
+        onError(s, m, now);
+        return;
+    }
+
+    if (type == FLEET_CARRY_RESULT || type == FLEET_RELEASED || type == FLEET_DELIVERY) {
+        // In a verified signed bundle the frame has no HMAC of its own. Anywhere
+        // else its last 32 bytes are its HMAC under the fleet token, and a frame
+        // whose HMAC is missing or wrong is dropped and counted.
+        const FleetFrame f = readFleetFrame(m, trusted, s.token);
+        if (f.auth == FrameAuth::Failed) {
+            inc(st.fleetFrameHmacFailures);
             return;
-        case FLEET_CARRY_RESULT: {
-            const auto r = parseCarryResult(m, world_.cfg.appId);
+        }
+        inc(f.auth == FrameAuth::SignedBundle ? st.fleetFramesInSignedBundle
+                                              : st.fleetFramesWithOwnHmac);
+        if (type == FLEET_CARRY_RESULT) {
+            const auto r = parseCarryResult(f.frame);
             if (!r) {
                 inc(st.rxMalformed);
                 return;
             }
             inc(st.rxByType[type]);
-            if (!trusted) inc(st.fleetFramesUnsigned);
-            if (looksLongForm(m, world_.cfg.appId)) inc(st.fleetFramesLongForm);
             onCarryResult(s, *r, now);
-            return;
-        }
-        case FLEET_RELEASED: {
-            const auto r = parseReleased(m, world_.cfg.appId);
+        } else if (type == FLEET_RELEASED) {
+            const auto r = parseReleased(f.frame);
             if (!r) {
                 inc(st.rxMalformed);
                 return;
             }
             inc(st.rxByType[type]);
-            if (!trusted) inc(st.fleetFramesUnsigned);
-            if (looksLongForm(m, world_.cfg.appId)) inc(st.fleetFramesLongForm);
             onReleased(s, *r, now);
-            return;
-        }
-        case FLEET_DELIVERY: {
-            const auto d = parseDelivery(m, world_.cfg.appId);
+        } else {
+            const auto d = parseDelivery(f.frame);
             if (!d) {
                 inc(st.rxMalformed);
                 return;
             }
+            // A FLEET_DELIVERY means "only these players": a communication, or a
+            // filtered event or app-defined message some of the session's players
+            // may not receive.
             inc(st.rxByType[type]);
-            if (!trusted) inc(st.fleetFramesUnsigned);
             inc(st.deliveries);
             inc(st.deliveryPlayers, d->count);
+            inc(s.io->deliveries);
+            inc(s.io->deliveryPlayers, d->count);
             inc(st.deliveryByType[d->notification.type()]);
             for (size_t i = 0; i < d->count; ++i) {
-                // A communication must list only players this session carries.
+                // It must list only players this session carries.
                 auto it = s.byId.find(d->player(i));
                 if (it == s.byId.end() || !it->second->carried) inc(st.deliveryForUncarried);
             }
-            return;
         }
-        default:
-            break;
+        return;
     }
+
     if (type & wire::SPATIAL_TYPE_BIT) {
         if (!trusted) {
             // Outside a signed bundle a notification carries its own HMAC.
@@ -911,11 +1055,35 @@ void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, bool tru
             }
         }
         inc(st.rxByType[type]);
-        s.errStreak = 0;
+        if (isCommunication(type)) {
+            plainCommunication(s, type);
+        } else if (isState(type)) {
+            // State arrives plain and once a session, however many of its players
+            // may receive it.
+            inc(st.plainState);
+            inc(s.io->plainState);
+        }
         if (type == wire::ACTOR_UPDATE_NOTIFICATION_2) onActorNotification(s, m, now);
         return;
     }
     inc(st.rxByType[type]);
+    if (isCommunication(type)) plainCommunication(s, type); // channel text or audio
+}
+
+void FleetWorker::plainCommunication(Session& s, uint8_t type) {
+    // A communication reaches a fleet session only inside a FLEET_DELIVERY that
+    // lists who may receive it. One that arrives plain says nothing about who
+    // may, so the game server could not deliver it by the rules: a server defect.
+    inc(world_.stats.plainCommunications);
+    inc(s.io->plainCommunications);
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 5) {
+        std::fprintf(stderr,
+                     "[fleet] SERVER DEFECT: session %d received a communication (type %u, %s) "
+                     "outside a FLEET_DELIVERY. Communications must always arrive in a 53 that "
+                     "lists the players who may receive them\n",
+                     s.index, type, messageTypeName(type));
+    }
 }
 
 void FleetWorker::onActorNotification(Session& s, const wire::InboundView& m, int64_t now) {
@@ -960,7 +1128,6 @@ void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
         inc(st.carryResultsDuplicate); // a resend was answered as well
         return;
     }
-    s.errStreak = 0;
     const CarryCause cause = p.carry.cause;
 
     if (r.status == CARRY_CARRIED) {
@@ -1032,27 +1199,27 @@ void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
             }
             break;
         }
-        case CARRY_OTHER_ORG_OR_APP:
-            // Another organization's or another app's player: no retry can help.
+        case CARRY_OTHER_ORGANIZATION:
+            // Another organization's player: no retry can help.
             endCarryEpisode(s, p);
             p.carried = false;
             p.failed = true;
             inc(st.playersFailed);
             std::fprintf(stderr,
                          "[fleet] player %d refused for good: FLEET_CARRY_RESULT status 2 "
-                         "(another organization's or another app's player)\n",
+                         "(another organization's player)\n",
                          p.index);
             break;
         default: {
-            // 3 (the proof or its time), 4 (the session is full) and anything
-            // unknown: the resend timer tries again with a fresh time until the
-            // five seconds are up.
+            // 3 (the proof or its time, or a replay), 4 (the session is full, or
+            // there is no place for it) and anything unknown: the resend timer
+            // tries again with a new time and proof until the five seconds are up.
             static std::atomic<bool> hinted3{false}, hinted4{false};
             if (r.status == CARRY_PROOF_OR_TIME && !hinted3.exchange(true)) {
                 std::fprintf(stderr,
-                             "[fleet] FLEET_CARRY_RESULT status 3 (the proof or its time): a "
-                             "time more than 30 s from the server's is refused, so check this "
-                             "host's clock\n");
+                             "[fleet] FLEET_CARRY_RESULT status 3 (the proof or its time failed, "
+                             "or a replay): a time more than 30 s from the server's is refused, "
+                             "so check this host's clock\n");
             } else if (r.status == CARRY_SESSION_FULL && !hinted4.exchange(true)) {
                 std::fprintf(stderr,
                              "[fleet] FLEET_CARRY_RESULT status 4: session %d carries as many "
@@ -1093,7 +1260,8 @@ void FleetWorker::onReleased(Session& s, const Released& r, int64_t now) {
         auto d = s.departed.find(id);
         if (d != s.departed.end() && d->second.releasedNs == 0) {
             if (d->second.late) {
-                inc(st.releasedAfterLateCarry);
+                inc(d->second.releasedFirst ? st.releasedAfterOwnRelease
+                                            : st.releasedAfterLateCarry);
                 s.departed.erase(d);
                 return;
             }
@@ -1161,6 +1329,20 @@ void FleetWorker::onReleased(Session& s, const Released& r, int64_t now) {
     }
 }
 
+void FleetWorker::noteSessionError(Session& s, int64_t now) {
+    // Twenty errors within two seconds that refuse the session itself (its
+    // token, or one of its own messages): ask the API to authorize it again,
+    // naming the server it is on.
+    if (now - s.errWindowNs > 2 * SEC) {
+        s.errWindowNs = now;
+        s.errStreak = 0;
+    }
+    if (++s.errStreak >= ERROR_STREAK_MOVE) {
+        s.errStreak = 0;
+        requestMove(s, MoveTrigger::ErrorStreak, now);
+    }
+}
+
 void FleetWorker::onError(Session& s, const wire::InboundView& m, int64_t now) {
     const FleetConfig& cfg = world_.cfg;
     FleetStats& st = world_.stats;
@@ -1180,10 +1362,7 @@ void FleetWorker::onError(Session& s, const wire::InboundView& m, int64_t now) {
     if (code == wire::ERR_INVALID_TOKEN || code == wire::ERR_TOKEN_EXPIRED ||
         code == wire::ERR_USER_NOT_AUTHENTICATED) {
         // The session's own token is refused: ask the API to authorize it again.
-        if (++s.errStreak >= ERROR_STREAK_MOVE) {
-            s.errStreak = 0;
-            requestMove(s, MoveTrigger::ErrorStreak, now);
-        }
+        noteSessionError(s, now);
         return;
     }
     if (code != wire::ERR_UNAUTHORIZED) return;
@@ -1196,10 +1375,7 @@ void FleetWorker::onError(Session& s, const wire::InboundView& m, int64_t now) {
         // One of the session's own messages (a carry, a release, its
         // capabilities or a heartbeat) was refused.
         inc(st.unauthSessionMessages);
-        if (++s.errStreak >= ERROR_STREAK_MOVE) {
-            s.errStreak = 0;
-            requestMove(s, MoveTrigger::ErrorStreak, now);
-        }
+        noteSessionError(s, now);
         return;
     }
 
@@ -1269,6 +1445,17 @@ FleetWorker::End FleetWorker::end() const {
         }
     }
     return e;
+}
+
+std::vector<FleetWorker::MinuteUse> FleetWorker::usage() const {
+    std::vector<MinuteUse> out;
+    for (const auto& s : sessions_) {
+        for (const auto& [minute, use] : s.minutes) {
+            (void)minute;
+            out.push_back(use);
+        }
+    }
+    return out;
 }
 
 std::vector<FleetSessionInfo> FleetWorker::sessionInfos() const {

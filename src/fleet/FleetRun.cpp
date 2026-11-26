@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
+#include <ctime>
 
 namespace lt::fleet {
 
@@ -30,6 +32,18 @@ template <size_t N> nlohmann::json nonZero(const std::array<Counter, N>& a) {
         if (get(a[i])) j[std::to_string(i)] = get(a[i]);
     }
     return j;
+}
+
+constexpr uint64_t kWireOverhead = 42; // Ethernet 14 + IPv4 20 + UDP 8
+
+std::string minuteIso(int64_t minute) {
+    const time_t secs = static_cast<time_t>(minute * 60);
+    std::tm tm{};
+    gmtime_r(&secs, &tm);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:00Z", tm.tm_year + 1900,
+                  tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+    return buf;
 }
 
 uint64_t notificationsReceived(const FleetStats& st) {
@@ -562,6 +576,7 @@ int FleetRun::run() {
             if (measureS > 0 && elapsed >= measureS) break;
             if (deps_.onTick) deps_.onTick(elapsed);
             housekeeping();
+            peakCarried_ = std::max(peakCarried_, std::min(sumCarried(), cfg_.players));
             if (static_cast<double>(now - lastControlNs) * 1e-9 >= controlS) {
                 const uint64_t c = get(stats_.crossingsCompleted);
                 const double dt = static_cast<double>(now - lastControlNs) * 1e-9;
@@ -606,7 +621,10 @@ int FleetRun::run() {
         end_.failed += e.failed;
         end_.crossingsOpen += e.crossingsOpen;
         end_.releasesPending += e.releasesPending;
+        const auto use = w->usage();
+        usage_.insert(usage_.end(), use.begin(), use.end());
     }
+    peakCarried_ = std::max(peakCarried_, end_.carried);
 
     // 6. Close every session, also after an interrupt. First let go of the setup
     // work that has not started and wait for what is in flight, so a session
@@ -701,6 +719,30 @@ int FleetRun::run() {
         failures.push_back(std::to_string(crossingCalls) +
                            " Application API call(s) were made because of a crossing");
     }
+    // And its wider form: while the players crossed, the API was called for
+    // nothing but the refreshes that fell due (a player's app token, a session's
+    // 24 hours). Anything else is named, so the reader can see what it was.
+    {
+        std::string what;
+        uint64_t other = 0;
+        for (int c = 0; c < ApiCounters::C; ++c) {
+            const ApiCause cause = static_cast<ApiCause>(c);
+            if (cause == ApiCause::TokenRefresh || cause == ApiCause::SessionKeep) continue;
+            const uint64_t n = get(stats_.api.duringWindowByCause[static_cast<size_t>(c)]);
+            if (!n) continue;
+            other += n;
+            what += (what.empty() ? "" : ", ") + std::to_string(n) + " for " + apiCauseName(cause);
+        }
+        if (other != 0) {
+            failures.push_back(std::to_string(other) +
+                               " Application API call(s) in the measured phase were not "
+                               "refreshes that fell due: " + what);
+        }
+    }
+    if (get(stats_.plainCommunications) > 0) {
+        failures.push_back(std::to_string(get(stats_.plainCommunications)) +
+                           " communication(s) arrived outside a FLEET_DELIVERY: a server defect");
+    }
     if (exitCode == 0 && !failures.empty()) exitCode = 1;
     // An interrupt ends a run that was asked to go on until interrupted, and that
     // run is judged like any other. Any other interrupted run did not finish.
@@ -714,6 +756,30 @@ int FleetRun::run() {
 // ---------------------------------------------------------------------------
 // The summary
 // ---------------------------------------------------------------------------
+
+nlohmann::json FleetRun::carriesByStatus() const {
+    // FLEET_CARRY_RESULT by status, under the names the contract gives them.
+    uint64_t other = 0;
+    for (size_t s = 5; s < 256; ++s) other += get(stats_.carryRefused[s]);
+    return {{carryStatusName(0), sum(stats_.carryCarried)},
+            {carryStatusName(1), get(stats_.carryRefused[1])},
+            {carryStatusName(2), get(stats_.carryRefused[2])},
+            {carryStatusName(3), get(stats_.carryRefused[3])},
+            {carryStatusName(4), get(stats_.carryRefused[4])},
+            {"other", other}};
+}
+
+nlohmann::json FleetRun::releasesByReason() const {
+    // FLEET_RELEASED by reason, under the names the contract gives them.
+    uint64_t other = 0;
+    for (size_t r = 0; r < 256; ++r) {
+        if (r != 1 && r != 2 && r != 5) other += get(stats_.releasedByReason[r]);
+    }
+    return {{releaseReasonName(1), get(stats_.releasedByReason[1])},
+            {releaseReasonName(2), get(stats_.releasedByReason[2])},
+            {releaseReasonName(5), get(stats_.releasedByReason[5])},
+            {"other", other}};
+}
 
 void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failures) {
     const FleetStats& st = stats_;
@@ -769,6 +835,10 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         {"moves", sum(st.sessionMoves)},
         {"moves_by_trigger", moves},
         {"moves_completed", get(st.sessionMovesCompleted)},
+        {"came_back_to_the_same_server", get(st.sessionReturnsSameServer)},
+        {"came_back_to_another_server", get(st.sessionReturnsOtherServer)},
+        {"bound_control_acknowledged", get(st.boundAcks)},
+        {"legacy_move_commands_dropped", get(st.legacyControlDropped)},
         {"move_failures", get(st.sessionMoveFailures)},
         {"keep_refreshes", get(st.sessionKeepRefreshes)},
         {"reconnect_commands", get(st.reconnectCommands)},
@@ -800,22 +870,17 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         attempts[carryCauseName(static_cast<CarryCause>(c))] = get(st.carryAttempts[static_cast<size_t>(c)]);
         carriedBy[carryCauseName(static_cast<CarryCause>(c))] = get(st.carryCarried[static_cast<size_t>(c)]);
     }
-    uint64_t refusedOther = 0;
-    for (size_t s = 5; s < 256; ++s) refusedOther += get(st.carryRefused[s]);
     j["carries"] = {
         {"attempts", sum(st.carryAttempts)},
         {"attempts_by_cause", attempts},
         {"sent", get(st.carryDatagrams)},
         {"carried", sum(st.carryCarried)},
         {"carried_by_cause", carriedBy},
-        {"refused",
-         {{"1_no_live_token", get(st.carryRefused[1])},
-          {"2_other_organization_or_app", get(st.carryRefused[2])},
-          {"3_proof_or_time", get(st.carryRefused[3])},
-          {"4_session_full", get(st.carryRefused[4])},
-          {"other", refusedOther}}},
+        {"by_status", carriesByStatus()},
+        {"resent", get(st.carryResends)},
+        {"waited_for_the_carry_rate", get(st.carryPacedWaits)},
         {"gave_up_after_5s", get(st.carryTimedOut)},
-        {"retried", get(st.carryRetries)},
+        {"started_again_after_giving_up", get(st.carryRetries)},
         {"abandoned_player_moved_on", get(st.carryAbandoned)},
         {"results_duplicate", get(st.carryResultsDuplicate)},
         {"results_late", get(st.carryResultsLate)},
@@ -844,7 +909,7 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
 
     // FLEET_RELEASED.
     j["released"] = {
-        {"by_reason", nonZero(st.releasedByReason)},
+        {"by_reason", releasesByReason()},
         {"old_session",
          {{"expected", get(st.releaseExpected)},
           {"received", get(st.releaseReceived)},
@@ -855,6 +920,7 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
           {"pending_at_end", end_.releasesPending}}},
         {"reason_1_for_a_held_player", get(st.releasedUnexpected)},
         {"reason_1_after_a_late_carry", get(st.releasedAfterLateCarry)},
+        {"reason_1_after_the_sessions_own_release", get(st.releasedAfterOwnRelease)},
         {"reason_2_for_a_held_player", get(st.released2Held)},
         {"reason_5_for_a_held_player", get(st.released5Held)},
         {"other_reason_for_a_held_player", get(st.releasedOtherHeld)},
@@ -909,8 +975,11 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         {"hmac_failures", get(st.rxHmacFailures)},
         {"malformed", get(st.rxMalformed)},
         {"unsigned_notifications", get(st.rxUnsignedSpatial)},
-        {"fleet_frames_outside_signed_bundle", get(st.fleetFramesUnsigned)},
-        {"fleet_frames_long_form", get(st.fleetFramesLongForm)},
+        {"fleet_frames_in_signed_bundles", get(st.fleetFramesInSignedBundle)},
+        {"fleet_frames_with_own_hmac", get(st.fleetFramesWithOwnHmac)},
+        {"fleet_frame_hmac_failures", get(st.fleetFrameHmacFailures)},
+        {"plain_state_notifications", get(st.plainState)},
+        {"plain_communications", get(st.plainCommunications)},
     };
 
     j["replication"] = {
@@ -937,6 +1006,11 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
             {"rx_bytes", get(io.rxBytes)},
             {"tx_datagrams", get(io.txDatagrams)},
             {"rx_datagrams", get(io.rxDatagrams)},
+            {"plain_state_notifications", get(io.plainState)},
+            {"deliveries", get(io.deliveries)},
+            {"delivery_players_listed", get(io.deliveryPlayers)},
+            {"plain_communications", get(io.plainCommunications)},
+            {"game_token_id", std::to_string(info.gameTokenId)},
             {"players_at_end", io.players.load()},
         });
     }
@@ -960,13 +1034,24 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         limited[name] = get(st.api.rateLimited[static_cast<size_t>(k)]);
         failed[name] = get(st.api.failures[static_cast<size_t>(k)]);
     }
-    for (int c = 0; c < ApiCounters::C; ++c)
+    nlohmann::json windowCauses = nlohmann::json::object();
+    for (int c = 0; c < ApiCounters::C; ++c) {
         causes[apiCauseName(static_cast<ApiCause>(c))] = st.api.byCause(static_cast<ApiCause>(c));
+        windowCauses[apiCauseName(static_cast<ApiCause>(c))] =
+            get(st.api.duringWindowByCause[static_cast<size_t>(c)]);
+    }
+    const uint64_t refreshesDue =
+        get(st.api.duringWindowByCause[static_cast<size_t>(ApiCause::TokenRefresh)]) +
+        get(st.api.duringWindowByCause[static_cast<size_t>(ApiCause::SessionKeep)]);
     j["api"] = {
         {"calls", st.api.total()},
         {"calls_by_kind", kinds},
         {"calls_by_cause", causes},
-        {"calls_in_measured_window_by_kind", window},
+        {"calls_in_measured_phase", sum(st.api.duringWindow)},
+        {"calls_in_measured_phase_by_kind", window},
+        {"calls_in_measured_phase_by_cause", windowCauses},
+        {"calls_in_measured_phase_refreshes_due", refreshesDue},
+        {"calls_in_measured_phase_other", sum(st.api.duringWindow) - refreshesDue},
         {"platform_busy_by_kind", busy},
         {"rate_limited_by_kind", limited},
         {"failures_by_kind", failed},
@@ -977,6 +1062,75 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
     j["generator"] = {
         {"send_lag", st.sendLag.toJson()},
         {"updates_skipped", get(st.updatesSkipped)},
+    };
+
+    // What each session sent and received in each minute of the wall clock (UTC),
+    // to lay beside the tier's usage rows, which are by session game token id and
+    // minute. `received_*` is what the server sent the session: the data out the
+    // bill prices. Bytes are UDP payload; `*_wire_bytes` adds 42 a datagram (the
+    // Ethernet, IPv4 and UDP headers).
+    std::sort(usage_.begin(), usage_.end(), [](const auto& a, const auto& b) {
+        return a.minute != b.minute ? a.minute < b.minute : a.session < b.session;
+    });
+    nlohmann::json minutes = nlohmann::json::array();
+    for (const auto& u : usage_) {
+        minutes.push_back({
+            {"session", u.session},
+            {"game_token_id", std::to_string(u.gameTokenId)},
+            {"minute", minuteIso(u.minute)},
+            {"sent_datagrams", u.txDatagrams},
+            {"sent_bytes", u.txBytes},
+            {"sent_wire_bytes", u.txBytes + kWireOverhead * u.txDatagrams},
+            {"received_datagrams", u.rxDatagrams},
+            {"received_bytes", u.rxBytes},
+            {"received_wire_bytes", u.rxBytes + kWireOverhead * u.rxDatagrams},
+            {"carried_player_seconds", std::round(u.carriedPlayerSeconds * 10.0) / 10.0},
+        });
+    }
+    j["usage"] = {
+        {"wire_overhead_bytes_per_datagram", kWireOverhead},
+        {"per_session_minute", minutes},
+    };
+
+    // The headline numbers of the proof, in one place.
+    const uint64_t hmacFailures = get(st.rxHmacFailures) + get(st.fleetFrameHmacFailures);
+    uint64_t otherErrors = 0;
+    for (int c = 0; c < 256; ++c) {
+        if (c != 7) otherErrors += get(st.errorCodes[static_cast<size_t>(c)]);
+    }
+    uint64_t carriesRefused = 0;
+    for (size_t s = 1; s < 256; ++s) carriesRefused += get(st.carryRefused[s]);
+    j["proof"] = {
+        {"sessions_opened", get(st.sessionsOpened)},
+        {"players_carried", peakCarried_},
+        {"players_carried_at_end", end_.carried},
+        {"carries_by_status", carriesByStatus()},
+        {"releases_by_reason", releasesByReason()},
+        {"crossings_attempted", get(st.crossingsAttempted)},
+        {"crossings_completed", get(st.crossingsCompleted)},
+        {"crossings_lost", end_.crossingsOpen},
+        {"crossings_per_s", rate(crossingsAtWindowEnd_, crossingsAtWindowStart_)},
+        {"crossing_plan", cfg_.releaseFirst ? "release-first" : "carry"},
+        {"carry_retries", get(st.carryResends) + get(st.carryRetries)},
+        {"api_calls_in_measured_phase", sum(st.api.duringWindow)},
+        {"api_calls_in_measured_phase_refreshes_due", refreshesDue},
+        {"api_calls_in_measured_phase_other", sum(st.api.duringWindow) - refreshesDue},
+        {"api_calls_caused_by_crossing",
+         st.api.byCause(ApiCause::Crossing) + get(st.api.requestsFromCrossingPath)},
+        {"hmac_failures", hmacFailures},
+        {"unauthorized_answers", get(st.errorCodes[7])},
+        {"refused",
+         {{"carries_refused", carriesRefused},
+          {"unauthorized", get(st.errorCodes[7])},
+          {"other_errors", otherErrors},
+          {"total", carriesRefused + get(st.errorCodes[7]) + otherErrors}}},
+        {"nothing_refused", carriesRefused + get(st.errorCodes[7]) + otherErrors == 0},
+        {"own_state_received", get(st.ownStateReceived)},
+        {"plain_communications", get(st.plainCommunications)},
+        {"datagrams_sent", get(st.txDatagrams)},
+        {"datagrams_received", get(st.rxDatagrams)},
+        {"bytes_sent", get(st.txBytes)},
+        {"bytes_received", get(st.rxBytes)},
     };
     summary_ = std::move(j);
 }

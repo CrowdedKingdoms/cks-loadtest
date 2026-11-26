@@ -2,6 +2,7 @@
 
 #include "fleet/FakeRealtime.hpp"
 #include "fleet/FleetConfig.hpp"
+#include "fleet/FleetRun.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -9,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <map>
+#include <string>
 
 namespace lt::fleet {
 
@@ -37,6 +40,9 @@ struct FakeRunResult {
     uint64_t capabilities = 0;
     uint64_t heartbeats = 0;
     int openSessionsAtEnd = 0;
+    /// Every counter of the stand-in for this run, by its name in
+    /// FakeRealtime::Counters.
+    std::map<std::string, uint64_t> fake;
 };
 
 /// Run `cfg` with no network: the stand-in answers the Application API and the
@@ -46,6 +52,11 @@ FakeRunResult runAgainstFake(FleetConfig cfg, FakeRealtime::Options options,
                              std::atomic<bool>& stop, FILE* log,
                              std::function<void(double, FakeRealtime&)> onTick = nullptr,
                              std::function<void(FakeRealtime&)> before = nullptr);
+
+/// What a run reaches a stand-in through, and the options a run against it needs
+/// (its org token, organization and app).
+RunDeps fakeDeps(FakeRealtime& fake);
+FleetConfig configForFake(FleetConfig cfg, FakeRealtime& fake);
 
 /// The same against a stand-in the caller keeps, so two runs can share one.
 FakeRunResult runAgainstFake(FakeRealtime& fake, FleetConfig cfg, std::atomic<bool>& stop,

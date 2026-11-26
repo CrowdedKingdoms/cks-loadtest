@@ -25,6 +25,12 @@ constexpr const char* REFRESH_SESSION_MUTATION =
     "mutation($i: RefreshFleetSessionInput!) { refreshFleetSession(input: $i) { token "
     "gameTokenId expiresAt server { ip4 clientPort } } }";
 
+constexpr const char* DELETE_PLAYER_MUTATION =
+    "mutation($o: BigInt!, $e: String!) { deleteManagedPlayer(orgId: $o, externalId: $e) }";
+
+constexpr const char* BLOCK_PLAYER_MUTATION =
+    "mutation($a: BigInt!, $u: BigInt!) { blockPlayer(appId: $a, userId: $u) { __typename } }";
+
 int64_t toEpochMs(std::chrono::system_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
 }
@@ -221,13 +227,17 @@ FleetSessionInfo FleetApi::openFleetSession(ApiCause cause) {
 }
 
 PlayerToken FleetApi::mintManagedPlayerToken(int n, ApiCause cause) {
+    return mintManagedPlayerToken(playerExternalId(n), 30, cause);
+}
+
+PlayerToken FleetApi::mintManagedPlayerToken(const std::string& externalId, int ageYears,
+                                             ApiCause cause) {
     return call(ApiKind::MintManagedPlayerToken, cause, [&](int&) {
-        const std::string externalId = playerExternalId(n);
         const nlohmann::json vars = {{"i",
                                       {{"appId", std::to_string(appId_)},
                                        {"externalId", externalId},
                                        {"gamertag", externalId},
-                                       {"ageYears", 30},
+                                       {"ageYears", ageYears},
                                        {"country", "US"}}}};
         const auto data = transport_->request(MINT_MUTATION, vars, orgToken_);
         const auto& t = data.at("mintManagedPlayerToken");
@@ -268,6 +278,27 @@ FleetSessionInfo FleetApi::refreshFleetSession(int64_t gameTokenId, const Server
         out.expiresAtMs = asExpiry(s.at("expiresAt"));
         out.server = asServer(s.at("server"));
         return out;
+    });
+}
+
+bool FleetApi::deleteManagedPlayer(int64_t orgId, const std::string& externalId,
+                                   ApiCause cause) {
+    return call(ApiKind::DeleteManagedPlayer, cause, [&](int&) {
+        const nlohmann::json vars = {{"o", std::to_string(orgId)}, {"e", externalId}};
+        const auto data = transport_->request(DELETE_PLAYER_MUTATION, vars, orgToken_);
+        const auto& v = data.at("deleteManagedPlayer");
+        return v.is_boolean() ? v.get<bool>() : false;
+    });
+}
+
+void FleetApi::blockPlayer(const std::string& playerToken, int64_t blockedUserId,
+                           ApiCause cause) {
+    call(ApiKind::BlockPlayer, cause, [&](int&) {
+        const nlohmann::json vars = {{"a", std::to_string(appId_)},
+                                     {"u", std::to_string(blockedUserId)}};
+        // The bearer is the blocking player's own app token, as from the player's device.
+        transport_->request(BLOCK_PLAYER_MUTATION, vars, playerToken);
+        return true;
     });
 }
 

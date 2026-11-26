@@ -53,6 +53,8 @@ add_library(fleet_load_core STATIC
   src/fleet/FakeRealtime.cpp
   src/fleet/FleetRun.cpp
   src/fleet/DryRun.cpp
+  src/fleet/Modes.cpp
+  src/fleet/RulesCheck.cpp
   src/fleet/SelfTest.cpp
 )
 target_link_libraries(fleet_load_core PUBLIC loadtest_core)

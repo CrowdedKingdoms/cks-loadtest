@@ -2,6 +2,7 @@
 #include "fleet/DryRun.hpp"
 #include "fleet/FleetWire.hpp"
 #include "fleet/Grid.hpp"
+#include "fleet/Modes.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -97,24 +98,57 @@ void wireChecks() {
               marker->sendUs == 123456789,
           "wire: the marker in the update's payload reads back");
 
-    const uint8_t result[18] = {FLEET_CARRY_RESULT, 2, 0x1a, 0x71, 0x18, 2, 0, 0, 0,
-                                0x39, 0x30, 0, 0, 0, 0, 0, 0, 4};
-    const auto r = parseCarryResult(wire::InboundView{result, sizeof(result)}, APP);
+    // The contract's golden proof (fleet id 9001, player id 4242, app 7).
+    const std::string goldenFleet = fixture("", "") + "fleet-token-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP";
+    const std::string goldenPlayer = fixture("", "") + "player-token-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO";
+    uint8_t golden[hmac::TAG_SIZE];
+    check(goldenFleet.size() == 64 && goldenPlayer.size() == 64 &&
+              carryProof(reinterpret_cast<const uint8_t*>(goldenPlayer.data()), 9001, 4242,
+                         1795000000000LL, golden) &&
+              toHex(golden, sizeof(golden)) ==
+                  "5602abb9300581f6a20e247ea0b406f690646a3d27f9427e95c5f6363115b35a",
+          "wire: the contract's golden carry proof");
+
+    // The three server frames, in both forms a session must read.
+    const uint8_t result[CARRY_RESULT_SIZE] = {FLEET_CARRY_RESULT, 2, 0x1a, 0x71, 0x18, 2, 0, 0, 0,
+                                               0x39, 0x30, 0, 0, 0, 0, 0, 0, 4};
+    const auto r = parseCarryResult(wire::InboundView{result, sizeof(result)});
     check(r && r->playerGameTokenId == PLAYER_ID && r->userId == 12345 && r->status == 4,
-          "wire: FLEET_CARRY_RESULT parses");
-    const uint8_t released[10] = {FLEET_RELEASED, 2, 0x1a, 0x71, 0x18, 2, 0, 0, 0, 1};
-    const auto rel = parseReleased(wire::InboundView{released, sizeof(released)}, APP);
+          "wire: FLEET_CARRY_RESULT parses (18 bytes)");
+    const uint8_t released[RELEASED_SIZE] = {FLEET_RELEASED, 2, 0x1a, 0x71, 0x18, 2, 0, 0, 0, 1};
+    const auto rel = parseReleased(wire::InboundView{released, sizeof(released)});
     check(rel && rel->playerGameTokenId == PLAYER_ID && rel->reason == 1,
-          "wire: FLEET_RELEASED parses");
+          "wire: FLEET_RELEASED parses (10 bytes)");
     uint8_t delivery[2 + 16 + 4] = {FLEET_DELIVERY, 2};
     wire::writeI64(delivery + 2, PLAYER_ID);
     wire::writeI64(delivery + 10, PLAYER_ID + 1);
     const uint8_t text[4] = {137, 1, 2, 3};
     std::memcpy(delivery + 18, text, sizeof(text));
-    const auto d = parseDelivery(wire::InboundView{delivery, sizeof(delivery)}, APP);
+    const auto d = parseDelivery(wire::InboundView{delivery, sizeof(delivery)});
     check(d && d->count == 2 && d->player(1) == PLAYER_ID + 1 && d->notification.type() == 137 &&
               d->notification.len == 4,
           "wire: FLEET_DELIVERY parses");
+
+    // Outside a signed bundle a frame is followed by its own HMAC.
+    uint8_t withHmac[CARRY_RESULT_SIZE + hmac::TAG_SIZE];
+    std::memcpy(withHmac, result, sizeof(result));
+    hmac::spatialSign(withHmac, sizeof(result), fleet, withHmac + sizeof(result));
+    FleetFrame f = readFleetFrame(wire::InboundView{withHmac, sizeof(withHmac)}, false, fleet);
+    check(sizeof(withHmac) == 50 && f.auth == FrameAuth::OwnHmac && f.frame.len == CARRY_RESULT_SIZE &&
+              parseCarryResult(f.frame),
+          "wire: a 51 with its own HMAC is 50 bytes and verifies with the fleet token");
+    withHmac[20] ^= 1;
+    check(readFleetFrame(wire::InboundView{withHmac, sizeof(withHmac)}, false, fleet).auth ==
+                  FrameAuth::Failed &&
+              readFleetFrame(wire::InboundView{result, sizeof(result)}, false, fleet).auth ==
+                  FrameAuth::Failed,
+          "wire: a frame whose HMAC is wrong or missing is refused");
+    check(readFleetFrame(wire::InboundView{result, sizeof(result)}, true, fleet).auth ==
+              FrameAuth::SignedBundle,
+          "wire: inside a verified signed bundle a frame has no HMAC of its own");
+    check(std::string(carryStatusName(3)) == "3_proof_time_or_replay" &&
+              std::string(releaseReasonName(5)) == "5_idle",
+          "wire: statuses and reasons have the contract's names");
 }
 
 void worldChecks() {
@@ -155,39 +189,71 @@ void runChecks() {
                   s["crossings"]["lost"].get<int>() == 0,
               "run: players crossed and none was lost");
         check(s["api"]["calls_caused_by_crossing"].get<uint64_t>() == 0 &&
-                  s["api"]["calls"].get<uint64_t>() == r.apiCalls &&
-                  r.apiCalls == 9u + 180u + 9u,
-              "run: the API saw only the setup and the teardown, and no call for a crossing");
-        check(s["own_state"]["received"].get<uint64_t>() == 0 && r.badHmac == 0,
+                  s["api"]["calls_in_measured_phase"].get<uint64_t>() == 0 &&
+                  s["api"]["calls"].get<uint64_t>() == r.apiCalls && r.apiCalls == 9u + 180u + 9u,
+              "run: the API saw only the setup and the teardown, and nothing while players crossed");
+        check(s["own_state"]["received"].get<uint64_t>() == 0 && r.badHmac == 0 &&
+                  s["traffic"]["plain_communications"].get<uint64_t>() == 0,
               "run: no own state came back, and every datagram verified");
+        check(r.fake.at("ownIdRefused") == 0 && r.fake.at("carriesDropped") == 0,
+              "run: nothing but 29, 49, 50 and 26 under a session's own id, and no carry past the rate");
+        check(!s["usage"]["per_session_minute"].empty() &&
+                  s["proof"]["sessions_opened"].get<uint64_t>() == 9,
+              "run: the summary has the session-minutes and the proof's numbers");
     }
     {
-        FakeRealtime::Options faults;
-        faults.mintBusyEvery = 7;
-        faults.dropToClient = 0.02;
-        faults.dropToServer = 0.02;
+        // Lost datagrams each way, a busy API at sign-in, and frames that each
+        // carry their own HMAC because the session's capabilities were not taken.
+        FakeRealtime::Options rough;
+        rough.mintBusyEvery = 7;
+        rough.dropToClient = 0.03;
+        rough.dropToServer = 0.03;
+        rough.ignoreCapabilities = true;
+        FleetConfig quick = cfg;
+        quick.carryResendMs = 80;
+        const FakeRunResult r = runAgainstFake(quick, rough, stop, nullptr);
+        const auto& s = r.summary;
+        check(r.exitCode == 0 && s["crossings"]["lost"].get<int>() == 0,
+              "rough: with datagrams lost each way, nobody is lost");
+        check(s["carries"]["resent"].get<uint64_t>() > 0 &&
+                  s["players"]["platform_busy"].get<uint64_t>() > 0,
+              "rough: an unanswered carry was sent again, and PLATFORM_BUSY was waited out");
+        check(s["traffic"]["fleet_frames_with_own_hmac"].get<uint64_t>() > 0 &&
+                  s["traffic"]["fleet_frame_hmac_failures"].get<uint64_t>() == 0,
+              "rough: frames with their own HMAC were read and verified");
+    }
+    {
+        // A session told to move and a sign-in that ends: both are handled, and
+        // both are API calls in the measured phase, so the run does not pass.
         bool moved = false, ended = false;
         const FakeRunResult r = runAgainstFake(
-            cfg, faults, stop, nullptr, [&](double t, FakeRealtime& fake) {
+            cfg, FakeRealtime::Options{}, stop, nullptr, [&](double t, FakeRealtime& fake) {
                 if (!moved && t > 0.4) {
                     moved = true;
                     fake.tellSessionToMove(4, false, 0);
                 }
-                if (!ended && t > 0.8) {
+                if (!ended && t > 1.2) {
                     ended = true;
-                    fake.endSignIn(3);
+                    for (int n = 0; n < 180; ++n) {
+                        if (fake.carrierOf(n) >= 0) {
+                            fake.endSignIn(n);
+                            break;
+                        }
+                    }
                 }
             });
         const auto& s = r.summary;
-        check(r.exitCode == 0, "faults: the run still passes");
-        check(s["sessions"]["moves_completed"].get<uint64_t>() >= 1 &&
-                  r.apiRefreshSession >= 1 && r.apiRefreshSessionWithoutServer == 0,
-              "faults: a session told to move asked the API and reconnected");
-        check(s["players"]["signed_in_again"].get<uint64_t>() >= 1 &&
-                  s["players"]["platform_busy"].get<uint64_t>() >= 1,
-              "faults: an ended sign-in was signed in again, and PLATFORM_BUSY was retried");
-        check(s["api"]["calls_caused_by_crossing"].get<uint64_t>() == 0,
-              "faults: still no API call for a crossing");
+        check(s["sessions"]["came_back_to_another_server"].get<uint64_t>() == 1 &&
+                  r.apiRefreshSession == 1 && r.apiRefreshSessionWithoutServer == 1 &&
+                  s["carries"]["carried_by_cause"]["session_move"].get<uint64_t>() > 0,
+              "faults: a session told to move asked the API for a new server and carried again");
+        check(s["players"]["signed_in_again"].get<uint64_t>() == 1 &&
+                  s["players"]["not_carried_at_end"].get<int>() == 0,
+              "faults: an ended sign-in was signed in again, and everyone was carried at the end");
+        check(r.exitCode == 1 && s["fail_reasons"].size() == 1 &&
+                  s["api"]["calls_in_measured_phase_other"].get<uint64_t>() >= 2 &&
+                  s["api"]["calls_caused_by_crossing"].get<uint64_t>() == 0,
+              "faults: those API calls in the measured phase are counted and fail the run; none was for a crossing");
     }
     {
         FakeRealtime::Options broken;
@@ -195,6 +261,24 @@ void runChecks() {
         const FakeRunResult r = runAgainstFake(cfg, broken, stop, nullptr);
         check(r.exitCode == 1 && r.summary["own_state"]["received"].get<uint64_t>() > 0,
               "detect: own state sent back unasked fails the run");
+    }
+    {
+        // The per-player rule checks, against the stand-in.
+        FakeRealtime::Options options;
+        options.idleTimeoutMs = 2500;
+        FakeRealtime fake(4242, options);
+        fake.start();
+        FleetConfig rules = configForFake(cfg, fake);
+        rules.rulesCheck = true;
+        rules.rulesIdleTimeoutS = 2.5;
+        rules.rulesStepS = 0.4;
+        nlohmann::json summary;
+        const int code = runRulesCheck(rules, fakeDeps(fake), stop, summary, nullptr);
+        fake.stop();
+        int passed = 0, failed = 0;
+        for (const auto& c : summary["checks"]) (c["result"] == "PASS" ? passed : failed)++;
+        check(code == 0 && passed >= 10 && failed == 0,
+              "rules: every per-player rule check passes against the stand-in");
     }
 }
 

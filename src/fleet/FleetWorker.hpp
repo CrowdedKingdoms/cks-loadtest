@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -67,7 +68,10 @@ private:
 struct ApiRequest {
     enum class Kind : uint8_t { MoveSession, SignInAgain } kind = Kind::MoveSession;
     int index = 0;               // session or player
-    ServerAddr current;          // MoveSession: the server the session was on
+    // MoveSession: the server the session is on, when it should stay there if the
+    // API still has it serve the app. Empty after a realtime server told the
+    // session to move: the API then names a new one.
+    ServerAddr current;
     int64_t gameTokenId = 0;     // MoveSession: the session's id
     bool fromCrossingPath = false;
 };
@@ -136,6 +140,22 @@ public:
     /// The sessions this worker owns, as last known. Call after stop().
     std::vector<FleetSessionInfo> sessionInfos() const;
 
+    /// What one session sent and received in one minute of the wall clock (UTC),
+    /// for comparison with the tier's usage rows, which are by session game token
+    /// id and minute.
+    struct MinuteUse {
+        int session = 0;
+        int64_t gameTokenId = 0;
+        int64_t minute = 0;              // minutes since the Unix epoch
+        uint64_t txBytes = 0;            // UDP payload bytes this client sent
+        uint64_t rxBytes = 0;            // UDP payload bytes the server sent this session
+        uint64_t txDatagrams = 0;
+        uint64_t rxDatagrams = 0;
+        double carriedPlayerSeconds = 0; // seconds its players were carried, summed
+    };
+    /// Every session-minute of this worker's sessions. Call after stop().
+    std::vector<MinuteUse> usage() const;
+
 private:
     struct Carry {
         bool active = false;
@@ -143,8 +163,9 @@ private:
         int64_t id = 0;              // the player's gameTokenId this carry names
         uint32_t version = 0;        // the credentials' version it was built from
         uint8_t token[hmac::TOKEN_OCTETS] = {};
-        int64_t firstSentNs = 0;
+        int64_t firstSentNs = 0;     // 0 until the first FLEET_CARRY went out (it may wait its turn)
         int64_t lastSentNs = 0;
+        bool waited = false;         // it waited for the session's carry rate
     };
 
     struct Player {
@@ -160,6 +181,7 @@ private:
         Carry carry;
         int64_t retryAtNs = 0;       // start a carry again at this time
         CarryCause retryCause = CarryCause::Join;
+        int64_t lastCarryMs = 0;     // the time in its last FLEET_CARRY: the next is later
         bool waitToken = false;      // waiting for the API threads to store a new token
         uint32_t waitVersion = 0;
         int64_t waitSinceNs = 0;
@@ -192,6 +214,7 @@ private:
         int64_t resultNs = 0;        // when the new session's carry result arrived
         int64_t releasedNs = 0;      // when FLEET_RELEASED reason 1 arrived here
         bool late = false;           // made by a carry result that arrived after the player left
+        bool releasedFirst = false;  // this session sent FLEET_RELEASE itself: no reason 1 is due
     };
 
     enum class SendKind : uint8_t { None, Update, Carry, Release, Capabilities, Heartbeat };
@@ -210,6 +233,19 @@ private:
         uint8_t seq = 0;
         int64_t activateAtNs = 0;    // no datagram before this (the API's authorization settles)
         bool needCarryAll = false;   // carry every held player once active
+        // The control nonce of this assignment, sent with the capabilities: move
+        // commands are then 44 and 45, bound to it. `boundAcked` once the server
+        // acknowledged it (46): from then on a 22 or 28 is a replay.
+        uint8_t nonce[CONTROL_NONCE_LEN] = {};
+        bool boundAcked = false;
+        // The session's carry rate: a token for each FLEET_CARRY it may send.
+        double carryTokens = 0;
+        int64_t carryRefillNs = 0;
+        // Use by minute, and the minute being written.
+        std::map<int64_t, MinuteUse> minutes;
+        MinuteUse* minute = nullptr;
+        int64_t minuteKey = -1;
+        int64_t lastCarriedTallyNs = 0;
         int64_t lastCapsNs = 0;
         int64_t lastHeartbeatNs = 0;
         int64_t lastRxNs = 0;
@@ -217,7 +253,9 @@ private:
         int64_t moveRetryAtNs = 0;
         bool movePending = false;    // told to move while the last move was settling
         MoveTrigger pendingTrigger = MoveTrigger::ReconnectCommand;
-        int errStreak = 0;
+        bool pendingToldToMove = false;
+        int errStreak = 0;           // session-level errors in the current two seconds
+        int64_t errWindowNs = 0;
         int sendErrStreak = 0;
         std::vector<std::unique_ptr<Player>> players;
         std::unordered_map<int64_t, Player*> byId;
@@ -262,11 +300,17 @@ private:
     void depart(Session& s, size_t slot, int toRegion, int64_t now);
     void deliver(std::unique_ptr<Player> p, int toSession, CarryCause cause, int64_t now);
     void requestSignInAgain(Player& p, int64_t now);
-    void requestMove(Session& s, MoveTrigger trigger, int64_t now);
+    /// `toldToMove`: a realtime server asked for it, so the API is asked for a new server.
+    void requestMove(Session& s, MoveTrigger trigger, int64_t now, bool toldToMove = false);
+    void forgetCarries(Session& s);
+    bool takeCarryToken(Session& s, int64_t now);
+    MinuteUse& minuteOf(Session& s);
     void requestApi(const ApiRequest& r);
 
     void handleDatagram(Session& s, const uint8_t* data, size_t len, int64_t now);
     void handleMessage(Session& s, const wire::InboundView& m, bool trusted, int64_t now);
+    void plainCommunication(Session& s, uint8_t type);
+    void noteSessionError(Session& s, int64_t now);
     void onCarryResult(Session& s, const CarryResult& r, int64_t now);
     void onReleased(Session& s, const Released& r, int64_t now);
     void onError(Session& s, const wire::InboundView& m, int64_t now);
@@ -287,6 +331,9 @@ private:
     std::atomic<bool> running_{false};
     int64_t lastSweepNs_ = 0;
     int64_t updateIntervalNs_ = 0;
+    bool leaving_ = false;           // the players have left: nothing more is carried or sent for them
+    int64_t minuteNow_ = 0;          // minutes since the Unix epoch, read once a loop
+    std::mt19937_64 nonceRng_;
 
     std::mutex mailMu_;
     std::vector<Mail> mail_;

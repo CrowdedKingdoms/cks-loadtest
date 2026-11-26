@@ -72,12 +72,28 @@ public:
              ApiCounters& counters, std::atomic<bool>* stop = nullptr,
              std::function<void(int)> sleepMs = nullptr);
 
+    // One org token opens, refreshes and closes a session: the API answers a
+    // refresh NOT_FOUND and a close false for any other org token. This object
+    // holds one org token, so a session stays with the token that opened it.
     FleetSessionInfo openFleetSession(ApiCause cause);
-    PlayerToken mintManagedPlayerToken(int n, ApiCause cause);
     bool closeFleetSession(int64_t gameTokenId, ApiCause cause);
+    /// With `current` set, the session stays on that server while it still serves
+    /// the app. With an empty `current` the input leaves currentServer out and the
+    /// answer names a new server: use that after a realtime server told the
+    /// session to move.
     FleetSessionInfo refreshFleetSession(int64_t gameTokenId, const ServerAddr& current,
                                          ApiCause cause);
+
+    /// Sign a managed player in (the org token's sign-in). The player is created
+    /// on its first sign-in, so a stable externalId is reused by a later run.
+    PlayerToken mintManagedPlayerToken(int n, ApiCause cause);
+    PlayerToken mintManagedPlayerToken(const std::string& externalId, int ageYears,
+                                       ApiCause cause);
     PlayerToken refreshAppToken(const std::string& playerToken, ApiCause cause);
+    /// Delete a managed player (scope players:manage). False when there was none.
+    bool deleteManagedPlayer(int64_t orgId, const std::string& externalId, ApiCause cause);
+    /// A player blocks another, with the blocking player's own app token as the bearer.
+    void blockPlayer(const std::string& playerToken, int64_t blockedUserId, ApiCause cause);
 
     /// Replace every occurrence of the org token in `text`. Error text from the
     /// API should never hold it; this makes sure a log line cannot.

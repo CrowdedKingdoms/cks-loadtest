@@ -50,6 +50,8 @@ enum class ApiKind : uint8_t {
     CloseFleetSession,
     RefreshFleetSession,
     RefreshAppToken,
+    DeleteManagedPlayer,
+    BlockPlayer,
     COUNT
 };
 /// Why an API call was made. `Crossing` exists so the summary can state its
@@ -62,6 +64,8 @@ enum class ApiCause : uint8_t {
     TokenRefresh,   // a player's app token neared its expiry
     SignInAgain,    // a player's sign-in ended and the player was signed in again
     Crossing,       // a player crossed from one server to another: must stay 0
+    Cleanup,        // --delete-players
+    RulesCheck,     // --rules-check
     COUNT
 };
 const char* apiKindName(ApiKind k);
@@ -95,6 +99,10 @@ struct SessionIo {
     Counter rxBytes{0};
     Counter txDatagrams{0};
     Counter rxDatagrams{0};
+    Counter plainState{0};           // state notifications received plain
+    Counter deliveries{0};           // FLEET_DELIVERY frames
+    Counter deliveryPlayers{0};      // players those frames listed
+    Counter plainCommunications{0};  // a communication outside a FLEET_DELIVERY: a server defect
     std::atomic<int> players{0};
     std::atomic<int> carried{0};
 };
@@ -106,8 +114,9 @@ struct ApiCounters {
     std::array<Counter, K> platformBusy{};
     std::array<Counter, K> rateLimited{};
     std::array<Counter, K> failures{};
-    /// Calls made while the measured window was open, by kind.
+    /// Calls made while the measured window was open, by kind and by cause.
     std::array<Counter, K> duringWindow{};
+    std::array<Counter, C> duringWindowByCause{};
     std::atomic<bool> windowOpen{false};
     /// An API request raised from inside the code that handles a crossing. The
     /// workers assert this cannot happen; the count is the evidence.
@@ -152,7 +161,9 @@ struct FleetStats {
     std::array<Counter, 256> carryRefused{};   // by status (1 and up)
     Counter carryTimedOut{0};
     Counter carryAbandoned{0};        // the player moved on before the result
-    Counter carryRetries{0};
+    Counter carryRetries{0};          // carries started again after giving up
+    Counter carryResends{0};          // FLEET_CARRY sent again, with a new time and proof
+    Counter carryPacedWaits{0};       // carries that waited for the session's carry rate
     Counter carryResultsDuplicate{0};
     Counter carryResultsLate{0};      // for a player the session no longer holds
     Counter carryResultsUnknown{0};
@@ -162,6 +173,7 @@ struct FleetStats {
     Counter crossingsAttempted{0};
     Counter crossingsCompleted{0};
     Counter crossingsSuperseded{0};   // crossed again before the carry completed
+    Counter crossingReleasesFirst{0}; // FLEET_RELEASE sent by the old session (release-first plan)
     Hist crossingLatency;
 
     // FLEET_RELEASED.
@@ -174,6 +186,7 @@ struct FleetStats {
     Hist releaseDelay;                // after the new session's result
     Counter releasedUnexpected{0};    // reason 1 for a player the session holds
     Counter releasedAfterLateCarry{0};
+    Counter releasedAfterOwnRelease{0}; // reason 1 after the session's own FLEET_RELEASE
     Counter releasedUnknownPlayer{0};
     Counter released2Held{0};         // reason 2 for a player the session holds
     Counter released5Held{0};         // reason 5 for a player the session holds
@@ -204,8 +217,15 @@ struct FleetStats {
     Counter rxHmacFailures{0};
     Counter rxMalformed{0};
     Counter rxUnsignedSpatial{0};
-    Counter fleetFramesUnsigned{0};
-    Counter fleetFramesLongForm{0};
+    Counter fleetFramesInSignedBundle{0}; // 51, 52, 53 as members of a verified signed bundle
+    Counter fleetFramesWithOwnHmac{0};    // 51, 52, 53 followed by their own HMAC, verified
+    Counter fleetFrameHmacFailures{0};    // 51, 52, 53 whose HMAC is missing or wrong: dropped
+    Counter plainState{0};                // state notifications received plain
+    Counter plainCommunications{0};       // communications outside a FLEET_DELIVERY: a defect
+    Counter legacyControlDropped{0};      // 22 or 28 after the server acknowledged bound control
+    Counter boundAcks{0};
+    Counter sessionReturnsSameServer{0};  // capabilities only: the carries stand
+    Counter sessionReturnsOtherServer{0}; // capabilities and a new carry for every player
     Counter deliveries{0};
     Counter deliveryPlayers{0};
     Counter deliveryForUncarried{0};
