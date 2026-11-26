@@ -429,7 +429,7 @@ in, `timing.measured_s` is the measured phase, and `timing.total_s` includes the
 | `moves_completed`, `move_failures` | Refreshes that ended connected, and failed attempts |
 | `came_back_to_the_same_server` | The carries stood: capabilities only |
 | `came_back_to_another_server` | Every player was carried again |
-| `bound_control_acknowledged` | Sessions whose control nonce the server acknowledged (46) |
+| `bound_control_acknowledged` | Acknowledgements (46) of a session's control nonce: one for each capabilities message a server accepted |
 | `legacy_move_commands_dropped` | A 22 or 28 that arrived after the acknowledgement: a replay |
 | `keep_refreshes` | `refreshFleetSession` calls made because a session's token neared its 24-hour expiry |
 | `reconnect_commands`, `session_released_by_reason` | Verified commands received |
