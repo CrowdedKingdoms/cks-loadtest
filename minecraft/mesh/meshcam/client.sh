@@ -20,7 +20,7 @@ cp "$api" "$dir/mods/fabric-api.jar"
 options="$dir/options.txt"
 touch "$options"
 for pair in onboardAccessibility:false skipMultiplayerWarning:true joinedFirstServer:true pauseOnLostFocus:false enableVsync:false \
-    soundCategory_master:0.0 maxFps:120 "inactivityFpsLimit:\"afk\""; do
+    soundCategory_master:0.0 maxFps:120 "inactivityFpsLimit:\"afk\"" tutorialStep:none; do
   key="${pair%%:*}"
   grep -v "^${key}:" "$options" > "$options.tmp" || true
   mv "$options.tmp" "$options"
