@@ -455,7 +455,7 @@ void testAroundATokenRefresh() {
         check(described, "refresh: each such refusal says the message type, the player, the time since "
                          "the last carry result and whether a refresh or a new carry was pending");
         // A player that crossed away while its carry with the new token was
-        // unanswered: the old session's FLEET_RELEASED names the NEW token id.
+        // unanswered: the old session's FLEET_RELEASED names the new token id.
         const json& old = s["released"]["old_session"];
         check(u(old["named_the_token_id_of_a_carry_left_unanswered"]) > 0 &&
                   u(old["never_arrived_within_5s"]) == 0 && u(old["received"]) == u(old["expected"]),

@@ -339,9 +339,9 @@ within 8 chunks of a border. A player that close to a border is in range of play
 standing just across it, so each server keeps receiving updates from its neighbours'
 players. A larger region lowers that traffic, and a smaller one raises it.
 
-## A load run passes on six conditions
+## A load run passes on seven conditions
 
-The exit code is 0 when all six hold:
+The exit code is 0 when all seven hold:
 
 1. Every carry that was attempted ended carried, or was retried until it was carried:
    `players.not_carried_at_end` and `players.refused_for_good` are 0.
@@ -349,12 +349,17 @@ The exit code is 0 when all six hold:
 3. No API call was made because of a crossing: `api.calls_caused_by_crossing` is 0.
 4. No API call in the measured phase was anything but a refresh that fell due:
    `api.calls_in_measured_phase_other` is 0.
-5. No own state came back: `own_state.received` is 0, unless you ran with `--own-state`.
+5. No session received an update it sent itself:
+   `own_state.sent_by_the_receiving_session.total` is 0, unless you ran with
+   `--own-state`. An update another session sent for a player the receiver carries
+   now is counted apart and does not fail a run.
 6. No communication arrived outside a `FLEET_DELIVERY`: `traffic.plain_communications`
    is 0.
+7. No refusal was left unexplained: `refused.unauthorized_unexplained` and
+   `refused.unauthorized_session_messages` are 0.
 
-Refusals do not decide the exit code, because some are expected (the table under
-`refused` below). `proof.nothing_refused` says whether the run saw any.
+The other classes of refusal are expected and do not decide the exit code (the table
+under `refused` below). `proof.nothing_refused` says whether the run saw any refusal.
 
 | Exit code | Meaning |
 |---|---|
@@ -410,7 +415,8 @@ The headline numbers in one object:
 | `hmac_failures` | Datagrams, notifications, and fleet frames whose HMAC failed |
 | `unauthorized_answers` | `UNAUTHORIZED` error messages received |
 | `refused`, `nothing_refused` | Carries refused, `UNAUTHORIZED` answers, other errors, their total, and whether the total is 0 |
-| `own_state_received`, `plain_communications` | Both must be 0 |
+| `own_state_received`, `own_state_sent_by_the_receiving_session`, `plain_communications` | Updates that came back to the session that sent them (two names for one number), and communications outside a `FLEET_DELIVERY`. All must be 0 |
+| `own_state_sent_by_another_session_before_the_handoff` | Updates a session received for a player it carries now, sent by the session that carried the player before. Expected |
 | `datagrams_sent`, `datagrams_received`, `bytes_sent`, `bytes_received` | Totals over the run |
 
 ### `config` and `timing`
@@ -458,10 +464,44 @@ in, `timing.measured_s` is the measured phase, and `timing.total_s` includes the
 | `resent` | Carries sent again because no result came, each with a later time and a new proof |
 | `waited_for_the_carry_rate` | Carries that waited their turn under `--carry-rate` |
 | `gave_up_after_5s`, `started_again_after_giving_up` | Carries with no result in 5 seconds, and carries started again after that |
-| `abandoned_player_moved_on` | Carries dropped because the player crossed again before the result |
-| `results_duplicate`, `results_late` | Results that answered a repeat, and results for a player the session no longer held |
+| `abandoned_player_moved_on` | A carry whose player crossed to another region before its result came, so the session stopped waiting for it: a join that had not been answered, or a carry made for a refreshed token |
+| `results_duplicate` | A result that answered a carry the session had sent twice |
+| `results_late` | The result of an abandoned carry, which arrived after the player had left the session; a status 0 among them means that carry landed, and its `FLEET_RELEASED` follows when the next session carries the player |
+| `took_a_newer_token_before_sending` | A carry that waited its turn and went out with a token stored meanwhile |
+| `retried_after_refresh` | Results with status 1 around a token refresh, after which the carry was sent again (see below). `..._at_once_with_the_newer_token` and `..._after_a_wait` split them |
+| `status_1_not_explained_by_a_refresh` | Results with status 1 and no refresh near them. The player signs in again, and that API call fails the run |
+| `token_carry_sent_after_the_refresh_answer` | How long after `refreshAppToken` answered the carry with the new token went out |
 | `unresolved_at_end` | Players without a carry at the end. Must be 0 |
 | `latency` | From the first `FLEET_CARRY` sent to the `FLEET_CARRY_RESULT` received |
+
+#### What happens to a carry around a token refresh
+
+A player's app token is refreshed before it expires (`--token-refresh-lead-s`). The
+API answers with a new token and a new `gameTokenId`, and the session that carries the
+player sends a new `FLEET_CARRY` with it at once.
+
+- **The carry under the old token stands while the new one is unanswered.** The
+  session goes on sending the player's updates under the old `gameTokenId` until the
+  new carry's result arrives, and under the new one from then on. It sends no
+  `FLEET_RELEASE` for the old one: the new carry replaces it.
+- **The realtime server moves the player to the new id when it accepts the carry.**
+  An update under the old id that is sent after that moment and before the result
+  reaches the session is answered `UNAUTHORIZED`. Those are counted in
+  `refused.unauthorized_during_token_refresh`.
+- **Status 1 around a refresh is sent again.** A carry that names the token the
+  refresh replaced is answered status 1 (no such live token). That happens to a
+  crossing whose carry went out while `refreshAppToken` was being answered. The
+  client sends the carry again at once with the new token, with a new time and proof.
+  If the carry named the newest token, and that token was stored in the last
+  5 seconds or a refresh is in flight, the client waits 200 ms and sends it again,
+  up to 10 times. Both are counted in `carries.retried_after_refresh`.
+- **Any other status 1 is a refusal.** The player signs in again, and the run fails
+  on that API call.
+- **A player can cross while the new carry is unanswered.** The session it leaves
+  drops that carry (`abandoned_player_moved_on`). If the carry landed all the same,
+  the `FLEET_RELEASED` the old session receives names the new `gameTokenId`. The
+  client pairs it with the crossing by either id
+  (`released.old_session.named_the_token_id_of_a_carry_left_unanswered`).
 
 ### `crossings`
 
@@ -488,7 +528,8 @@ in, `timing.measured_s` is the measured phase, and `timing.total_s` includes the
 | `received` | Of those, the old server received `FLEET_RELEASED` with reason 1 |
 | `delay_after_new_result` | How long after the new server's result the release arrived. A release that arrived first counts as 0 |
 | `before_new_result` | Releases that arrived before the new server's result |
-| `never_arrived_within_5s` | Releases still missing 5 seconds after the new server's result |
+| `named_the_token_id_of_a_carry_left_unanswered` | Releases that named the `gameTokenId` of a carry the player left behind unanswered (a refreshed token's). They are counted in `received` |
+| `never_arrived_within_5s` | Releases still missing 5 seconds after the new server's result. The client does nothing more about one: the new server carries the player, and the old one stopped sending for the player when the player left. Each is listed under `events.released_never_arrived` |
 | `no_new_result_to_pair`, `pending_at_end` | Expectations that ended with no result to time against, and ones still waiting at the end |
 
 The remaining fields count releases the run did not expect, and what the client did:
@@ -496,7 +537,7 @@ The remaining fields count releases the run did not expect, and what the client 
 | Field | Meaning |
 |---|---|
 | `reason_1_for_a_held_player` | Another session's carry replaced one the world says is current. The server carried the player again |
-| `reason_1_after_a_late_carry` | A carry that the player had already left behind landed late, and its release followed |
+| `reason_1_after_a_late_carry` | The release for a carry the player had left behind: the abandoned carry landed after the player crossed (`carries.results_late`), and the next session's carry replaced it |
 | `reason_1_after_the_sessions_own_release` | Under the release-first plan: a reason 1 for a player the session had already released |
 | `reason_2_for_a_held_player` | The player's sign-in ended. The player was signed in again and carried again |
 | `reason_5_for_a_held_player` | The player was released as idle. The server carried the player again |
@@ -509,19 +550,34 @@ The remaining fields count releases the run did not expect, and what the client 
 `unauthorized` is the count for `UNAUTHORIZED`, and `player_messages_refused` is the
 part of it that answered a message sent for a player. An error names no player: it
 echoes a one-byte sequence number that the whole session shares, and the client looks
-up what it sent under that number in the last two seconds. The client sorts those
-refusals by the cause it can see:
+up what it sent under that number in the last two seconds. For each message it sent,
+the client remembers the type, the player, the token id it named, whether a carry
+with a new token was unanswered, and whether a `refreshAppToken` was in flight.
 
-| Field | Meaning |
-|---|---|
-| `unauthorized_first_contact` | Within 2 seconds of the carry. The first message makes the realtime server load the player's permissions |
-| `unauthorized_window_reload` | The player walked more than 8 chunks from where their permissions were loaded |
-| `unauthorized_after_handoff` | The player had left the session; its last update met the new server's carry on the way |
-| `unauthorized_unexplained` | None of the above. A steady run of these for one player makes the server carry the player again (`carried_again_after_unauthorized`) |
-| `unauthorized_session_messages` | A session's own message (a carry, a release, its capabilities, a keepalive) was refused |
+Every `UNAUTHORIZED` falls into one class. The client tests them in this order:
 
-The first two causes follow the model the per-player harness uses. The numbers 2
-seconds and 8 chunks are assumptions about the realtime servers, so read a large
+| Field | The refused message | Fails a run |
+|---|---|---|
+| `unauthorized_session_messages` | Was one of the session's own (a carry, a release, its capabilities, a keepalive) | Yes |
+| `unauthorized_during_token_refresh` | Named a token id that a refresh was replacing or had replaced. It was sent after the realtime server accepted the carry with the new token and before that carry's result reached the session | No |
+| `unauthorized_after_handoff` | Was for a player who has left the session since. The player's last update there met the new session's carry on the way | No |
+| `unauthorized_after_the_carry_ended` | Was sent before a `FLEET_RELEASED` for a player the session held, or before the session moved. The carry it relied on ended while the message was on the way | No |
+| `unauthorized_first_contact` | Was sent within 2 seconds of the carry's result. The first message makes the realtime server load the player's permissions | No |
+| `unauthorized_window_reload` | Was sent after the player walked more than 8 chunks from where their permissions were loaded | No |
+| `unauthorized_unexplained` | None of the above: the session carried the player under that token id when it sent the message, and still does. The sequence number of an error that matches nothing sent in the last two seconds lands here too | Yes |
+
+`unauthorized_during_token_refresh_before_the_new_carry_result` and
+`..._after_the_new_carry_result` say whether the refusal reached the session before or
+after the new carry's result. A steady run of unexplained refusals for one player
+makes the session carry the player again (`carried_again_after_unauthorized`).
+
+The first 200 refusals of each class are listed under `events`, each with the message
+type, the player, how long after the player's last carry result on that session the
+message was sent, whether a carry with a new token was unanswered, and whether a
+token refresh was in flight.
+
+The numbers 2 seconds and 8 chunks follow the model the per-player harness uses. They
+are assumptions about the realtime servers, so read a large
 `unauthorized_window_reload` as a question to ask and treat it as unproven.
 
 ### `traffic`
@@ -537,10 +593,18 @@ seconds and 8 chunks are assumptions about the realtime servers, so read a large
 | `deliveries` | `FLEET_DELIVERY` frames, the players they listed, the notification types inside, and any player listed that the session did not carry |
 | `plain_communications` | Texts, voice, video, single-actor messages, or channel messages that arrived outside a `FLEET_DELIVERY`. Must be 0: such a message does not say who may receive it |
 | `signed_bundles`, `plain_bundles` | Datagrams of each bundle kind |
+| `by_type_and_arrival` | For each message type: how many arrived as members of a signed bundle, as members of a plain bundle, and alone in a datagram. For those outside a signed bundle: how many carried an HMAC of their own that verified, one that failed, or none. An error message (3) has no HMAC in any form, and 22, 28, 44, 45, and 46 always arrive alone with one |
+| `plain_bundle_members`, `plain_bundle_members_by_type` | What the plain bundles held. Each plain bundle is listed under `events.plain_bundles` with its members and each member's own HMAC |
 | `fleet_frames_in_signed_bundles`, `fleet_frames_with_own_hmac` | 51, 52, and 53 frames in each form |
 | `fleet_frame_hmac_failures` | 51, 52, and 53 frames whose own HMAC was missing or wrong. They are dropped |
 | `hmac_failures`, `malformed` | Datagrams and notifications that failed verification or parsing. Both should be 0 |
-| `unsigned_notifications` | Notifications outside a signed bundle with no HMAC of their own |
+| `unsigned_notifications` | Spatial notifications outside a signed bundle whose header says they carry no HMAC. Nothing proves the realtime server sent one. Error messages are not among them |
+| `unsigned_notifications_by_type` | The same, by message type |
+| `unsigned_notifications_were` | What the unsigned actor updates were: sent by the receiving session, sent by another session of this run, the sender's first update after a carry result, without a marker of this run, and from beyond the replication distance of the receiving session's whole region |
+| `updates_from_beyond_the_range_of_the_receivers_region` | Updates of this run, in any form, that came from farther than `--distance` plus one chunk from the receiving session's region. Every player of a session stands inside its region, so none of them is in range of such an update |
+| `first_updates_after_a_carry_result` | The first update a session sends for a player after a carry result: how many were sent, how many notifications of them were received, and how many of those had no HMAC |
+| `actor_left` | `ACTOR_LEFT` (145) by its reason byte (0: the actor went stale, 1: its session was released), whether the actor's player was carried by a session at that moment, and how many came from out of range |
+| `actor_updates_not_of_this_run` | Actor updates with another payload, and ones with the marker of another run of this tool. The second kind means another run is using the same app at the same time |
 
 ### `replication`
 
@@ -551,8 +615,39 @@ session received.
 
 ### `own_state`
 
-`received` counts updates that came back to the session that sent them. It must be 0
-with the capability off. With `--own-state` it is the traffic the capability adds.
+Every update carries a marker that names the session that sent it and the player it
+is for. The client sorts each update a session receives by who sent it:
+
+| Field | Meaning |
+|---|---|
+| `sent_by_the_receiving_session.total` | Updates that came back to the session that sent them. Must be 0 with the capability off. With `--own-state` it is the traffic the capability adds. `received` is the same number |
+| `...while_it_still_carried_the_player`, `...after_the_player_had_left_it` | Whether the session still carried the player when its own update came back |
+| `...its_first_update_after_a_carry_result`, `...with_no_hmac_outside_a_signed_bundle` | How many of them were the session's first update for the player after a carry result, and how many arrived outside a signed bundle with no HMAC |
+| `...age_when_received` | How old those updates were when they came back |
+| `sent_by_another_session_before_the_handoff.total` | Updates for a player the receiver carries now, sent by another session before the receiver's carry result arrived. The session that carried the player before sent them, and they were still on the way at the handoff. Expected |
+| `...sent_before_the_receivers_carry_result` | How long before the receiver's carry result those updates were sent (`max_ms`, `p99_ms`) |
+| `sent_by_another_session_after_the_receivers_carry_result` | Updates for a player the receiver carries, sent by another session after the receiver's carry result. This client stops sending for a player the moment the player leaves a session, so it expects 0 |
+
+The first 200 updates that came back to their sender are listed under
+`events.own_state_sent_by_the_receiving_session`.
+
+### `events`
+
+A counter says how often something happened. `events` says what happened: it holds the
+first 200 occurrences of each kind, with `recorded` and `not_recorded` counts. Each
+event has `since_start_s` (seconds since the run began), `t_s` (seconds since the
+measured phase opened, null during the setup), and the session.
+
+| Kind | One event is |
+|---|---|
+| `own_state_sent_by_the_receiving_session` | An update that came back to its sender: the player, its age, how it arrived, and how long after the session's last carry result for that player it was sent |
+| `state_for_a_carried_player_sent_by_another_session_after_the_carry` | An update for a player the receiver carries, sent by another session after the receiver's carry result |
+| `notifications_outside_a_signed_bundle_without_a_verified_hmac` | A notification with no HMAC, or one that failed: its type and size, who sent the update, how far its chunk is from the receiving session's region, and whether the session carried that player before |
+| `plain_bundles` | A plain bundle: its size, and each member's type, size, and own HMAC (`verified`, `failed`, or `none`) |
+| `carry_status_1` | A carry answered status 1: its cause, how long after the newest token was stored it was sent, whether a refresh was in flight, and what the client did next |
+| `unauthorized_...` | A refusal of that class (see `refused`) |
+| `released_never_arrived` | A crossing whose old session received no `FLEET_RELEASED` within 5 seconds |
+| `actor_left` | An `ACTOR_LEFT`: its reason, the actor's player, which session carried that player then, and how long after the player's last carry result it came |
 
 ### `bytes`
 
@@ -653,8 +748,10 @@ and a channel one is byte for byte what any session receives.
 
 - **The marker lives in the update's payload.** The client sends the 88-byte actor
   state the per-player harness sends, which leaves rotation pitch and yaw at 0. The
-  client writes the sending session and a send time into those two fields as whole
-  numbers. The platform relays the payload as it is. Use an app of your own, because a
+  client writes the sending session, the player, a 10-bit tag of the run, whether the
+  update is the session's first for the player after a carry result, and a send time
+  into those two fields as whole numbers. The platform relays the payload as it is.
+  That is how a receiving session knows which session sent an update. Use an app of your own, because a
   game client that renders these actors would show the numbers as a rotation.
 - **A session-released command decides between a new server and the same one by its
   reason.** Reasons 3 and 4 ask for a new server, as `COMMAND_RECONNECT` does. Any other
@@ -679,12 +776,14 @@ ctest --test-dir build -R fleet --output-on-failure
 | `fleet_wire_test` | `FLEET_CARRY`, `FLEET_RELEASE`, the keepalive, a player's heartbeat, the capabilities with and without a nonce, and a carried player's update against bytes computed outside this code; the contract's golden vectors; the proof against an HMAC built from SHA-256 by hand; 51, 52, and 53 in both forms, a wrong HMAC, and the 1,242-byte datagram; the move commands 22, 28, 44, 45, and the acknowledgement 46; the marker |
 | `fleet_world_test` | The grid, neighbours, a crossing detected exactly once, the speed formula, and the cross-rate controller |
 | `fleet_api_test` | Each GraphQL document and input, the retries, the counts by kind and cause, the roster file, and the org token's handling |
-| `fleet_run_test` | The whole client against the stand-in: a clean run with the stand-in's own count of what it was sent; sessions told to move; a session authorized again on the same server; an ended sign-in; an idle release; lost datagrams; token refresh; both frame forms and a frame whose HMAC fails; the carry rate; the release-first plan; a `FLEET_DELIVERY` and a communication outside one; own state; statuses 2, 3, and 4; an interrupt; roster reuse; the org token that owns a session; `--delete-players`; `--rules-check` |
+| `fleet_run_test` | The whole client against the stand-in: a clean run with the stand-in's own count of what it was sent; sessions told to move; a session authorized again on the same server; an ended sign-in; an idle release; lost datagrams; token refresh; slow carry results, a late new token, and a slow refresh answer around a token refresh; state held back across a handoff; a stray copy with no HMAC; both frame forms and a frame whose HMAC fails; the carry rate; the release-first plan; a `FLEET_DELIVERY` and a communication outside one; own state; statuses 2, 3, and 4; an interrupt; roster reuse; the org token that owns a session; `--delete-players`; `--rules-check` |
 | `fleet_self_test`, `fleet_dry_run`, `fleet_rules_dry_run`, `fleet_needs_org_token` | The binary itself |
 
 The stand-in (`src/fleet/FakeRealtime.*`) is written from the public wire formats
 above. It checks each datagram's HMAC and each carry's proof, keeps one carrier for a
 player, drops carries past 64 a second, sends state plain and once to a session, and
-sends text and voice inside a `FLEET_DELIVERY`. It is a test double and says nothing
+sends text and voice inside a `FLEET_DELIVERY`. Around a token refresh it answers as
+the dev tier was seen to answer: a carry that names a replaced token gets status 1,
+and after a carry with the new token a message under the old id is refused. It is a test double and says nothing
 about how the realtime servers are built. Only a live run on a tier tests the realtime
 servers themselves.

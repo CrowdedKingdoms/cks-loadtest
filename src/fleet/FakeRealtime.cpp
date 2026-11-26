@@ -953,7 +953,7 @@ void FakeRealtime::onUpdate(Session& s, int n, const uint8_t* d, size_t len, uin
     }
     if (opt_.stateDelayMs > 0) {
         // Held back: who receives it is decided when it goes out, and "its own
-        // session" stays the session that SENT it.
+        // session" stays the session that sent it.
         Held h;
         h.dueNs = nowNs() + opt_.stateDelayMs * 1000000LL;
         h.sessionId = s.id;

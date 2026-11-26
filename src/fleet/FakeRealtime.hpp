@@ -69,7 +69,7 @@ public:
         bool ownStateBug = false;               // send a session its own players' state unasked
         bool plainCommunicationBug = false;     // send a text plain as well as in a 53
         int corruptFrameHmacEvery = 0;          // every Nth frame's own HMAC is wrong
-        int strayUnsignedEvery = 0;             // every Nth update is ALSO sent, alone in a datagram and
+        int strayUnsignedEvery = 0;             // every Nth update is sent once more, alone in a datagram and
                                                 //   with no HMAC, to one session: its sender (one time in
                                                 //   four) or any session, in range or out of it
     };

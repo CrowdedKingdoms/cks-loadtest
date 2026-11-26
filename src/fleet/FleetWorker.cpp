@@ -785,6 +785,9 @@ void FleetWorker::sendUpdate(Session& s, Player& p, int64_t now, int64_t schedul
     pose.velX = p.walk.dx * speedUnits;
     pose.velY = p.walk.dy * speedUnits;
     // The marker (FleetWire.hpp): who sent this update, and when.
+    PlayerShared& shared = world_.shared[static_cast<size_t>(p.index)];
+    shared.chunkX.store(static_cast<int32_t>(g.chunkX(p.walk.x)), std::memory_order_relaxed);
+    shared.chunkY.store(static_cast<int32_t>(g.chunkY(p.walk.y)), std::memory_order_relaxed);
     const bool first = p.firstUpdateDue;
     p.firstUpdateDue = false;
     if (first) inc(world_.stats.firstUpdatesSent);
@@ -1109,6 +1112,45 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
     if (!ok) inc(st.rxMalformed);
 }
 
+void FleetWorker::describeNeighbourhood(const Session& s, int64_t cx, int64_t cy, int64_t now,
+                                        nlohmann::json& e, bool* nearFormerPlayer) {
+    // Which player could put this session in range of the chunk (cx, cy)? The
+    // nearest one it carries now (which stands inside its region), and the
+    // nearest one it carried before and no longer carries, by the chunk of each
+    // one's last update. Read from other threads' atomics, so a position can be
+    // one update old.
+    int nearestNow = -1, nearestFormer = -1;
+    int64_t nowDist = INT64_MAX, formerDist = INT64_MAX;
+    for (int n = 0; n < world_.cfg.players; ++n) {
+        const PlayerShared& shared = world_.shared[static_cast<size_t>(n)];
+        const int holder = shared.holder.load(std::memory_order_relaxed);
+        const bool mine = holder == s.index;
+        if (!mine && !shared.wasCarriedBy(s.index)) continue;
+        const int64_t dx = std::llabs(cx - shared.chunkX.load(std::memory_order_relaxed));
+        const int64_t dy = std::llabs(cy - shared.chunkY.load(std::memory_order_relaxed));
+        const int64_t d = std::max(dx, dy);
+        if (mine) {
+            if (d < nowDist) nowDist = d, nearestNow = n;
+        } else if (d < formerDist) {
+            formerDist = d, nearestFormer = n;
+        }
+    }
+    if (nearestNow >= 0) e["nearest_player_the_session_carries_is_chunks_away"] = nowDist;
+    const bool near = nearestFormer >= 0 && formerDist <= world_.cfg.distance + 1;
+    e["in_range_of_a_player_the_session_carried_before"] = near;
+    if (nearestFormer >= 0) {
+        const PlayerShared& shared = world_.shared[static_cast<size_t>(nearestFormer)];
+        e["nearest_player_the_session_carried_before"] = nearestFormer;
+        e["that_player_is_chunks_away"] = formerDist;
+        e["that_player_is_carried_by_session"] = shared.holder.load(std::memory_order_relaxed);
+        if (shared.leftSession.load(std::memory_order_relaxed) == s.index) {
+            e["ms_since_that_player_left_this_session"] =
+                msBetween(now, shared.leftAtNs.load(std::memory_order_relaxed));
+        }
+    }
+    if (nearFormerPlayer) *nearFormerPlayer = near;
+}
+
 void FleetWorker::countControl(uint8_t type, bool verified) {
     // 22, 28, 44, 45 and 46 are always alone in their datagram, with an HMAC
     // keyed on the fleet token.
@@ -1162,6 +1204,10 @@ void FleetWorker::noteOutsideSignedBundle(Session& s, const wire::InboundView& m
         e["chunks_from_the_receiving_sessions_region"] = far;
         e["out_of_range_of_every_player_of_the_session"] = far > world_.cfg.distance + 1;
         if (none && far > world_.cfg.distance + 1) inc(st.unsignedOutOfRange);
+        if (far > world_.cfg.distance + 1) {
+            describeNeighbourhood(s, wire::readI64(m.data + wire::off::CHUNK_X),
+                                  wire::readI64(m.data + wire::off::CHUNK_Y), now, e);
+        }
         const auto actor = world_.playerOfActor.find(
             std::string(reinterpret_cast<const char*>(m.data + wire::off::UUID), 32));
         if (actor != world_.playerOfActor.end()) {
@@ -1342,10 +1388,35 @@ void FleetWorker::onActorNotification(Session& s, const wire::InboundView& m, Wh
         return;
     }
     inc(st.markersSeen);
-    if (world_.grid.chunksFromRegion(s.index, wire::readI64(m.data + wire::off::CHUNK_X),
-                                     wire::readI64(m.data + wire::off::CHUNK_Y)) >
-        world_.cfg.distance + 1)
-        inc(st.updatesOutOfRange);
+    {
+        // How far the update's chunk is from this session's region. Every player
+        // the session carries stands inside its region, so an update from farther
+        // than the replication distance is out of range of all of them.
+        const int64_t cx = wire::readI64(m.data + wire::off::CHUNK_X);
+        const int64_t cy = wire::readI64(m.data + wire::off::CHUNK_Y);
+        const int64_t far = world_.grid.chunksFromRegion(s.index, cx, cy);
+        inc(st.updatesByChunksFromRegion[static_cast<size_t>(std::min<int64_t>(far, 257))]);
+        if (far > world_.cfg.distance + 1) {
+            inc(st.updatesOutOfRange);
+            inc(st.updatesOutOfRangeBytes, m.len);
+            inc(s.io->updatesOutOfRange);
+            inc(s.io->rxBytesOutOfRange, m.len);
+            // One in 499 is described, so the events cover the whole run.
+            if (outOfRangeSeen_++ % 499 == 0) {
+                nlohmann::json e = {{"t_s", world_.phaseSeconds(now)},
+                                    {"session", s.index},
+                                    {"sent_by_session", marker->session},
+                                    {"player", marker->player},
+                                    {"where", whereName(static_cast<int>(where))},
+                                    {"chunks_from_the_receiving_sessions_region", far}};
+                bool nearFormer = false;
+                describeNeighbourhood(s, cx, cy, now, e, &nearFormer);
+                inc(st.updatesOutOfRangeSampled);
+                if (nearFormer) inc(st.updatesOutOfRangeNearFormerPlayer);
+                st.events.add("updates_from_out_of_range", std::move(e));
+            }
+        }
+    }
     if (marker->first) {
         inc(st.firstUpdatesReceived);
         if (where != Where::SignedBundle && m.data[wire::off::CONTAINS_AUTH] == 0)
@@ -1405,7 +1476,7 @@ void FleetWorker::onActorNotification(Session& s, const wire::InboundView& m, Wh
             inc(st.otherSentBeforeHandoff);
             st.handoffLead.record((carriedAt - sentNs) / 1000);
         } else {
-            // Sent AFTER this session's carry result, by another session. The
+            // Sent after this session's carry result, by another session. The
             // client never does that (a session stops sending for a player the
             // moment the player leaves it), so this is counted apart.
             inc(st.otherSentAfterCarry);
@@ -1674,7 +1745,7 @@ std::unordered_map<int64_t, FleetWorker::Departed>::iterator FleetWorker::findDe
     Session& s, int64_t id, bool* byAlias) {
     // A player that left is known by the token id its carry stood under. If it
     // left a carry with a refreshed token unanswered, and that carry landed, the
-    // server knows it here under the NEW id, and its release names that one.
+    // server knows it here under the new id, and its release names that one.
     if (byAlias) *byAlias = false;
     auto it = s.departed.find(id);
     if (it != s.departed.end()) return it;

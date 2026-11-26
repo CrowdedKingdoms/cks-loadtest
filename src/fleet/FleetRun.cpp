@@ -1034,6 +1034,31 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
                 {{"type", t}, {"name", messageTypeName(t)}, {"n", get(st.rxOutsideNoHmac[i])}});
         }
     }
+    // Updates by how far they came from the receiving session's region.
+    nlohmann::json byDistance = nlohmann::json::object();
+    int64_t farthest = 0;
+    {
+        const int d = cfg_.distance;
+        struct Band { int from, to; };
+        const Band bands[] = {{0, 0},          {1, d},           {d + 1, d + 1},  {d + 2, 2 * d + 1},
+                              {2 * d + 2, 32}, {33, 64},         {65, 128},       {129, 256},
+                              {257, 257}};
+        for (const Band& b : bands) {
+            if (b.to < b.from) continue;
+            uint64_t n = 0;
+            for (int i = b.from; i <= b.to && i <= 257; ++i) {
+                const uint64_t c = get(st.updatesByChunksFromRegion[static_cast<size_t>(i)]);
+                n += c;
+                if (c) farthest = i;
+            }
+            const std::string name = b.from == 0 ? "inside_the_region"
+                                     : b.from == 257 ? "257_chunks_or_more"
+                                     : b.from == b.to ? std::to_string(b.from) + "_chunks"
+                                                      : std::to_string(b.from) + "_to_" +
+                                                            std::to_string(b.to) + "_chunks";
+            byDistance[name] = n;
+        }
+    }
     nlohmann::json leftByReason = nlohmann::json::object();
     for (int r = 0; r < 256; ++r) {
         const uint64_t n = get(st.actorLeftByReason[static_cast<size_t>(r)]);
@@ -1071,6 +1096,14 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
           {"not_an_actor_update", get(st.unsignedOtherType)},
           {"from_beyond_the_range_of_the_receivers_region", get(st.unsignedOutOfRange)}}},
         {"updates_from_beyond_the_range_of_the_receivers_region", get(st.updatesOutOfRange)},
+        {"updates_by_chunks_from_the_receivers_region", byDistance},
+        {"updates_from_out_of_range",
+         {{"n", get(st.updatesOutOfRange)},
+          {"bytes_as_members", get(st.updatesOutOfRangeBytes)},
+          {"farthest_chunks", farthest},
+          {"described", get(st.updatesOutOfRangeSampled)},
+          {"of_those_in_range_of_a_player_the_session_carried_before",
+           get(st.updatesOutOfRangeNearFormerPlayer)}}},
         {"first_updates_after_a_carry_result",
          {{"sent", get(st.firstUpdatesSent)},
           {"notifications_received", get(st.firstUpdatesReceived)},
@@ -1132,6 +1165,8 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
             {"tx_datagrams", get(io.txDatagrams)},
             {"rx_datagrams", get(io.rxDatagrams)},
             {"plain_state_notifications", get(io.plainState)},
+            {"updates_from_out_of_range", get(io.updatesOutOfRange)},
+            {"bytes_from_out_of_range_as_members", get(io.rxBytesOutOfRange)},
             {"deliveries", get(io.deliveries)},
             {"delivery_players_listed", get(io.deliveryPlayers)},
             {"plain_communications", get(io.plainCommunications)},

@@ -422,7 +422,7 @@ inline std::optional<Payload> notificationPayload(const wire::InboundView& m) {
 ///   yaw   = microseconds on this process's steady clock when the update was sent
 /// Both are whole numbers below 2^53, so a float64 holds them exactly.
 ///
-/// So every update a session receives says WHICH SESSION SENT IT, for which
+/// So every update a session receives says which session sent it, for which
 /// player, when, and whether it was the first update that session sent for the
 /// player after a FLEET_CARRY_RESULT. That is what lets the client tell state a
 /// session sent itself (which must not come back to it) from state another

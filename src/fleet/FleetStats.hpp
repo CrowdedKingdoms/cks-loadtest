@@ -124,6 +124,8 @@ struct SessionIo {
     Counter deliveries{0};           // FLEET_DELIVERY frames
     Counter deliveryPlayers{0};      // players those frames listed
     Counter plainCommunications{0};  // a communication outside a FLEET_DELIVERY: a server defect
+    Counter updatesOutOfRange{0};    // updates from beyond the replication distance of its region
+    Counter rxBytesOutOfRange{0};    // their bytes, as members (without the bundle's own bytes)
     std::atomic<int> players{0};
     std::atomic<int> carried{0};
 };
@@ -287,7 +289,7 @@ struct FleetStats {
     Counter actorUpdatesOtherRun{0};        // a marker of another run of this tool
 
     // Replication latency and own state. Every update's marker names the session
-    // that SENT it and the player it is for.
+    // that sent it and the player it is for.
     Counter markersSeen{0};
     Counter ownStateReceived{0};            // a session received an update IT sent: must be 0
     Counter ownSentWhileCarrying{0};        // of those: it still carried the player
@@ -308,11 +310,18 @@ struct FleetStats {
     Counter unsignedOutOfRange{0};          // an update from beyond the replication distance of the
                                             //   receiving session's whole region
     Counter updatesOutOfRange{0};           // the same, for every update of this run received
+    Counter updatesOutOfRangeBytes{0};      // their bytes, as members
+    Counter updatesOutOfRangeNearFormerPlayer{0}; // of the sampled ones: in range of a player the
+                                                  //   session carried before and no longer carries
+    Counter updatesOutOfRangeSampled{0};
+    // Every update of this run by how far its chunk is from the receiving
+    // session's region, in chunks (the last entry: that many or more).
+    std::array<Counter, 258> updatesByChunksFromRegion{};
     Counter actorLeftOutOfRange{0};         // an ACTOR_LEFT from beyond it
     Hist ownSentAge;                        // how old those updates were when they came back
     Counter otherSentBeforeHandoff{0};      // sent by ANOTHER session before the receiver's carry result
     Hist handoffLead;                       // how long before the receiver's carry result they were sent
-    Counter otherSentAfterCarry{0};         // sent by another session AFTER the receiver's carry result
+    Counter otherSentAfterCarry{0};         // sent by another session after the receiver's carry result
     Hist replicationLatency;
     EventLog events;
 

@@ -76,6 +76,7 @@ struct PlayerShared {
     std::atomic<int64_t> refreshStartedAtNs{0}; // when a refreshAppToken for it was sent; 0 when none is in flight
     std::atomic<bool> tokenRefreshed{false};   // its current token came from a refresh (and not a sign-in)
     std::atomic<uint64_t> carriedBy[4] = {};   // the sessions that have carried it (session mod 256)
+    std::atomic<int32_t> chunkX{0}, chunkY{0}; // the app chunk of its last update
 
     void noteCarriedBy(int session) {
         carriedBy[(session >> 6) & 3].fetch_or(uint64_t{1} << (session & 63),
@@ -364,6 +365,11 @@ private:
     void handleDatagram(Session& s, const uint8_t* data, size_t len, int64_t now);
     void handleMessage(Session& s, const wire::InboundView& m, Where where, int64_t now);
     void countControl(uint8_t type, bool verified);
+    /// For an update from out of range of everything a session carries: the
+    /// players near the update that could explain why the session was sent it.
+    void describeNeighbourhood(const Session& s, int64_t cx, int64_t cy, int64_t now,
+                               nlohmann::json& e, bool* nearFormerPlayer = nullptr);
+    uint64_t outOfRangeSeen_ = 0;
     nlohmann::json* bundleMembers_ = nullptr; // the plain bundle being read, for its event
     void onActorLeft(Session& s, const wire::InboundView& m, Where where, int64_t now);
     void noteOutsideSignedBundle(Session& s, const wire::InboundView& m, Where where,
