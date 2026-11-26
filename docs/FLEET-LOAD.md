@@ -601,7 +601,8 @@ are assumptions about the realtime servers, so read a large
 | `unsigned_notifications` | Spatial notifications outside a signed bundle whose header says they carry no HMAC. Nothing proves the realtime server sent one. Error messages are not among them |
 | `unsigned_notifications_by_type` | The same, by message type |
 | `unsigned_notifications_were` | What the unsigned actor updates were: sent by the receiving session, sent by another session of this run, the sender's first update after a carry result, without a marker of this run, and from beyond the replication distance of the receiving session's whole region |
-| `updates_from_beyond_the_range_of_the_receivers_region` | Updates of this run, in any form, that came from farther than `--distance` plus one chunk from the receiving session's region. Every player of a session stands inside its region, so none of them is in range of such an update |
+| `updates_by_chunks_from_the_receivers_region` | Every update of this run that a session received, by how far its chunk is from that session's region, on the axis where it is farthest. Every player of a session stands inside its region, so an update from farther than `--distance` is out of range of all of them. The client allows one chunk more before it calls an update out of range |
+| `updates_from_beyond_the_range_of_the_receivers_region`, `updates_from_out_of_range` | Updates from farther than `--distance` plus one chunk: their number, their bytes as bundle members, and the farthest. One in 499 is described under `events.updates_from_out_of_range`, and `of_those_in_range_of_a_player_the_session_carried_before` counts the described ones that were in range of a player the session used to carry |
 | `first_updates_after_a_carry_result` | The first update a session sends for a player after a carry result: how many were sent, how many notifications of them were received, and how many of those had no HMAC |
 | `actor_left` | `ACTOR_LEFT` (145) by its reason byte (0: the actor went stale, 1: its session was released), whether the actor's player was carried by a session at that moment, and how many came from out of range |
 | `actor_updates_not_of_this_run` | Actor updates with another payload, and ones with the marker of another run of this tool. The second kind means another run is using the same app at the same time |
@@ -644,6 +645,7 @@ measured phase opened, null during the setup), and the session.
 | `state_for_a_carried_player_sent_by_another_session_after_the_carry` | An update for a player the receiver carries, sent by another session after the receiver's carry result |
 | `notifications_outside_a_signed_bundle_without_a_verified_hmac` | A notification with no HMAC, or one that failed: its type and size, who sent the update, how far its chunk is from the receiving session's region, and whether the session carried that player before |
 | `plain_bundles` | A plain bundle: its size, and each member's type, size, and own HMAC (`verified`, `failed`, or `none`) |
+| `updates_from_out_of_range` | One in 499 of the updates from beyond the replication distance of the receiving session's region: who sent it, how far it came, how far the nearest player the session carries is from it, and the nearest player the session carried before, with the session that carries that player now |
 | `carry_status_1` | A carry answered status 1: its cause, how long after the newest token was stored it was sent, whether a refresh was in flight, and what the client did next |
 | `unauthorized_...` | A refusal of that class (see `refused`) |
 | `released_never_arrived` | A crossing whose old session received no `FLEET_RELEASED` within 5 seconds |
@@ -652,9 +654,9 @@ measured phase opened, null during the setup), and the session.
 ### `bytes`
 
 `tx` and `rx` are UDP payload bytes, in total. `per_session` lists each session's
-`game_token_id`, server, bytes, datagrams, plain state notifications, `FLEET_DELIVERY`
-frames with the players they listed, plain communications, and the players it held at
-the end.
+`game_token_id`, server, bytes, datagrams, plain state notifications, updates from out
+of range with their bytes, `FLEET_DELIVERY` frames with the players they listed, plain
+communications, and the players it held at the end.
 
 ### `usage`: the bytes to lay beside the bill
 
