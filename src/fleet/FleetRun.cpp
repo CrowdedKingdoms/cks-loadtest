@@ -115,7 +115,12 @@ void FleetRun::setFatal(const std::string& why) {
     hasFatal_.store(true);
 }
 
-void FleetRun::storeToken(int player, const PlayerToken& t) {
+void FleetRun::storeToken(int player, const PlayerToken& t, bool fromRefresh) {
+    // The time is written first, so a worker that sees the new token also sees
+    // when it came.
+    PlayerShared& shared = world_->shared[static_cast<size_t>(player)];
+    shared.tokenRefreshed.store(fromRefresh, std::memory_order_relaxed);
+    shared.tokenStoredAtNs.store(nowNs(), std::memory_order_relaxed);
     world_->creds[static_cast<size_t>(player)].store(t);
     if (!cfg_.rosterFile.empty()) {
         std::lock_guard<std::mutex> lock(mu_);
@@ -174,15 +179,18 @@ void FleetRun::runJob(FleetApi& api, const Job& j) {
             // The player's own app token is the bearer. If the API will not
             // refresh it any more, the player signs in again.
             SharedCreds& creds = world_->creds[i];
+            PlayerShared& shared = world_->shared[i];
             bool done = false;
+            shared.refreshStartedAtNs.store(nowNs(), std::memory_order_relaxed);
             try {
                 const PlayerToken t = api.refreshAppToken(creds.snapshot().token, j.cause);
-                storeToken(j.index, t);
+                storeToken(j.index, t, /*fromRefresh*/ true);
                 stats_.tokenRefreshes.fetch_add(1, std::memory_order_relaxed);
                 done = true;
             } catch (const std::exception&) {
                 stats_.tokenRefreshFailures.fetch_add(1, std::memory_order_relaxed);
             }
+            shared.refreshStartedAtNs.store(0, std::memory_order_relaxed);
             if (!done && !stop_.load()) {
                 try {
                     const PlayerToken t =
@@ -490,6 +498,8 @@ int FleetRun::run() {
         for (int n = 0; n < cfg_.players; ++n) {
             auto it = roster_.players.find(n);
             if (it != roster_.players.end() && it->second.expiresAtMs - nowMs > margin) {
+                world_->shared[static_cast<size_t>(n)].tokenStoredAtNs.store(
+                    nowNs(), std::memory_order_relaxed);
                 world_->creds[static_cast<size_t>(n)].store(it->second);
                 stats_.playersFromRoster.fetch_add(1, std::memory_order_relaxed);
                 tokensReady_.fetch_add(1, std::memory_order_relaxed);
@@ -552,6 +562,7 @@ int FleetRun::run() {
     if (setupOk) {
         ranWindow = true;
         windowStartNs_ = nowNs();
+        world_->windowStartNs.store(windowStartNs_, std::memory_order_relaxed);
         stats_.api.windowOpen.store(true);
         crossingsAtWindowStart_ = get(stats_.crossingsCompleted);
         updatesAtWindowStart_ = get(stats_.updatesSent);
@@ -707,9 +718,28 @@ int FleetRun::run() {
                                "plus superseded plus open)");
         }
         if (!cfg_.ownState && get(stats_.ownStateReceived) > 0) {
-            failures.push_back(std::to_string(get(stats_.ownStateReceived)) +
-                               " update(s) of a session's own carried players came back to it "
-                               "with FLEET_OWN_STATE off");
+            // Each update names the session that sent it: these came back to the
+            // session that sent them. An update another session sent for a player
+            // the receiver carries now is counted apart and does not fail a run.
+            failures.push_back(
+                std::to_string(get(stats_.ownStateReceived)) +
+                " update(s) came back to the session that sent them with FLEET_OWN_STATE off (" +
+                std::to_string(get(stats_.ownSentWhileCarrying)) +
+                " while it still carried the player, " +
+                std::to_string(get(stats_.ownSentAfterPlayerLeft)) +
+                " after the player had left it)");
+        }
+        // Refusals. Each class is described in the summary; two of them say the
+        // client and the realtime servers disagree about a carry, and fail a run.
+        if (get(stats_.unauthUnexplained) > 0) {
+            failures.push_back(std::to_string(get(stats_.unauthUnexplained)) +
+                               " message(s) were refused UNAUTHORIZED with no explanation: the "
+                               "session carried the player under that token id when it sent them");
+        }
+        if (get(stats_.unauthSessionMessages) > 0) {
+            failures.push_back(std::to_string(get(stats_.unauthSessionMessages)) +
+                               " of a session's own messages (29, 49, 50 or 26) were refused "
+                               "UNAUTHORIZED");
         }
     }
     // The assertion the proof rests on: no API call was made because of a crossing.
@@ -896,6 +926,12 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         {"abandoned_player_moved_on", get(st.carryAbandoned)},
         {"results_duplicate", get(st.carryResultsDuplicate)},
         {"results_late", get(st.carryResultsLate)},
+        {"took_a_newer_token_before_sending", get(st.carryTookNewerToken)},
+        {"retried_after_refresh", get(st.carryRetriedAfterRefresh)},
+        {"retried_after_refresh_at_once_with_the_newer_token", get(st.carryRetriedWithNewerToken)},
+        {"retried_after_refresh_after_a_wait", get(st.carryRetriedAfterWait)},
+        {"status_1_not_explained_by_a_refresh", get(st.carryStatus1Refusals)},
+        {"token_carry_sent_after_the_refresh_answer", st.tokenCarryDelay.toJson()},
         {"unresolved_at_end", end_.notCarried + end_.failed},
         {"latency", st.carryLatency.toJson()},
     };
@@ -927,6 +963,7 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
           {"received", get(st.releaseReceived)},
           {"delay_after_new_result", st.releaseDelay.toJson()},
           {"before_new_result", get(st.releaseBeforeResult)},
+          {"named_the_token_id_of_a_carry_left_unanswered", get(st.releaseNamedNewerToken)},
           {"never_arrived_within_5s", get(st.releaseMissing)},
           {"no_new_result_to_pair", get(st.releaseUnpaired)},
           {"pending_at_end", end_.releasesPending}}},
@@ -952,11 +989,19 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         {"errors_by_code", codes},
         {"unauthorized", get(st.errorCodes[7])},
         {"player_messages_refused", get(st.playerMessagesRefused)},
+        {"unauthorized_during_token_refresh", get(st.unauthTokenRefresh)},
+        {"unauthorized_during_token_refresh_before_the_new_carry_result",
+         get(st.unauthTokenRefreshBeforeResult)},
+        {"unauthorized_during_token_refresh_after_the_new_carry_result",
+         get(st.unauthTokenRefreshAfterResult)},
+        {"unauthorized_after_handoff", get(st.unauthAfterHandoff)},
+        {"unauthorized_after_the_carry_ended", get(st.unauthAfterCarryEnded)},
         {"unauthorized_first_contact", get(st.unauthFirstContact)},
         {"unauthorized_window_reload", get(st.unauthWindowReload)},
-        {"unauthorized_after_handoff", get(st.unauthAfterHandoff)},
         {"unauthorized_unexplained", get(st.unauthUnexplained)},
         {"unauthorized_session_messages", get(st.unauthSessionMessages)},
+        {"classes_that_fail_a_run",
+         {"unauthorized_unexplained", "unauthorized_session_messages"}},
         {"carried_again_after_unauthorized", get(st.recarriedAfterUnauthorized)},
     };
 
@@ -965,6 +1010,34 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
     for (int t = 0; t < 256; ++t) {
         const uint64_t n = get(st.rxByType[static_cast<size_t>(t)]);
         if (n) byType.push_back({{"type", t}, {"name", messageTypeName(t)}, {"n", n}});
+    }
+    // Where each message type arrived, and how what arrived outside a signed
+    // bundle was authenticated.
+    nlohmann::json arrival = nlohmann::json::array();
+    nlohmann::json plainMembers = nlohmann::json::array(), unsignedByType = nlohmann::json::array();
+    for (int t = 0; t < 256; ++t) {
+        const size_t i = static_cast<size_t>(t);
+        const uint64_t inSigned = get(st.rxInSignedBundle[i]), inPlain = get(st.rxInPlainBundle[i]),
+                       alone = get(st.rxStandalone[i]);
+        if (inSigned + inPlain + alone == 0) continue;
+        arrival.push_back({{"type", t},
+                           {"name", messageTypeName(t)},
+                           {"in_signed_bundles", inSigned},
+                           {"in_plain_bundles", inPlain},
+                           {"alone_in_a_datagram", alone},
+                           {"outside_signed_bundles_own_hmac_verified", get(st.rxOutsideOwnHmacOk[i])},
+                           {"outside_signed_bundles_own_hmac_failed", get(st.rxOutsideOwnHmacFailed[i])},
+                           {"outside_signed_bundles_no_hmac", get(st.rxOutsideNoHmac[i])}});
+        if (inPlain) plainMembers.push_back({{"type", t}, {"name", messageTypeName(t)}, {"n", inPlain}});
+        if ((t & wire::SPATIAL_TYPE_BIT) && get(st.rxOutsideNoHmac[i])) {
+            unsignedByType.push_back(
+                {{"type", t}, {"name", messageTypeName(t)}, {"n", get(st.rxOutsideNoHmac[i])}});
+        }
+    }
+    nlohmann::json leftByReason = nlohmann::json::object();
+    for (int r = 0; r < 256; ++r) {
+        const uint64_t n = get(st.actorLeftByReason[static_cast<size_t>(r)]);
+        if (n) leftByReason[std::to_string(r)] = n;
     }
     j["traffic"] = {
         {"updates_sent", get(st.updatesSent)},
@@ -984,9 +1057,34 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
           {"listing_a_player_not_carried", get(st.deliveryForUncarried)}}},
         {"signed_bundles", get(st.rxSignedBundles)},
         {"plain_bundles", get(st.rxPlainBundles)},
+        {"plain_bundle_members", get(st.plainBundleMembers)},
+        {"plain_bundle_members_by_type", plainMembers},
         {"hmac_failures", get(st.rxHmacFailures)},
         {"malformed", get(st.rxMalformed)},
         {"unsigned_notifications", get(st.rxUnsignedSpatial)},
+        {"unsigned_notifications_by_type", unsignedByType},
+        {"unsigned_notifications_were",
+         {{"an_update_the_receiving_session_sent", get(st.unsignedSentByReceiver)},
+          {"an_update_another_session_of_this_run_sent", get(st.unsignedSentByAnother)},
+          {"of_those_the_senders_first_update_after_a_carry_result", get(st.unsignedFirstUpdate)},
+          {"an_update_with_no_marker_of_this_run", get(st.unsignedNotThisRun)},
+          {"not_an_actor_update", get(st.unsignedOtherType)},
+          {"from_beyond_the_range_of_the_receivers_region", get(st.unsignedOutOfRange)}}},
+        {"updates_from_beyond_the_range_of_the_receivers_region", get(st.updatesOutOfRange)},
+        {"first_updates_after_a_carry_result",
+         {{"sent", get(st.firstUpdatesSent)},
+          {"notifications_received", get(st.firstUpdatesReceived)},
+          {"of_those_with_no_hmac_outside_a_signed_bundle", get(st.firstUpdatesReceivedUnsigned)}}},
+        {"by_type_and_arrival", arrival},
+        {"actor_left",
+         {{"by_reason", leftByReason},
+          {"its_player_was_carried_then", get(st.actorLeftForCarriedPlayer)},
+          {"its_player_was_not_carried_then", get(st.actorLeftForUncarriedPlayer)},
+          {"from_beyond_the_range_of_the_receivers_region", get(st.actorLeftOutOfRange)},
+          {"not_an_actor_of_this_run", get(st.actorLeftUnknownActor)}}},
+        {"actor_updates_not_of_this_run",
+         {{"another_payload", get(st.actorUpdatesOtherPayload)},
+          {"another_run_of_this_tool", get(st.actorUpdatesOtherRun)}}},
         {"fleet_frames_in_signed_bundles", get(st.fleetFramesInSignedBundle)},
         {"fleet_frames_with_own_hmac", get(st.fleetFramesWithOwnHmac)},
         {"fleet_frame_hmac_failures", get(st.fleetFrameHmacFailures)},
@@ -999,10 +1097,25 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         {"marked_updates_received", get(st.markersSeen)},
         {"latency", st.replicationLatency.toJson()},
     };
+    // Every update names the session that sent it and the player it is for.
     j["own_state"] = {
         {"capability_set", cfg_.ownState},
         {"received", get(st.ownStateReceived)},
+        {"sent_by_the_receiving_session",
+         {{"total", get(st.ownStateReceived)},
+          {"while_it_still_carried_the_player", get(st.ownSentWhileCarrying)},
+          {"after_the_player_had_left_it", get(st.ownSentAfterPlayerLeft)},
+          {"its_first_update_after_a_carry_result", get(st.ownSentFirstUpdate)},
+          {"with_no_hmac_outside_a_signed_bundle", get(st.ownSentUnsigned)},
+          {"age_when_received", st.ownSentAge.toJson()},
+          {"fails_a_run", !cfg_.ownState}}},
+        {"sent_by_another_session_before_the_handoff",
+         {{"total", get(st.otherSentBeforeHandoff)},
+          {"sent_before_the_receivers_carry_result", st.handoffLead.toJson()},
+          {"fails_a_run", false}}},
+        {"sent_by_another_session_after_the_receivers_carry_result", get(st.otherSentAfterCarry)},
     };
+    j["events"] = st.events.toJson();
 
     // Bytes.
     nlohmann::json perSession = nlohmann::json::array();
@@ -1138,6 +1251,8 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
           {"total", carriesRefused + get(st.errorCodes[7]) + otherErrors}}},
         {"nothing_refused", carriesRefused + get(st.errorCodes[7]) + otherErrors == 0},
         {"own_state_received", get(st.ownStateReceived)},
+        {"own_state_sent_by_the_receiving_session", get(st.ownStateReceived)},
+        {"own_state_sent_by_another_session_before_the_handoff", get(st.otherSentBeforeHandoff)},
         {"plain_communications", get(st.plainCommunications)},
         {"datagrams_sent", get(st.txDatagrams)},
         {"datagrams_received", get(st.rxDatagrams)},

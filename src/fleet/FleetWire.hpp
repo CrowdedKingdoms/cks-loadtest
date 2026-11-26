@@ -417,23 +417,36 @@ inline std::optional<Payload> notificationPayload(const wire::InboundView& m) {
 /// leave a mark the receiver reads. This client sends the 88-byte UE5 state the
 /// existing harness sends, which leaves rotation pitch and yaw at zero. The
 /// marker uses those two float64 fields, so the state keeps its size and layout:
-///   pitch = 2^40 + sampled * 2^36 + runTag * 2^16 + sender session index
-///   yaw   = microseconds on this process's steady clock when the update was built
+///   pitch = 2^52 + player * 2^28 + sampled * 2^27 + first * 2^26 + runTag * 2^16
+///           + sender session
+///   yaw   = microseconds on this process's steady clock when the update was sent
 /// Both are whole numbers below 2^53, so a float64 holds them exactly.
-/// The receiver learns which session sent the update (for the own-state check)
-/// and, for a sampled player, when (for the end-to-end replication latency).
+///
+/// So every update a session receives says WHICH SESSION SENT IT, for which
+/// player, when, and whether it was the first update that session sent for the
+/// player after a FLEET_CARRY_RESULT. That is what lets the client tell state a
+/// session sent itself (which must not come back to it) from state another
+/// session sent for a player the receiver has carried since, and measure how
+/// long an update took.
 struct Marker {
-    uint16_t session = 0;
-    uint16_t runTag = 0;
-    bool sampled = false;
+    uint16_t session = 0;   // the session that sent the update
+    uint16_t runTag = 0;    // 10 bits: this run's, so another run's updates are not read as ours
+    bool first = false;     // the sender's first update for the player after a carry result
+    bool sampled = false;   // one of the players whose latency is measured
+    int32_t player = 0;     // the player the update is for (24 bits)
     int64_t sendUs = 0;
 };
 
-inline constexpr double MARKER_BASE = 1099511627776.0; // 2^40
+inline constexpr double MARKER_BASE = 4503599627370496.0; // 2^52
+inline constexpr uint32_t MARKER_RUN_TAG_MASK = 0x3FF;
+inline constexpr int32_t MARKER_MAX_PLAYER = (1 << 24) - 1;
 
-inline double markerCode(uint16_t session, uint16_t runTag, bool sampled) {
-    const uint64_t v = (uint64_t{1} << 40) | (sampled ? (uint64_t{1} << 36) : 0) |
-                       (static_cast<uint64_t>(runTag) << 16) | session;
+inline double markerCode(uint16_t session, uint16_t runTag, bool sampled, int32_t player,
+                         bool first = false) {
+    const uint64_t v = (uint64_t{1} << 52) |
+                       ((static_cast<uint64_t>(player) & 0xFFFFFF) << 28) |
+                       (sampled ? (uint64_t{1} << 27) : 0) | (first ? (uint64_t{1} << 26) : 0) |
+                       ((static_cast<uint64_t>(runTag) & MARKER_RUN_TAG_MASK) << 16) | session;
     return static_cast<double>(v);
 }
 
@@ -448,13 +461,12 @@ inline std::optional<Marker> readMarker(const uint8_t* state, size_t len) {
         return std::nullopt;
     if (!(when >= 0 && when < 9.0e15) || when != std::floor(when)) return std::nullopt;
     const uint64_t v = static_cast<uint64_t>(code);
-    // Bits 32 to 35 and 37 to 39 are never set by markerCode.
-    const uint64_t reserved = (uint64_t{0xF} << 32) | (uint64_t{0x7} << 37);
-    if (v & reserved) return std::nullopt;
     Marker m;
     m.session = static_cast<uint16_t>(v & 0xFFFF);
-    m.runTag = static_cast<uint16_t>((v >> 16) & 0xFFFF);
-    m.sampled = ((v >> 36) & 1) != 0;
+    m.runTag = static_cast<uint16_t>((v >> 16) & MARKER_RUN_TAG_MASK);
+    m.first = ((v >> 26) & 1) != 0;
+    m.sampled = ((v >> 27) & 1) != 0;
+    m.player = static_cast<int32_t>((v >> 28) & 0xFFFFFF);
     m.sendUs = static_cast<int64_t>(when);
     return m;
 }

@@ -77,6 +77,10 @@ struct FleetConfig {
                                   //   proof; each wait is twice the last, up to eight times this
     int carryGiveUpMs = 5000;     // give up on a carry and count it
     int carryRetryMs = 1000;      // start again after giving up
+    // FLEET_CARRY_RESULT status 1 around a token refresh is sent again:
+    int status1WaitMs = 200;      // after this wait, when the token is the newest one
+    int status1Retries = 10;      // at most this many times in a row
+    int status1RecentMs = 5000;   // "around a refresh": the newest token was stored within this
     int releaseWaitMs = 5000;     // FLEET_RELEASED reason 1 counted missing after this
     int permWindowRadiusChunks = 8;
     int permReloadGraceMs = 5000;

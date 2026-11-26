@@ -648,7 +648,7 @@ void testMarker() {
                                      wire::DecayRate::EXPONENTIAL);
     wire::ActorPose pose;
     pose.posX = 12.5;
-    pose.pitch = markerCode(99, 0xA5C3, true);
+    pose.pitch = markerCode(99, 0x3C3, true, 123456, true);
     pose.yaw = 1234567890123.0;
     wire::finalizeActorUpdateFmt(buf, wire::PoseFormat::UE5, 4, 5, 0, pose, 1, FLEET);
 
@@ -663,8 +663,9 @@ void testMarker() {
     const auto payload = notificationPayload(view);
     check(payload && payload->len == wire::state::SIZE, "marker: the notification's payload is the 88-byte state");
     auto m = payload ? readMarker(payload->data, payload->len) : std::nullopt;
-    check(m && m->session == 99 && m->runTag == 0xA5C3 && m->sampled && m->sendUs == 1234567890123LL,
-          "marker: session, run tag, sample flag and send time read back");
+    check(m && m->session == 99 && m->runTag == 0x3C3 && m->sampled && m->first && m->player == 123456 &&
+              m->sendUs == 1234567890123LL,
+          "marker: sending session, run tag, sample flag, player and send time read back");
 
     // And from the signed form, whose tail is 41 bytes.
     const wire::InboundView signedView{buf, wire::ACTOR_UPDATE_SIZE};
@@ -672,12 +673,24 @@ void testMarker() {
     m = signedPayload ? readMarker(signedPayload->data, signedPayload->len) : std::nullopt;
     check(m && m->session == 99, "marker: read from a notification that carries its own HMAC");
 
-    pose.pitch = markerCode(65535, 0, false);
+    pose.pitch = markerCode(65535, 0, false, 0);
     pose.yaw = 0.0;
     wire::finalizeActorUpdateFmt(buf, wire::PoseFormat::UE5, 4, 5, 0, pose, 1, FLEET);
     m = readMarker(buf + wire::HEADER_SIZE, wire::state::SIZE);
-    check(m && m->session == 65535 && m->runTag == 0 && !m->sampled && m->sendUs == 0,
-          "marker: the largest session index, no sample flag");
+    check(m && m->session == 65535 && m->runTag == 0 && !m->sampled && !m->first && m->player == 0 &&
+              m->sendUs == 0,
+          "marker: the largest session index, no sample flag, player 0");
+    pose.pitch = markerCode(0, MARKER_RUN_TAG_MASK, true, MARKER_MAX_PLAYER);
+    wire::finalizeActorUpdateFmt(buf, wire::PoseFormat::UE5, 4, 5, 0, pose, 1, FLEET);
+    m = readMarker(buf + wire::HEADER_SIZE, wire::state::SIZE);
+    check(m && m->session == 0 && m->runTag == MARKER_RUN_TAG_MASK && m->sampled && !m->first &&
+              m->player == MARKER_MAX_PLAYER,
+          "marker: the largest player index and run tag fit a float64 exactly");
+    // The marker an earlier version wrote (2^40 + ...) is not read as this one's.
+    pose.pitch = 1099511627776.0 + 65536.0 * 7 + 3;
+    wire::finalizeActorUpdateFmt(buf, wire::PoseFormat::UE5, 4, 5, 0, pose, 1, FLEET);
+    check(!readMarker(buf + wire::HEADER_SIZE, wire::state::SIZE),
+          "marker: an earlier version's marker is not read as this version's");
 
     // A state this tool did not write has no marker.
     pose.pitch = 0.0;

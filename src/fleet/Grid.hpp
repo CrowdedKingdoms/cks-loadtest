@@ -62,6 +62,19 @@ struct Grid {
     int64_t chunkX(double x) const { return originChunkX + static_cast<int64_t>(std::floor(x)); }
     int64_t chunkY(double y) const { return originChunkY + static_cast<int64_t>(std::floor(y)); }
 
+    /// How far an app chunk is from a region, in chunks, on the axis where it is
+    /// farthest. 0 inside the region. Every player of a region's server stands
+    /// inside it, so a notification from farther than the replication distance
+    /// is out of range of all of them.
+    int64_t chunksFromRegion(int region, int64_t appChunkX, int64_t appChunkY) const {
+        const int64_t x0 = originChunkX + static_cast<int64_t>(colOf(region)) * regionChunks;
+        const int64_t y0 = originChunkY + static_cast<int64_t>(rowOf(region)) * regionChunks;
+        const int64_t x1 = x0 + regionChunks - 1, y1 = y0 + regionChunks - 1;
+        const int64_t dx = appChunkX < x0 ? x0 - appChunkX : appChunkX > x1 ? appChunkX - x1 : 0;
+        const int64_t dy = appChunkY < y0 ? y0 - appChunkY : appChunkY > y1 ? appChunkY - y1 : 0;
+        return std::max(dx, dy);
+    }
+
     /// True when two different regions touch (a side or a corner).
     bool adjacent(int a, int b) const {
         if (a == b) return false;

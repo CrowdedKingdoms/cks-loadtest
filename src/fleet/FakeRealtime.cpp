@@ -111,7 +111,13 @@ public:
 
     PlayerToken refreshAppToken(const std::string& playerToken, int& httpCalls) override {
         httpCalls = 1;
-        return fake_.apiRefreshPlayer(playerToken);
+        const PlayerToken t = fake_.apiRefreshPlayer(playerToken);
+        // The API has replaced the token; its answer is still on the way.
+        if (fake_.options().refreshAnswerDelayMs > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fake_.options().refreshAnswerDelayMs));
+        }
+        return t;
     }
 
 private:
@@ -180,6 +186,8 @@ std::map<std::string, uint64_t> FakeRealtime::snapshot() const {
         {"updatesUnauthorized", counters_.updatesUnauthorized.load()},
         {"notificationsOut", counters_.notificationsOut.load()},
         {"ownStateOut", counters_.ownStateOut.load()},
+        {"strayUnsigned", counters_.strayUnsigned.load()},
+        {"strayUnsignedToSender", counters_.strayUnsignedToSender.load()},
         {"deliveriesOut", counters_.deliveriesOut.load()},
         {"deliveryPlayersOut", counters_.deliveryPlayersOut.load()},
         {"framesInSignedBundle", counters_.framesInSignedBundle.load()},
@@ -396,6 +404,7 @@ PlayerToken FakeRealtime::apiRefreshPlayer(const std::string& token) {
         p.token = randomToken();
         p.tokenId = nextTokenId_++;
         p.expiresAtMs = epochMs() + opt_.playerTokenTtlMs;
+        p.tokenKnownAtMs = epochMs() + opt_.newTokenLagMs;
         tokenOwner_[p.tokenId] = n;
         return PlayerToken{p.token, p.tokenId, p.expiresAtMs};
     }
@@ -614,6 +623,7 @@ void FakeRealtime::run() {
             lastSweep = now;
             sweepPlayers();
         }
+        deliverHeld(now);
         flushAll();
     }
 }
@@ -686,7 +696,10 @@ void FakeRealtime::onDatagram(Session& s, const uint8_t* d, size_t len) {
     auto owner = tokenOwner_.find(tailId);
     auto c = owner == tokenOwner_.end() ? carries_.end() : carries_.find(owner->second);
     if (c == carries_.end() || c->second.sessionId != s.id ||
-        !liveToken(players_[owner->second], tailId, epochMs())) {
+        !liveToken(players_[owner->second], tailId, epochMs()) ||
+        (opt_.strictTokenId && c->second.tokenId != tailId)) {
+        // The session does not carry the player, or not under this token id: after
+        // a carry with a refreshed token the player continues under the new id.
         if (type == wire::ACTOR_UPDATE_REQUEST_2) ++counters_.updatesUnauthorized;
         queueError(s, seq, wire::ERR_UNAUTHORIZED);
         return;
@@ -789,6 +802,14 @@ void FakeRealtime::onCarry(Session& s, const uint8_t* d) {
         n = owner->second;
         token = liveToken(players_[n], playerId, epochMs());
     }
+    if (token && opt_.oldTokenCarryRefused && playerId == players_[n].oldTokenId) {
+        // A refresh has replaced this token: no new carry is made with it, though
+        // the carry that stands under it goes on until the old token's time is up.
+        token = nullptr;
+    }
+    if (token && playerId == players_[n].tokenId && epochMs() < players_[n].tokenKnownAtMs) {
+        token = nullptr; // Options::newTokenLagMs: the realtime side has not heard of it yet
+    }
     if (!token) {
         status = CARRY_NO_LIVE_TOKEN;
     } else if (players_[n].foreign) {
@@ -811,7 +832,7 @@ void FakeRealtime::onCarry(Session& s, const uint8_t* d) {
             wire::writeI64(frame + 1, playerId);
             wire::writeI64(frame + 9, 5000 + n);
             frame[17] = CARRY_CARRIED;
-            queueFleetFrame(s, frame, sizeof(frame));
+            sendCarryResult(s, frame);
             return;
         } else if (last != s.lastAcceptedMs.end() && when <= last->second) {
             // Sent again after that carry ended, or older than the session's last
@@ -834,6 +855,8 @@ void FakeRealtime::onCarry(Session& s, const uint8_t* d) {
         next.tokenId = playerId;
         next.acceptedMs = when;
         next.lastInputNs = nowNs();
+        next.firstUpdatePending = c == carries_.end() || c->second.sessionId != s.id ||
+                                  c->second.firstUpdatePending;
         if (c != carries_.end()) {
             next.cx = c->second.cx;
             next.cy = c->second.cy;
@@ -871,7 +894,40 @@ void FakeRealtime::onCarry(Session& s, const uint8_t* d) {
     wire::writeI64(frame + 1, playerId);
     wire::writeI64(frame + 9, status == CARRY_CARRIED ? 5000 + n : 0); // the user id
     frame[17] = status;
-    queueFleetFrame(s, frame, sizeof(frame));
+    sendCarryResult(s, frame);
+}
+
+void FakeRealtime::sendCarryResult(Session& s, const uint8_t* frame) {
+    if (opt_.carryResultDelayMs <= 0) {
+        queueFleetFrame(s, frame, CARRY_RESULT_SIZE);
+        return;
+    }
+    Held h;
+    h.dueNs = nowNs() + opt_.carryResultDelayMs * 1000000LL;
+    h.frame = true;
+    h.sessionId = s.id;
+    h.bytes.assign(frame, frame + CARRY_RESULT_SIZE);
+    held_.push_back(std::move(h));
+}
+
+void FakeRealtime::deliverHeld(int64_t now) {
+    // Each kind is held for one fixed time, but the two times differ, so the
+    // queue is not strictly in order: take whatever is due.
+    for (auto it = held_.begin(); it != held_.end();) {
+        if (it->dueNs > now) {
+            ++it;
+            continue;
+        }
+        auto s = sessions_.find(it->sessionId);
+        if (s != sessions_.end()) {
+            if (it->frame) {
+                queueFleetFrame(s->second, it->bytes.data(), it->bytes.size());
+            } else if (carries_.count(it->player)) {
+                fanOut(s->second, it->player, it->bytes.data(), it->bytes.size(), it->seq);
+            }
+        }
+        it = held_.erase(it);
+    }
 }
 
 void FakeRealtime::onUpdate(Session& s, int n, const uint8_t* d, size_t len, uint8_t seq) {
@@ -895,6 +951,26 @@ void FakeRealtime::onUpdate(Session& s, int n, const uint8_t* d, size_t len, uin
         carry.lastStateHash = state;
         carry.lastInputNs = nowNs();
     }
+    if (opt_.stateDelayMs > 0) {
+        // Held back: who receives it is decided when it goes out, and "its own
+        // session" stays the session that SENT it.
+        Held h;
+        h.dueNs = nowNs() + opt_.stateDelayMs * 1000000LL;
+        h.sessionId = s.id;
+        h.player = n;
+        h.seq = seq;
+        h.bytes.assign(d, d + len);
+        held_.push_back(std::move(h));
+        return;
+    }
+    fanOut(s, n, d, len, seq);
+}
+
+void FakeRealtime::fanOut(Session& s, int n, const uint8_t* d, size_t len, uint8_t seq) {
+    const size_t bodyLen = len - wire::TAIL_WITH_HMAC;
+    const int64_t cx = wire::readI64(d + wire::off::CHUNK_X);
+    const int64_t cy = wire::readI64(d + wire::off::CHUNK_Y);
+    const int64_t cz = wire::readI64(d + wire::off::CHUNK_Z);
     const int distance = d[wire::off::DISTANCE];
 
     // The notification: the same bytes with the type rewritten. Inside a signed
@@ -906,6 +982,22 @@ void FakeRealtime::onUpdate(Session& s, int n, const uint8_t* d, size_t len, uin
     wire::writeI64(unsignedMember + bodyLen, serverNowMs());
     unsignedMember[bodyLen + 8] = seq;
     const size_t unsignedLen = bodyLen + wire::TAIL_NO_HMAC;
+
+    auto carry = carries_.find(n);
+    if (carry != carries_.end()) carry->second.firstUpdatePending = false;
+    if (opt_.strayUnsignedEvery > 0 && ++updatesFannedOut_ % opt_.strayUnsignedEvery == 0 &&
+        !order_.empty()) {
+        // The defect: one more copy, alone in a datagram, with no HMAC, to the
+        // sender itself or to any session at all.
+        const bool toSender = rng_() % 4 == 0;
+        const int64_t target = toSender ? s.id : order_[rng_() % order_.size()];
+        auto r = sessions_.find(target);
+        if (r != sessions_.end() && r->second.fd >= 0) {
+            ++counters_.strayUnsigned;
+            if (target == s.id) ++counters_.strayUnsignedToSender;
+            sendRaw(r->second, unsignedMember, unsignedLen);
+        }
+    }
 
     // State goes out plain and ONCE to a session, however many of its players
     // are in range.

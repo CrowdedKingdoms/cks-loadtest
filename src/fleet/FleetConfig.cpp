@@ -149,6 +149,7 @@ std::string FleetConfig::validate() const {
     if (servers < 1) return "--servers must be at least 1";
     if (servers > 65535) return "--servers must be at most 65535";
     if (players < 1) return "--players must be at least 1";
+    if (players > 16777215) return "--players must be at most 16777215";
     if (updateHz <= 0 || updateHz > 500) return "--update-hz must be above 0 and at most 500";
     if (crossRate < 0) return "--cross-rate must be 0 or more";
     if (signinRate <= 0) return "--signin-rate must be above 0";

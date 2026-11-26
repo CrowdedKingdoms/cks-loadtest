@@ -403,6 +403,205 @@ void testTokenRefresh() {
     dumpOnFailure(r, before);
 }
 
+const json* typeRow(const json& traffic, int type) {
+    for (const auto& row : traffic["by_type_and_arrival"])
+        if (row["type"] == type) return &row;
+    return nullptr;
+}
+
+void testAroundATokenRefresh() {
+    std::atomic<bool> stop{false};
+    FleetConfig cfg = base();
+    cfg.dryRunS = 4.5;
+    cfg.tokenRefreshLeadS = 2;
+    cfg.crossRate = 90;
+    {
+        // The realtime side answers a carry a quarter of a second late. Meanwhile
+        // the session goes on sending under the old token id, which the stand-in
+        // (like the dev tier) refuses once it has accepted the carry with the new
+        // one; and some players cross away before the answer comes.
+        const int before = g_failures;
+        FakeRealtime::Options opt;
+        opt.playerTokenTtlMs = 4000;
+        opt.carryResultDelayMs = 250;
+        const FakeRunResult r = runAgainstFake(cfg, opt, stop, nullptr);
+        const json& s = r.summary;
+        const json& refused = s["refused"];
+        check(r.exitCode == 0 && s["players"]["not_carried_at_end"] == 0 &&
+                  u(s["players"]["token_refreshes"]) >= 180,
+              "refresh: with slow carry results the run passes and every token was refreshed");
+        check(u(refused["unauthorized_during_token_refresh"]) > 0 &&
+                  u(refused["unauthorized_during_token_refresh"]) ==
+                      u(refused["unauthorized_during_token_refresh_before_the_new_carry_result"]) +
+                          u(refused["unauthorized_during_token_refresh_after_the_new_carry_result"]),
+              "refresh: an update under the old token id, refused while the new carry is unanswered, "
+              "is classed as a refusal during a token refresh");
+        check(u(refused["unauthorized_unexplained"]) == 0 && u(refused["unauthorized_session_messages"]) == 0 &&
+                  u(refused["unauthorized"]) ==
+                      u(refused["unauthorized_during_token_refresh"]) + u(refused["unauthorized_after_handoff"]) +
+                          u(refused["unauthorized_after_the_carry_ended"]) +
+                          u(refused["unauthorized_first_contact"]) + u(refused["unauthorized_window_reload"]),
+              "refresh: every refusal has a class, and none is unexplained");
+        const json& events = s["events"];
+        bool described = events.contains("unauthorized_during_token_refresh");
+        if (described) {
+            const json& e = events["unauthorized_during_token_refresh"]["events"][0];
+            described = e["message_type"] == 128 && e.contains("player") &&
+                        e.contains("carry_with_a_new_token_unanswered_when_sent") &&
+                        e.contains("token_refresh_in_flight_when_sent") &&
+                        e.contains("sent_ms_after_the_last_carry_result_here") &&
+                        e["named_a_token_id_replaced_since"] == true;
+        }
+        check(described, "refresh: each such refusal says the message type, the player, the time since "
+                         "the last carry result and whether a refresh or a new carry was pending");
+        // A player that crossed away while its carry with the new token was
+        // unanswered: the old session's FLEET_RELEASED names the NEW token id.
+        const json& old = s["released"]["old_session"];
+        check(u(old["named_the_token_id_of_a_carry_left_unanswered"]) > 0 &&
+                  u(old["never_arrived_within_5s"]) == 0 && u(old["received"]) == u(old["expected"]),
+              "refresh: a FLEET_RELEASED that names the token id of a carry the player left unanswered "
+              "is paired with its crossing, and none is counted as missing");
+        check(u(s["carries"]["token_carry_sent_after_the_refresh_answer"]["samples"]) >= 180,
+              "refresh: the time from the refresh's answer to the carry with the new token is measured");
+        dumpOnFailure(r, before);
+    }
+    {
+        // The realtime side learns of a refreshed token 300 ms after the API
+        // answered: a carry that names it sooner is answered status 1.
+        const int before = g_failures;
+        FakeRealtime::Options opt;
+        opt.playerTokenTtlMs = 4000;
+        opt.newTokenLagMs = 300;
+        const FakeRunResult r = runAgainstFake(cfg, opt, stop, nullptr);
+        const json& c = r.summary["carries"];
+        check(u(c["by_status"]["1_no_live_token"]) >= 180 &&
+                  u(c["retried_after_refresh"]) == u(c["by_status"]["1_no_live_token"]) &&
+                  u(c["retried_after_refresh_after_a_wait"]) >= 180 &&
+                  u(c["status_1_not_explained_by_a_refresh"]) == 0,
+              "refresh: status 1 for a token stored moments ago is waited out and the carry sent again");
+        check(r.exitCode == 0 && r.summary["players"]["not_carried_at_end"] == 0 &&
+                  u(r.summary["players"]["signed_in_again"]) == 0 &&
+                  u(r.summary["released"]["by_reason"]["2_sign_in_ended"]) == 0 &&
+                  u(r.summary["api"]["calls_in_measured_phase_other"]) == 0,
+              "refresh: nobody signs in again, the old carry stands meanwhile, and the run passes");
+        bool described = r.summary["events"].contains("carry_status_1");
+        if (described) {
+            const json& e = r.summary["events"]["carry_status_1"]["events"][0];
+            described = e["client_did"] == "waited_and_carried_again" &&
+                        e.contains("carry_sent_ms_after_the_newest_token_was_stored") &&
+                        e["named_the_newest_token_when_sent"] == true;
+        }
+        check(described, "refresh: each status 1 says how long after the refresh's answer the carry was "
+                         "sent and what the client did next");
+        dumpOnFailure(r, before);
+    }
+    {
+        // The API replaces the token 150 ms before its answer arrives. A crossing
+        // in that time carries with the token the client still has, which the
+        // realtime side no longer takes for a new carry: status 1.
+        const int before = g_failures;
+        FakeRealtime::Options opt;
+        opt.playerTokenTtlMs = 4000;
+        opt.refreshAnswerDelayMs = 150;
+        FleetConfig busy = cfg;
+        busy.apiThreads = 32;
+        busy.crossRate = 120;
+        const FakeRunResult r = runAgainstFake(busy, opt, stop, nullptr);
+        const json& c = r.summary["carries"];
+        check(u(c["by_status"]["1_no_live_token"]) > 0 &&
+                  u(c["retried_after_refresh"]) == u(c["by_status"]["1_no_live_token"]) &&
+                  u(c["status_1_not_explained_by_a_refresh"]) == 0,
+              "refresh: a carry that named the token a refresh was replacing is sent again with the new one");
+        check(r.exitCode == 0 && r.summary["players"]["not_carried_at_end"] == 0 &&
+                  u(r.summary["players"]["signed_in_again"]) == 0 && r.summary["crossings"]["lost"] == 0,
+              "refresh: nobody signs in again and no crossing is lost");
+        dumpOnFailure(r, before);
+    }
+}
+
+void testWhoSentTheState() {
+    std::atomic<bool> stop{false};
+    {
+        // State is held 260 ms before it goes out, longer than the 200 ms between
+        // a player's updates, so the old session's last update for a player
+        // reaches the new session after its carry result.
+        const int before = g_failures;
+        FakeRealtime::Options opt;
+        opt.stateDelayMs = 260;
+        FleetConfig cfg = base();
+        cfg.dryRunS = 3.0;
+        cfg.crossRate = 90;
+        const FakeRunResult r = runAgainstFake(cfg, opt, stop, nullptr);
+        const json& own = r.summary["own_state"];
+        check(r.exitCode == 0 && u(own["sent_by_the_receiving_session"]["total"]) == 0 &&
+                  u(own["received"]) == 0,
+              "handoff: no session received an update it sent, and the run passes");
+        check(u(own["sent_by_another_session_before_the_handoff"]["total"]) > 0 &&
+                  own["sent_by_another_session_before_the_handoff"]["fails_a_run"] == false,
+              "handoff: an update another session sent for a player the receiver carries now is "
+              "counted apart and does not fail the run");
+        const json& lead = own["sent_by_another_session_before_the_handoff"]["sent_before_the_receivers_carry_result"];
+        check(u(lead["samples"]) == u(own["sent_by_another_session_before_the_handoff"]["total"]) &&
+                  lead["max_ms"].get<double>() > 100 && lead["max_ms"].get<double>() < 320 &&
+                  lead.contains("p99_ms"),
+              "handoff: how long before the receiver's carry result it was sent is reported (max, p99)");
+        check(u(own["sent_by_another_session_after_the_receivers_carry_result"]) == 0,
+              "handoff: no other session sent for a player after the receiver's carry result");
+        dumpOnFailure(r, before);
+    }
+    {
+        // The defect seen on the dev tier: now and then one more copy of an update
+        // arrives alone in a datagram with no HMAC, at the session that sent it or
+        // at a session far out of range.
+        const int before = g_failures;
+        FakeRealtime::Options opt;
+        opt.strayUnsignedEvery = 40;
+        FleetConfig cfg = base();
+        cfg.dryRunS = 2.0;
+        const FakeRunResult r = runAgainstFake(cfg, opt, stop, nullptr);
+        const json& s = r.summary;
+        const json& mine = s["own_state"]["sent_by_the_receiving_session"];
+        check(r.exitCode == 1 && u(mine["total"]) > 0 && u(mine["total"]) == u(s["own_state"]["received"]) &&
+                  u(mine["total"]) == r.fake.at("strayUnsignedToSender"),
+              "stray: state that came back to the session that sent it fails the run");
+        check(u(mine["with_no_hmac_outside_a_signed_bundle"]) == u(mine["total"]) &&
+                  u(mine["while_it_still_carried_the_player"]) + u(mine["after_the_player_had_left_it"]) ==
+                      u(mine["total"]),
+              "stray: each one is counted with how it arrived and whether the session still carried the player");
+        const json& t = s["traffic"];
+        const json* row = typeRow(t, 130);
+        check(u(t["unsigned_notifications"]) == r.fake.at("strayUnsigned") &&
+                  u(t["unsigned_notifications"]) > u(mine["total"]) && row &&
+                  u((*row)["alone_in_a_datagram"]) == u(t["unsigned_notifications"]) &&
+                  u((*row)["outside_signed_bundles_no_hmac"]) == u(t["unsigned_notifications"]) &&
+                  u((*row)["in_signed_bundles"]) > 0 && t["unsigned_notifications_by_type"][0]["type"] == 130,
+              "stray: every notification with no HMAC is counted by type and by how it arrived");
+        const json& were = t["unsigned_notifications_were"];
+        check(u(were["an_update_the_receiving_session_sent"]) == u(mine["total"]) &&
+                  u(were["an_update_the_receiving_session_sent"]) +
+                          u(were["an_update_another_session_of_this_run_sent"]) ==
+                      u(t["unsigned_notifications"]) &&
+                  u(were["from_beyond_the_range_of_the_receivers_region"]) > 0 &&
+                  u(t["updates_from_beyond_the_range_of_the_receivers_region"]) ==
+                      u(were["from_beyond_the_range_of_the_receivers_region"]),
+              "stray: the summary says who sent each, and how many came from out of range");
+        bool said = false;
+        for (const auto& why : s["fail_reasons"])
+            said = said || why.get<std::string>().find("came back to the session that sent them") !=
+                               std::string::npos;
+        bool described = s["events"].contains("notifications_outside_a_signed_bundle_without_a_verified_hmac");
+        if (described) {
+            const json& e = s["events"]["notifications_outside_a_signed_bundle_without_a_verified_hmac"]["events"][0];
+            described = e["own_hmac"] == "none" && e["bytes"] == 165 && e.contains("sent_by_session") &&
+                        e.contains("chunks_from_the_receiving_sessions_region") &&
+                        e.contains("the_session_carried_that_player_before");
+        }
+        check(said && described && s["events"].contains("own_state_sent_by_the_receiving_session"),
+              "stray: the failure says which session sent what came back, and the events describe each");
+        dumpOnFailure(r, before);
+    }
+}
+
 void testOwnState() {
     std::atomic<bool> stop{false};
     {
@@ -417,6 +616,9 @@ void testOwnState() {
         check(r.exitCode == 1 && s["pass"] == false, "own state: sent back unasked, the run fails");
         check(u(s["own_state"]["received"]) > 0 && u(s["own_state"]["received"]) <= r.ownStateOut,
               "own state: every copy that came back is counted");
+        check(u(s["own_state"]["sent_by_the_receiving_session"]["while_it_still_carried_the_player"]) > 0 &&
+                  u(s["own_state"]["sent_by_the_receiving_session"]["total"]) == u(s["own_state"]["received"]),
+              "own state: each is an update the receiving session itself sent");
         bool said = false;
         for (const auto& why : s["fail_reasons"])
             said = said || why.get<std::string>().find("FLEET_OWN_STATE") != std::string::npos;
@@ -462,6 +664,23 @@ void testFrameForms() {
         check(u(t["hmac_failures"]) == 0 && u(t["unsigned_notifications"]) == 0 &&
                   u(s["replication"]["latency"]["samples"]) > 0,
               "frames: each notification's own HMAC verified with the fleet token");
+        const json* updates = typeRow(t, 130);
+        const json* results = typeRow(t, 51);
+        check(updates && results && u((*updates)["in_plain_bundles"]) > 0 &&
+                  u((*updates)["in_signed_bundles"]) == 0 &&
+                  u((*updates)["outside_signed_bundles_own_hmac_verified"]) ==
+                      u((*updates)["in_plain_bundles"]) + u((*updates)["alone_in_a_datagram"]) &&
+                  u((*updates)["outside_signed_bundles_no_hmac"]) == 0 &&
+                  u((*results)["outside_signed_bundles_own_hmac_verified"]) >= 180 &&
+                  u(t["plain_bundle_members"]) > 0 && !t["plain_bundle_members_by_type"].empty(),
+              "frames: by type, what arrived in plain bundles and whether each member's own HMAC verified");
+        bool members = s["events"].contains("plain_bundles");
+        if (members) {
+            const json& first = s["events"]["plain_bundles"]["events"][0];
+            members = !first["members"].empty() && first["members"][0]["own_hmac"] == "verified" &&
+                      first["members"][0].contains("type") && first["members"][0].contains("bytes");
+        }
+        check(members, "frames: a plain bundle's members are listed with their own HMAC's result");
         dumpOnFailure(r, before);
     }
     {
@@ -1003,6 +1222,8 @@ int main() {
     testFaults();
     testLoss();
     testTokenRefresh();
+    testAroundATokenRefresh();
+    testWhoSentTheState();
     testOwnState();
     testFrameForms();
     testCarryRate();

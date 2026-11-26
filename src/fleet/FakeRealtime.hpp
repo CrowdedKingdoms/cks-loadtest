@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -52,10 +53,25 @@ public:
         int mintBusyEvery = 0;                  // every Nth sign-in answers PLATFORM_BUSY first
         int mintRateLimitedEvery = 0;           // every Nth sign-in answers RATE_LIMITED first
         int64_t clockSkewMs = 0;                // the server's clock against this host's
+        // Around a player's token refresh, as the dev tier answers:
+        bool oldTokenCarryRefused = true;       // a FLEET_CARRY naming the token a refresh replaced is
+                                                //   answered status 1; the carry that stands under it goes on
+        bool strictTokenId = true;              // a message must name the token id the carry stands under:
+                                                //   after a carry with the new token, the old id is refused
+        int64_t newTokenLagMs = 0;              // a refreshed token is unknown to the realtime side for
+                                                //   this long after the API answered (a carry: status 1)
+        int64_t refreshAnswerDelayMs = 0;       // refreshAppToken's answer takes this long to come back,
+                                                //   after the old token was replaced
+        // Timing, for the tests of what crosses on the way.
+        int64_t carryResultDelayMs = 0;         // hold each FLEET_CARRY_RESULT this long
+        int64_t stateDelayMs = 0;               // hold each state notification this long before it goes out
         // Defects, for the tests that the client catches them.
         bool ownStateBug = false;               // send a session its own players' state unasked
         bool plainCommunicationBug = false;     // send a text plain as well as in a 53
         int corruptFrameHmacEvery = 0;          // every Nth frame's own HMAC is wrong
+        int strayUnsignedEvery = 0;             // every Nth update is ALSO sent, alone in a datagram and
+                                                //   with no HMAC, to one session: its sender (one time in
+                                                //   four) or any session, in range or out of it
     };
     /// The org token that opens the sessions, and another valid one of the same
     /// organization that did not.
@@ -104,6 +120,8 @@ public:
         std::atomic<uint64_t> updatesUnauthorized{0};
         std::atomic<uint64_t> notificationsOut{0};
         std::atomic<uint64_t> ownStateOut{0};
+        std::atomic<uint64_t> strayUnsigned{0};      // Options::strayUnsignedEvery
+        std::atomic<uint64_t> strayUnsignedToSender{0};
         std::atomic<uint64_t> deliveriesOut{0};      // FLEET_DELIVERY frames
         std::atomic<uint64_t> deliveryPlayersOut{0};
         std::atomic<uint64_t> framesInSignedBundle{0};
@@ -151,6 +169,7 @@ public:
     bool apiDeletePlayer(const std::string& externalId);
     void apiBlockPlayer(const std::string& playerToken, int64_t blockedUserId);
     int64_t appId() const { return appId_; }
+    const Options& options() const { return opt_; }
 
 private:
     struct Session {
@@ -184,6 +203,7 @@ private:
         std::string oldToken;
         int64_t oldTokenId = 0;
         int64_t oldDeadMs = 0;
+        int64_t tokenKnownAtMs = 0;  // the realtime side knows the newest token from this time
         bool foreign = false;
         bool ended = false;
         bool minor = false;          // under 18: voice is off
@@ -196,6 +216,16 @@ private:
         bool placed = false;
         int64_t lastInputNs = 0;     // the idle clock
         uint64_t lastStateHash = 0;
+        bool firstUpdatePending = false; // no update yet since this session's carry was accepted
+    };
+    /// Something held back for a while (Options::carryResultDelayMs, stateDelayMs).
+    struct Held {
+        int64_t dueNs = 0;
+        bool frame = false;          // a fleet frame for `sessionId`; otherwise an update it sent
+        int64_t sessionId = 0;
+        int player = -1;
+        uint8_t seq = 0;
+        std::vector<uint8_t> bytes;
     };
 
     int connect(const FleetSessionInfo& info, std::string& error);
@@ -204,6 +234,9 @@ private:
     void onCapabilities(Session& s, const uint8_t* d, size_t len);
     void onCarry(Session& s, const uint8_t* d);
     void onUpdate(Session& s, int player, const uint8_t* d, size_t len, uint8_t seq);
+    void fanOut(Session& s, int player, const uint8_t* d, size_t len, uint8_t seq);
+    void deliverHeld(int64_t now);
+    void sendCarryResult(Session& s, const uint8_t* frame);
     void onCommunication(Session& s, int player, const uint8_t* d, size_t len, uint8_t seq,
                          uint8_t notificationType);
     void queueMember(Session& s, const uint8_t* m, size_t len);
@@ -241,6 +274,8 @@ private:
     std::unordered_map<std::string, int> actorOwner_; // actor uuid -> player index
     std::set<std::pair<int, int>> blocks_;            // (blocker, blocked)
     std::vector<int64_t> dirty_;                      // sessions with a bundle to flush
+    std::deque<Held> held_;                           // in the order they fall due
+    uint64_t updatesFannedOut_ = 0;
     int64_t nextFleetId_ = 7000000001LL;
     int64_t nextTokenId_ = 9000000001LL;
     int nextPlayer_ = 0;

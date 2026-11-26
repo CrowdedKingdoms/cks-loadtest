@@ -37,6 +37,22 @@ uint64_t mix64(uint64_t x) {
 
 void inc(Counter& c, uint64_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
 
+double msBetween(int64_t laterNs, int64_t earlierNs) {
+    return std::round(static_cast<double>(laterNs - earlierNs) / 1e4) / 100.0; // two decimals
+}
+
+/// A marker written by an earlier version of this tool (2^40 + ...).
+bool isEarlierMarker(const uint8_t* state, size_t len) {
+    if (len != wire::state::SIZE || state[wire::state::VERSION] != wire::state::VERSION_VALUE)
+        return false;
+    const double code = wire::readF64(state + wire::state::ROTATION_PITCH);
+    return code >= 1099511627776.0 && code < 2199023255552.0 && code == std::floor(code);
+}
+
+const char* whereName(int where) {
+    return where == 0 ? "signed_bundle" : where == 1 ? "plain_bundle" : "standalone";
+}
+
 } // namespace
 
 int connectUdp(const FleetSessionInfo& info, int rcvbufBytes, std::string& error) {
@@ -120,14 +136,19 @@ PlayerToken SharedCreds::snapshot() const {
 World::World(const FleetConfig& c, FleetStats& s, int workerCount)
     : cfg(c), stats(s), grid(Grid::forServers(c.servers, c.regionChunks)),
       workers(std::max(1, std::min(workerCount, c.servers))),
-      creds(static_cast<size_t>(c.players)) {
+      creds(static_cast<size_t>(c.players)), shared(static_cast<size_t>(c.players)) {
     // A tag for this run, so an update left over from another run of the tool in
     // the same app is not read as this run's.
     runTag = static_cast<uint16_t>(
         mix64(c.seed ^ static_cast<uint64_t>(epochMs()) ^
               (static_cast<uint64_t>(getpid()) << 32)) &
-        0xFFFF);
+        MARKER_RUN_TAG_MASK);
     sampleStride = c.latencySample > 0 ? std::max(1, c.players / c.latencySample) : 0;
+    char uuid[32];
+    for (int n = 0; n < c.players; ++n) {
+        actorUuid(n, uuid);
+        playerOfActor.emplace(std::string(uuid, sizeof(uuid)), n);
+    }
 }
 
 void World::actorUuid(int player, char* out32) const {
@@ -334,6 +355,7 @@ void FleetWorker::activate(Session& s, const FleetSessionInfo& info, int64_t now
     s.state = Session::State::Active;
     s.activateAtNs = now + static_cast<int64_t>(world_.cfg.sessionSettleMs) * MS;
     s.lastCapsNs = 0;       // a new server knows nothing about this session
+    s.firstCapsNs = 0;
     s.lastHeartbeatNs = now;
     s.lastRxNs = now;
     s.errStreak = 0;
@@ -352,6 +374,9 @@ void FleetWorker::activate(Session& s, const FleetSessionInfo& info, int64_t now
 void FleetWorker::forgetCarries(Session& s) {
     for (auto& p : s.players) {
         if (p->carry.active) endCarryEpisode(s, *p);
+        if (p->carried)
+            world_.shared[static_cast<size_t>(p->index)].holder.store(-1,
+                                                                      std::memory_order_relaxed);
         p->carried = false;
         p->retryAtNs = 0;
     }
@@ -564,18 +589,31 @@ void FleetWorker::sweep(int64_t now) {
             Departed& d = it->second;
             if (d.late) {
                 if (now - d.departNs > LATE_ENTRY_NS) {
+                    if (d.altId) s.departedAlias.erase(d.altId);
                     it = s.departed.erase(it);
                     continue;
                 }
             } else if (d.resultNs && !d.releasedNs) {
                 if (now - d.resultNs > static_cast<int64_t>(cfg.releaseWaitMs) * MS) {
+                    // The next session's carry landed and no FLEET_RELEASED reason 1
+                    // came here within the wait. Nothing else is done about it: the
+                    // player is carried by the next session, and this one stopped
+                    // sending for it when it left. It is counted and described.
                     inc(st.releaseMissing);
+                    st.events.add("released_never_arrived",
+                                  {{"t_s", world_.phaseSeconds(now)},
+                                   {"session", s.index},
+                                   {"player", d.player},
+                                   {"waited_ms", msBetween(now, d.resultNs)},
+                                   {"left_a_token_carry_unanswered", d.altId != 0}});
+                    if (d.altId) s.departedAlias.erase(d.altId);
                     it = s.departed.erase(it);
                     continue;
                 }
                 ++awaiting;
             } else if (now - d.departNs > UNPAIRED_ENTRY_NS) {
                 inc(st.releaseUnpaired);
+                if (d.altId) s.departedAlias.erase(d.altId);
                 it = s.departed.erase(it);
                 continue;
             } else if (now - d.departNs < static_cast<int64_t>(cfg.carryGiveUpMs) * MS) {
@@ -629,11 +667,23 @@ void FleetWorker::drainSocket(Session& s) {
 // ---------------------------------------------------------------------------
 
 bool FleetWorker::sendOn(Session& s, const uint8_t* buf, size_t len, SendKind kind, int64_t id,
-                         int64_t now) {
+                         int64_t now, const Player* forPlayer) {
     if (s.fd < 0) return false;
     // The sequence number was written into `buf` by the builder: remember what it
     // was for, so an error that echoes it can be laid at the right message.
-    s.ring[s.seq] = SeqEntry{id, now, kind};
+    SeqEntry& e = s.ring[s.seq];
+    e = SeqEntry{};
+    e.id = id;
+    e.sentNs = now;
+    e.kind = kind;
+    e.type = len ? buf[0] : 0;
+    if (forPlayer) {
+        e.player = forPlayer->index;
+        e.tokenCarryPending = forPlayer->carry.active && forPlayer->carry.id != forPlayer->curId;
+        e.refreshInFlight =
+            world_.shared[static_cast<size_t>(forPlayer->index)].refreshStartedAtNs.load(
+                std::memory_order_relaxed) != 0;
+    }
     ++s.seq;
     const ssize_t n = send(s.fd, buf, len, 0);
     if (n == static_cast<ssize_t>(len)) {
@@ -663,6 +713,7 @@ bool FleetWorker::sendOn(Session& s, const uint8_t* buf, size_t len, SendKind ki
 
 void FleetWorker::sendCapabilities(Session& s, int64_t now) {
     s.lastCapsNs = now;
+    if (s.firstCapsNs == 0) s.firstCapsNs = now;
     uint32_t flags = 0;
     if (world_.cfg.signedBundles) flags |= wire::CAP_BUNDLE_SIGNED;
     if (world_.cfg.ownState) flags |= CAP_FLEET_OWN_STATE;
@@ -683,7 +734,35 @@ void FleetWorker::sendHeartbeat(Session& s, int64_t now) {
 }
 
 void FleetWorker::sendCarry(Session& s, Player& p, int64_t now) {
-    if (p.carry.firstSentNs == 0) p.carry.firstSentNs = now;
+    // A carry can wait its turn (the session's carry rate). When it goes out it
+    // names the player's newest token: one a refresh has replaced meanwhile would
+    // be answered status 1. A carry that was already sent keeps its token when it
+    // is sent again, so its result is still the answer to it.
+    const uint32_t v = world_.creds[static_cast<size_t>(p.index)].version();
+    if (p.carry.firstSentNs == 0 && v != p.carry.version && !(v & 1)) {
+        uint8_t token[hmac::TOKEN_OCTETS];
+        int64_t id = 0;
+        uint32_t version = 0;
+        if (world_.creds[static_cast<size_t>(p.index)].load(token, id, version) &&
+            id != p.carry.id) {
+            if (p.carry.id != p.curId) s.byId.erase(p.carry.id);
+            std::memcpy(p.carry.token, token, sizeof(token));
+            p.carry.id = id;
+            p.carry.version = version;
+            s.byId[id] = &p;
+            inc(world_.stats.carryTookNewerToken);
+        }
+    }
+    if (p.carry.firstSentNs == 0) {
+        p.carry.firstSentNs = now;
+        if (p.carry.cause == CarryCause::TokenRefresh) {
+            // How long after the API's answer with the new token its first carry
+            // goes out.
+            const int64_t stored = world_.shared[static_cast<size_t>(p.index)]
+                                       .tokenStoredAtNs.load(std::memory_order_relaxed);
+            if (stored && now >= stored) world_.stats.tokenCarryDelay.record((now - stored) / 1000);
+        }
+    }
     p.carry.lastSentNs = now;
     // Each FLEET_CARRY names a later time than the one before: a carry older than
     // the session's last accepted carry of the player is refused as a replay.
@@ -706,7 +785,11 @@ void FleetWorker::sendUpdate(Session& s, Player& p, int64_t now, int64_t schedul
     pose.velX = p.walk.dx * speedUnits;
     pose.velY = p.walk.dy * speedUnits;
     // The marker (FleetWire.hpp): who sent this update, and when.
-    pose.pitch = markerCode(static_cast<uint16_t>(s.index), world_.runTag, p.sampled);
+    const bool first = p.firstUpdateDue;
+    p.firstUpdateDue = false;
+    if (first) inc(world_.stats.firstUpdatesSent);
+    pose.pitch =
+        markerCode(static_cast<uint16_t>(s.index), world_.runTag, p.sampled, p.index, first);
     pose.yaw = static_cast<double>(now / 1000);
     pose.roll = std::atan2(p.walk.dy, p.walk.dx) * (180.0 / 3.14159265358979);
     // The tail names the PLAYER (set in the template); the HMAC is keyed with the
@@ -717,7 +800,7 @@ void FleetWorker::sendUpdate(Session& s, Player& p, int64_t now, int64_t schedul
         return;
     }
     if (sendOn(s, p.msg, wire::actorUpdateSize(wire::PoseFormat::UE5), SendKind::Update, p.curId,
-               now)) {
+               now, &p)) {
         inc(world_.stats.updatesSent);
         world_.stats.sendLag.record((now - scheduledNs) / 1000);
     }
@@ -765,6 +848,7 @@ void FleetWorker::adopt(Session& s, std::unique_ptr<Player> owned, CarryCause ca
                         int64_t now) {
     Player& p = *owned;
     s.players.push_back(std::move(owned));
+    s.byIndex[p.index] = &p;
     if (p.lastMoveNs == 0) p.lastMoveNs = now;
     if (p.nextUpdateNs == 0) {
         // Spread first sends over one interval so a batch of joins is not a burst.
@@ -787,6 +871,16 @@ void FleetWorker::depart(Session& s, size_t slot, int toRegion, int64_t now) {
     std::unique_ptr<Player> p = std::move(s.players[slot]);
     if (slot + 1 != s.players.size()) s.players[slot] = std::move(s.players.back());
     s.players.pop_back();
+    s.byIndex.erase(p->index);
+    PlayerShared& shared = world_.shared[static_cast<size_t>(p->index)];
+    if (p->carried) {
+        shared.leftSession.store(s.index, std::memory_order_relaxed);
+        shared.leftAtNs.store(now, std::memory_order_relaxed);
+        shared.holder.store(-1, std::memory_order_relaxed);
+    }
+    // A carry the player leaves behind unanswered (one made for a refreshed token):
+    // if it lands, the server's release to this session names ITS token id.
+    const int64_t leftBehind = p->carry.active && p->carry.id != p->curId ? p->carry.id : 0;
 
     inc(st.crossingsAttempted);
     if (p->crossingOpen) inc(st.crossingsSuperseded); // crossed again before it was carried
@@ -822,11 +916,14 @@ void FleetWorker::depart(Session& s, size_t slot, int toRegion, int64_t now) {
         // one, and FLEET_RELEASED reason 1 is due here once that carry lands.
         auto old = s.departed.find(p->curId);
         if (old != s.departed.end() && !old->second.late) inc(st.releaseUnpaired);
+        if (old != s.departed.end()) eraseDeparted(s, old);
         Departed d;
         d.player = p->index;
         d.crossingSeq = p->crossingSeq;
         d.departNs = now;
+        d.altId = leftBehind;
         s.departed[p->curId] = d;
+        if (leftBehind) s.departedAlias[leftBehind] = p->curId;
         inc(st.releaseExpected);
         p->originSession = s.index;
         p->originId = p->curId;
@@ -934,6 +1031,7 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
         } else {
             ok = verifyReconnect(data, len, s.token);
         }
+        countControl(first, ok);
         if (!ok) {
             inc(st.rxHmacFailures);
             return;
@@ -953,6 +1051,7 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
         } else {
             reason = verifySessionReleased(data, len, s.token);
         }
+        countControl(first, reason.has_value());
         if (!reason) {
             inc(st.rxHmacFailures);
             return;
@@ -964,7 +1063,9 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
         return;
     }
     if (first == CONTROL_BOUND_ACK) {
-        if (world_.cfg.boundControl && verifyBoundAck(data, len, s.token, s.nonce)) {
+        const bool ok = world_.cfg.boundControl && verifyBoundAck(data, len, s.token, s.nonce);
+        countControl(first, ok);
+        if (ok) {
             s.boundAcked = true;
             inc(st.boundAcks);
         } else {
@@ -982,21 +1083,138 @@ void FleetWorker::handleDatagram(Session& s, const uint8_t* data, size_t len, in
             inc(st.rxHmacFailures);
             return;
         }
-    } else if (first == wire::MESSAGE_BUNDLE) {
+    }
+    const bool plainBundle = first == wire::MESSAGE_BUNDLE;
+    const Where where =
+        signedBundle ? Where::SignedBundle : plainBundle ? Where::PlainBundle : Where::Standalone;
+    nlohmann::json members = nlohmann::json::array();
+    if (plainBundle) {
+        // A plain bundle is not signed as a whole: each member must carry its own
+        // HMAC. What its members were, and whether each one's HMAC verified, goes
+        // into the summary.
         inc(st.rxPlainBundles);
+        bundleMembers_ = &members;
     }
     const bool ok = wire::forEachMessage(data, len, [&](const wire::InboundView& m) {
-        handleMessage(s, m, signedBundle, now);
+        handleMessage(s, m, where, now);
     });
+    bundleMembers_ = nullptr;
+    if (plainBundle) {
+        st.events.add("plain_bundles", {{"t_s", world_.phaseSeconds(now)},
+                                        {"session", s.index},
+                                        {"datagram_bytes", len},
+                                        {"well_formed", ok},
+                                        {"members", std::move(members)}});
+    }
     if (!ok) inc(st.rxMalformed);
 }
 
-void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, bool trusted,
+void FleetWorker::countControl(uint8_t type, bool verified) {
+    // 22, 28, 44, 45 and 46 are always alone in their datagram, with an HMAC
+    // keyed on the fleet token.
+    FleetStats& st = world_.stats;
+    inc(st.rxStandalone[type]);
+    inc(verified ? st.rxOutsideOwnHmacOk[type] : st.rxOutsideOwnHmacFailed[type]);
+}
+
+void FleetWorker::noteOutsideSignedBundle(Session& s, const wire::InboundView& m, Where where,
+                                          const char* ownHmac, int64_t now) {
+    // A message that arrived outside a signed bundle: how it was authenticated.
+    FleetStats& st = world_.stats;
+    const uint8_t type = m.type();
+    const bool none = ownHmac[0] == 'n';
+    const bool verified = ownHmac[0] == 'v';
+    inc(none ? st.rxOutsideNoHmac[type]
+             : verified ? st.rxOutsideOwnHmacOk[type] : st.rxOutsideOwnHmacFailed[type]);
+    if (bundleMembers_) {
+        bundleMembers_->push_back({{"type", type},
+                                   {"name", messageTypeName(type)},
+                                   {"bytes", m.len},
+                                   {"own_hmac", ownHmac}});
+    }
+    if (!(type & wire::SPATIAL_TYPE_BIT) || verified) return;
+    // A notification with no HMAC of its own, or one that did not verify, outside
+    // a signed bundle: nothing says the realtime server sent it.
+    nlohmann::json e = {{"t_s", world_.phaseSeconds(now)},
+                        {"session", s.index},
+                        {"where", whereName(static_cast<int>(where))},
+                        {"type", type},
+                        {"name", messageTypeName(type)},
+                        {"bytes", m.len},
+                        {"own_hmac", ownHmac},
+                        {"contains_auth_byte",
+                         m.len > wire::off::CONTAINS_AUTH ? m.data[wire::off::CONTAINS_AUTH] : 0},
+                        {"ms_since_the_session_first_sent_capabilities",
+                         s.firstCapsNs ? msBetween(now, s.firstCapsNs) : -1.0},
+                        {"ms_since_the_session_last_sent_capabilities",
+                         s.lastCapsNs ? msBetween(now, s.lastCapsNs) : -1.0}};
+    if (s.lastCarriedNs)
+        e["ms_since_the_session_last_carry_result"] = msBetween(now, s.lastCarriedNs);
+    if (s.lastReleasedNs)
+        e["ms_since_the_session_last_fleet_released"] = msBetween(now, s.lastReleasedNs);
+    if (m.len >= wire::HEADER_SIZE) {
+        // How far the notification's chunk is from the receiving session's region.
+        // Every player the session carries stands inside its region, so one from
+        // farther than the replication distance is out of range of all of them.
+        const int64_t far = world_.grid.chunksFromRegion(
+            s.index, wire::readI64(m.data + wire::off::CHUNK_X),
+            wire::readI64(m.data + wire::off::CHUNK_Y));
+        e["chunks_from_the_receiving_sessions_region"] = far;
+        e["out_of_range_of_every_player_of_the_session"] = far > world_.cfg.distance + 1;
+        if (none && far > world_.cfg.distance + 1) inc(st.unsignedOutOfRange);
+        const auto actor = world_.playerOfActor.find(
+            std::string(reinterpret_cast<const char*>(m.data + wire::off::UUID), 32));
+        if (actor != world_.playerOfActor.end()) {
+            const PlayerShared& shared = world_.shared[static_cast<size_t>(actor->second)];
+            e["actor_player"] = actor->second;
+            e["actor_player_carried_by_session"] = shared.holder.load(std::memory_order_relaxed);
+            e["the_session_carried_that_player_before"] = shared.wasCarriedBy(s.index);
+            if (shared.leftSession.load(std::memory_order_relaxed) == s.index) {
+                e["ms_since_that_player_left_the_session"] =
+                    msBetween(now, shared.leftAtNs.load(std::memory_order_relaxed));
+            }
+        }
+    }
+    if (type == wire::ACTOR_UPDATE_NOTIFICATION_2) {
+        const auto payload = notificationPayload(m);
+        const auto marker = payload ? readMarker(payload->data, payload->len) : std::nullopt;
+        if (marker && marker->runTag == world_.runTag && marker->player < world_.cfg.players) {
+            e["sent_by_session"] = marker->session;
+            e["sent_by_the_receiving_session"] = marker->session == s.index;
+            e["first_update_after_a_carry_result"] = marker->first;
+            e["update_age_ms"] = msBetween(now, marker->sendUs * 1000);
+            if (none) {
+                inc(marker->session == s.index ? st.unsignedSentByReceiver
+                                               : st.unsignedSentByAnother);
+                if (marker->first) inc(st.unsignedFirstUpdate);
+            }
+        } else if (none) {
+            inc(st.unsignedNotThisRun);
+        }
+    } else {
+        if (none) inc(st.unsignedOtherType);
+        if (type == ACTOR_LEFT_NOTIFICATION) {
+            const auto payload = notificationPayload(m);
+            if (payload && payload->len >= 1) e["actor_left_reason"] = payload->data[0];
+        }
+    }
+    st.events.add("notifications_outside_a_signed_bundle_without_a_verified_hmac", std::move(e));
+}
+
+void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, Where where,
                                 int64_t now) {
     FleetStats& st = world_.stats;
     const uint8_t type = m.type();
+    const bool trusted = where == Where::SignedBundle;
     if (s.state != Session::State::Active) return; // a handler in this datagram moved the session
+    inc(where == Where::SignedBundle ? st.rxInSignedBundle[type]
+                                     : where == Where::PlainBundle ? st.rxInPlainBundle[type]
+                                                                   : st.rxStandalone[type]);
+    if (where == Where::PlainBundle) inc(st.plainBundleMembers);
+
     if (type == wire::GENERIC_ERROR_MESSAGE) {
+        // [3][sequence number][code]: three bytes, with no HMAC in any form.
+        if (!trusted) noteOutsideSignedBundle(s, m, where, "none", now);
         inc(st.rxByType[type]);
         onError(s, m, now);
         return;
@@ -1007,6 +1225,9 @@ void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, bool tru
         // else its last 32 bytes are its HMAC under the fleet token, and a frame
         // whose HMAC is missing or wrong is dropped and counted.
         const FleetFrame f = readFleetFrame(m, trusted, s.token);
+        if (!trusted)
+            noteOutsideSignedBundle(s, m, where, f.auth == FrameAuth::Failed ? "failed" : "verified",
+                                    now);
         if (f.auth == FrameAuth::Failed) {
             inc(st.fleetFrameHmacFailures);
             return;
@@ -1055,12 +1276,19 @@ void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, bool tru
 
     if (type & wire::SPATIAL_TYPE_BIT) {
         if (!trusted) {
-            // Outside a signed bundle a notification carries its own HMAC.
+            // Outside a signed bundle a notification carries its own HMAC. One
+            // whose header says it has none is counted (unsigned_notifications)
+            // and still read, so the summary can say what it was; one whose HMAC
+            // does not verify is dropped.
             if (m.len > wire::off::CONTAINS_AUTH && m.data[wire::off::CONTAINS_AUTH] == 0) {
                 inc(st.rxUnsignedSpatial);
+                noteOutsideSignedBundle(s, m, where, "none", now);
             } else if (!wire::verifyNotification(m, s.token)) {
                 inc(st.rxHmacFailures);
+                noteOutsideSignedBundle(s, m, where, "failed", now);
                 return;
+            } else {
+                noteOutsideSignedBundle(s, m, where, "verified", now);
             }
         }
         inc(st.rxByType[type]);
@@ -1072,9 +1300,14 @@ void FleetWorker::handleMessage(Session& s, const wire::InboundView& m, bool tru
             inc(st.plainState);
             inc(s.io->plainState);
         }
-        if (type == wire::ACTOR_UPDATE_NOTIFICATION_2) onActorNotification(s, m, now);
+        if (type == wire::ACTOR_UPDATE_NOTIFICATION_2) {
+            onActorNotification(s, m, where, now);
+        } else if (type == ACTOR_LEFT_NOTIFICATION) {
+            onActorLeft(s, m, where, now);
+        }
         return;
     }
+    if (!trusted) noteOutsideSignedBundle(s, m, where, "none", now);
     inc(st.rxByType[type]);
     if (isCommunication(type)) plainCommunication(s, type); // channel text or audio
 }
@@ -1095,18 +1328,95 @@ void FleetWorker::plainCommunication(Session& s, uint8_t type) {
     }
 }
 
-void FleetWorker::onActorNotification(Session& s, const wire::InboundView& m, int64_t now) {
+void FleetWorker::onActorNotification(Session& s, const wire::InboundView& m, Where where,
+                                      int64_t now) {
     FleetStats& st = world_.stats;
     const auto payload = notificationPayload(m);
     if (!payload) return;
     const auto marker = readMarker(payload->data, payload->len);
-    if (!marker || marker->runTag != world_.runTag) return; // not this run's update
-    inc(st.markersSeen);
-    if (marker->session == s.index) {
-        // State one of this session's own carried players sent. It must not come
-        // back unless the session set FLEET_OWN_STATE.
-        inc(st.ownStateReceived);
+    if (!marker || marker->runTag != world_.runTag || marker->player >= world_.cfg.players) {
+        // Not this run's update: another payload, or a marker of another run of
+        // this tool (state the platform kept from it).
+        inc(marker || isEarlierMarker(payload->data, payload->len) ? st.actorUpdatesOtherRun
+                                                                  : st.actorUpdatesOtherPayload);
         return;
+    }
+    inc(st.markersSeen);
+    if (world_.grid.chunksFromRegion(s.index, wire::readI64(m.data + wire::off::CHUNK_X),
+                                     wire::readI64(m.data + wire::off::CHUNK_Y)) >
+        world_.cfg.distance + 1)
+        inc(st.updatesOutOfRange);
+    if (marker->first) {
+        inc(st.firstUpdatesReceived);
+        if (where != Where::SignedBundle && m.data[wire::off::CONTAINS_AUTH] == 0)
+            inc(st.firstUpdatesReceivedUnsigned);
+    }
+    const int64_t sentNs = marker->sendUs * 1000;
+    const PlayerShared& shared = world_.shared[static_cast<size_t>(marker->player)];
+    const auto mine = s.byIndex.find(marker->player);
+    const bool carriedHere = mine != s.byIndex.end() && mine->second->carried;
+
+    if (marker->session == s.index) {
+        // THIS session sent the update, and it came back to it. With
+        // FLEET_OWN_STATE off that must not happen. The two cases are counted
+        // apart: the session still carried the player when the update came back,
+        // or the player had crossed to another session meanwhile.
+        const bool unsignedOutside =
+            where != Where::SignedBundle && m.data[wire::off::CONTAINS_AUTH] == 0;
+        inc(st.ownStateReceived);
+        inc(carriedHere ? st.ownSentWhileCarrying : st.ownSentAfterPlayerLeft);
+        if (marker->first) inc(st.ownSentFirstUpdate);
+        if (unsignedOutside) inc(st.ownSentUnsigned);
+        st.ownSentAge.record(std::max<int64_t>(0, (now - sentNs) / 1000));
+        const int64_t leftAt = shared.leftAtNs.load(std::memory_order_relaxed);
+        const bool leftHere = shared.leftSession.load(std::memory_order_relaxed) == s.index;
+        nlohmann::json e = {
+            {"t_s", world_.phaseSeconds(now)},
+            {"session", s.index},
+            {"player", marker->player},
+            {"update_age_ms", msBetween(now, sentNs)},
+            {"where", whereName(static_cast<int>(where))},
+            {"own_hmac", where == Where::SignedBundle ? "signed_bundle"
+                                                      : unsignedOutside ? "none" : "verified"},
+            {"first_update_after_a_carry_result", marker->first},
+            {"session_still_carried_the_player", carriedHere},
+            {"player_carried_by_session_now", shared.holder.load(std::memory_order_relaxed)}};
+        if (carriedHere) {
+            e["sent_ms_after_the_last_carry_result_here"] =
+                msBetween(sentNs, mine->second->lastCarryResultNs);
+            e["that_carry_was_for"] = carryCauseName(mine->second->carriedCause);
+        } else if (leftHere && leftAt) {
+            e["ms_since_the_player_left_this_session"] = msBetween(now, leftAt);
+            e["sent_ms_before_the_player_left"] = msBetween(leftAt, sentNs);
+            const int64_t nextCarry = shared.carriedAtNs.load(std::memory_order_relaxed);
+            if (nextCarry > leftAt)
+                e["ms_since_the_next_session_carry_result"] = msBetween(now, nextCarry);
+        }
+        st.events.add("own_state_sent_by_the_receiving_session", std::move(e));
+        return;
+    }
+
+    if (carriedHere) {
+        // Another session sent it, for a player this session carries now.
+        const int64_t carriedAt = mine->second->carriedSinceNs;
+        if (sentNs <= carriedAt) {
+            // Sent before this session's carry result: the old session's last
+            // updates, crossing the handoff. Expected.
+            inc(st.otherSentBeforeHandoff);
+            st.handoffLead.record((carriedAt - sentNs) / 1000);
+        } else {
+            // Sent AFTER this session's carry result, by another session. The
+            // client never does that (a session stops sending for a player the
+            // moment the player leaves it), so this is counted apart.
+            inc(st.otherSentAfterCarry);
+            st.events.add("state_for_a_carried_player_sent_by_another_session_after_the_carry",
+                          {{"t_s", world_.phaseSeconds(now)},
+                           {"session", s.index},
+                           {"player", marker->player},
+                           {"sent_by_session", marker->session},
+                           {"sent_ms_after_this_session_carry_result", msBetween(sentNs, carriedAt)},
+                           {"update_age_ms", msBetween(now, sentNs)}});
+        }
     }
     if (marker->sampled) {
         const int64_t us = now / 1000 - marker->sendUs;
@@ -1114,7 +1424,43 @@ void FleetWorker::onActorNotification(Session& s, const wire::InboundView& m, in
     }
 }
 
+void FleetWorker::onActorLeft(Session& s, const wire::InboundView& m, Where where, int64_t now) {
+    // ACTOR_LEFT (145): the first payload byte is the reason (0 the actor went
+    // stale, 1 its session was released).
+    FleetStats& st = world_.stats;
+    const auto payload = notificationPayload(m);
+    const int reason = payload && payload->len >= 1 ? payload->data[0] : 255;
+    inc(st.actorLeftByReason[static_cast<size_t>(reason)]);
+    const auto actor = world_.playerOfActor.find(
+        std::string(reinterpret_cast<const char*>(m.data + wire::off::UUID), 32));
+    if (actor == world_.playerOfActor.end()) {
+        inc(st.actorLeftUnknownActor);
+        return;
+    }
+    const PlayerShared& shared = world_.shared[static_cast<size_t>(actor->second)];
+    const int holder = shared.holder.load(std::memory_order_relaxed);
+    inc(holder >= 0 ? st.actorLeftForCarriedPlayer : st.actorLeftForUncarriedPlayer);
+    const int64_t far = world_.grid.chunksFromRegion(
+        s.index, wire::readI64(m.data + wire::off::CHUNK_X),
+        wire::readI64(m.data + wire::off::CHUNK_Y));
+    if (far > world_.cfg.distance + 1) inc(st.actorLeftOutOfRange);
+    const int64_t leftAt = shared.leftAtNs.load(std::memory_order_relaxed);
+    const int64_t carriedAt = shared.carriedAtNs.load(std::memory_order_relaxed);
+    nlohmann::json e = {{"t_s", world_.phaseSeconds(now)},
+                        {"session", s.index},
+                        {"where", whereName(static_cast<int>(where))},
+                        {"reason", reason},
+                        {"actor_player", actor->second},
+                        {"actor_player_carried_by_session", holder},
+                        {"chunks_from_the_receiving_sessions_region", far},
+                        {"the_session_carried_that_player_before", shared.wasCarriedBy(s.index)}};
+    if (carriedAt) e["ms_since_the_player_last_carry_result"] = msBetween(now, carriedAt);
+    if (leftAt) e["ms_since_the_player_last_left_a_session"] = msBetween(now, leftAt);
+    st.events.add("actor_left", std::move(e));
+}
+
 void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
+    const FleetConfig& cfg = world_.cfg;
     FleetStats& st = world_.stats;
     const int64_t id = r.playerGameTokenId;
     auto it = s.byId.find(id);
@@ -1122,7 +1468,8 @@ void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
         // The player left this session before the answer came (or the id is not
         // one this session ever sent).
         inc(st.carryResultsLate);
-        if (r.status == CARRY_CARRIED && s.departed.find(id) == s.departed.end()) {
+        if (r.status == CARRY_CARRIED && s.departed.find(id) == s.departed.end() &&
+            s.departedAlias.find(id) == s.departedAlias.end()) {
             // The abandoned carry landed after all, so a reason 1 will follow when
             // the next session's carry replaces it.
             Departed d;
@@ -1159,7 +1506,16 @@ void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
                                              static_cast<uint8_t>(world_.cfg.distance),
                                              static_cast<wire::DecayRate>(world_.cfg.decay));
         }
+        p.lastCarryResultNs = now;
+        s.lastCarriedNs = now;
+        p.status1Retries = 0;
+        p.carriedCause = cause;
+        p.firstUpdateDue = true;
         if (!p.carried) {
+            PlayerShared& shared = world_.shared[static_cast<size_t>(p.index)];
+            shared.carriedAtNs.store(now, std::memory_order_relaxed);
+            shared.holder.store(s.index, std::memory_order_relaxed);
+            shared.noteCarriedBy(s.index);
             p.carried = true;
             p.carriedSinceNs = now;
             p.permCenterX = world_.grid.chunkX(p.walk.x);
@@ -1195,22 +1551,77 @@ void FleetWorker::onCarryResult(Session& s, const CarryResult& r, int64_t now) {
     inc(st.carryRefused[r.status]);
     switch (r.status) {
         case CARRY_NO_LIVE_TOKEN: {
-            // The token is not live. Carry with a newer one if the API threads
-            // have stored it meanwhile; otherwise the player signs in again.
+            // "No such live token." Around a token refresh that is a matter of
+            // timing, in one of two ways, and the carry is sent again (a new time
+            // and proof) before it counts as a refusal:
+            //   - the carry named the token the refresh has replaced since (the API
+            //     retires it as it answers): carry at once with the new one;
+            //   - the carry named the newest token, stored moments ago, or a refresh
+            //     of it is in flight: the realtime server may not know the new one
+            //     yet, or the old one is already retired. Wait a little and carry
+            //     with whatever token is newest then.
+            // The carry that stands under the old token id is left alone meanwhile,
+            // and the player's updates go on under it.
+            // Anything else is a refusal: the player signs in again.
             const uint32_t usedVersion = p.carry.version;
+            const int64_t firstSent = p.carry.firstSentNs;
+            const PlayerShared& shared = world_.shared[static_cast<size_t>(p.index)];
+            const int64_t stored = shared.tokenStoredAtNs.load(std::memory_order_relaxed);
+            const int64_t refreshStarted = shared.refreshStartedAtNs.load(std::memory_order_relaxed);
+            const bool refreshed = shared.tokenRefreshed.load(std::memory_order_relaxed);
             endCarryEpisode(s, p);
             const uint32_t v = world_.creds[static_cast<size_t>(p.index)].version();
-            if (v != usedVersion && !(v & 1)) {
+            const bool newer = v != usedVersion && !(v & 1);
+            const bool recent =
+                stored && now - stored < static_cast<int64_t>(cfg.status1RecentMs) * MS;
+            const bool mayWait = (recent || refreshStarted || (v & 1)) &&
+                                 p.status1Retries < cfg.status1Retries;
+            const char* did = "signed_in_again";
+            if (newer) {
+                did = "carried_at_once_with_the_newer_token";
+                ++p.status1Retries;
+                inc(st.carryRetriedAfterRefresh);
+                inc(st.carryRetriedWithNewerToken);
                 startCarry(s, p, cause, now);
+            } else if (mayWait) {
+                did = "waited_and_carried_again";
+                ++p.status1Retries;
+                inc(st.carryRetriedAfterRefresh);
+                inc(st.carryRetriedAfterWait);
+                p.retryCause = cause;
+                p.retryAtNs = now + static_cast<int64_t>(cfg.status1WaitMs) * MS;
             } else {
+                inc(st.carryStatus1Refusals);
+                p.status1Retries = 0;
                 p.retryCause = cause;
                 requestSignInAgain(p, now);
             }
+            nlohmann::json e = {
+                {"t_s", world_.phaseSeconds(now)},
+                {"session", s.index},
+                {"player", p.index},
+                {"carry_cause", carryCauseName(cause)},
+                {"answered_after_ms", firstSent ? msBetween(now, firstSent) : -1.0},
+                {"named_the_newest_token_when_sent", !newer},
+                {"token_came_from_a_refresh", refreshed},
+                {"refresh_in_flight_when_answered", refreshStarted != 0},
+                {"status_1_in_a_row", p.status1Retries},
+                {"player_still_carried_under_the_old_token", p.carried},
+                {"client_did", did}};
+            if (stored && firstSent) {
+                // Positive: the carry went out this long after the API's answer with
+                // the newest token was stored. Negative: this long before it.
+                e["carry_sent_ms_after_the_newest_token_was_stored"] = msBetween(firstSent, stored);
+            }
+            st.events.add("carry_status_1", std::move(e));
             break;
         }
         case CARRY_OTHER_ORGANIZATION:
             // Another organization's player: no retry can help.
             endCarryEpisode(s, p);
+            if (p.carried)
+                world_.shared[static_cast<size_t>(p.index)].holder.store(-1,
+                                                                         std::memory_order_relaxed);
             p.carried = false;
             p.failed = true;
             inc(st.playersFailed);
@@ -1256,24 +1667,50 @@ void FleetWorker::pairRelease(Session& s, std::unordered_map<int64_t, Departed>:
     inc(st.releaseReceived);
     if (delta < 0) inc(st.releaseBeforeResult);
     st.releaseDelay.record(delta > 0 ? delta / 1000 : 0);
+    eraseDeparted(s, it);
+}
+
+std::unordered_map<int64_t, FleetWorker::Departed>::iterator FleetWorker::findDeparted(
+    Session& s, int64_t id, bool* byAlias) {
+    // A player that left is known by the token id its carry stood under. If it
+    // left a carry with a refreshed token unanswered, and that carry landed, the
+    // server knows it here under the NEW id, and its release names that one.
+    if (byAlias) *byAlias = false;
+    auto it = s.departed.find(id);
+    if (it != s.departed.end()) return it;
+    const auto alias = s.departedAlias.find(id);
+    if (alias == s.departedAlias.end()) return s.departed.end();
+    it = s.departed.find(alias->second);
+    if (it != s.departed.end() && it->second.altId == id) {
+        if (byAlias) *byAlias = true;
+        return it;
+    }
+    return s.departed.end();
+}
+
+void FleetWorker::eraseDeparted(Session& s, std::unordered_map<int64_t, Departed>::iterator it) {
+    if (it->second.altId) s.departedAlias.erase(it->second.altId);
     s.departed.erase(it);
 }
 
 void FleetWorker::onReleased(Session& s, const Released& r, int64_t now) {
     FleetStats& st = world_.stats;
     inc(st.releasedByReason[r.reason]);
+    s.lastReleasedNs = now;
     const int64_t id = r.playerGameTokenId;
 
     if (r.reason == RELEASED_CARRIED_ELSEWHERE) {
         // The expected case: a player that crossed away from this session.
-        auto d = s.departed.find(id);
+        bool byAlias = false;
+        auto d = findDeparted(s, id, &byAlias);
         if (d != s.departed.end() && d->second.releasedNs == 0) {
             if (d->second.late) {
                 inc(d->second.releasedFirst ? st.releasedAfterOwnRelease
                                             : st.releasedAfterLateCarry);
-                s.departed.erase(d);
+                eraseDeparted(s, d);
                 return;
             }
+            if (byAlias) inc(st.releaseNamedNewerToken);
             d->second.releasedNs = now;
             if (d->second.resultNs) pairRelease(s, d);
             return;
@@ -1287,7 +1724,9 @@ void FleetWorker::onReleased(Session& s, const Released& r, int64_t now) {
     }
     // The session holds this player and was told it no longer carries them.
     Player& p = *it->second;
+    world_.shared[static_cast<size_t>(p.index)].holder.store(-1, std::memory_order_relaxed);
     p.carried = false;
+    p.carryEndedNs = now;
     switch (r.reason) {
         case RELEASED_CARRIED_ELSEWHERE:
             // Another session's carry replaced this one while the world says the
@@ -1376,57 +1815,141 @@ void FleetWorker::onError(Session& s, const wire::InboundView& m, int64_t now) {
     }
     if (code != wire::ERR_UNAUTHORIZED) return;
 
+    const auto describe = [&](const char* cls) {
+        nlohmann::json ev = {{"t_s", world_.phaseSeconds(now)},
+                             {"session", s.index},
+                             {"class", cls},
+                             {"sequence_number", seq}};
+        if (fresh) {
+            ev["message_type"] = e.type;
+            ev["message_name"] = messageTypeName(e.type);
+            ev["refused_ms_after_it_was_sent"] = msBetween(now, e.sentNs);
+        }
+        return ev;
+    };
+
     if (!fresh) {
+        // The sequence number names no message this session sent in the last two
+        // seconds, so nothing says what was refused.
         inc(st.unauthUnexplained);
+        st.events.add("unauthorized_unexplained", describe("unexplained"));
         return;
     }
     if (e.kind != SendKind::Update) {
         // One of the session's own messages (a carry, a release, its
         // capabilities or a heartbeat) was refused.
         inc(st.unauthSessionMessages);
+        st.events.add("unauthorized_session_messages", describe("session_messages"));
         noteSessionError(s, now);
         return;
     }
 
-    // A message sent for a player was refused.
+    // A message sent for a player was refused. What the client knew when it sent
+    // it, and what it knows now, decide the class.
     inc(st.playerMessagesRefused);
-    auto it = s.byId.find(e.id);
-    if (it == s.byId.end() || it->second->curId != e.id || !it->second->carried) {
-        // The player has left this session since: its last update crossed the
-        // new session's carry on the way.
-        inc(st.unauthAfterHandoff);
+    const PlayerShared& shared = world_.shared[static_cast<size_t>(e.player)];
+    const auto held = s.byIndex.find(e.player);
+    Player* p = held == s.byIndex.end() ? nullptr : held->second;
+    const int64_t stored = shared.tokenStoredAtNs.load(std::memory_order_relaxed);
+    const bool refreshed = shared.tokenRefreshed.load(std::memory_order_relaxed);
+
+    nlohmann::json ev = describe("");
+    ev["player"] = e.player;
+    ev["carry_with_a_new_token_unanswered_when_sent"] = e.tokenCarryPending;
+    ev["token_refresh_in_flight_when_sent"] = e.refreshInFlight;
+    if (stored) {
+        // Positive: sent this long after the API's answer with the player's newest
+        // token was stored. Negative: this long before it.
+        ev["sent_ms_after_the_newest_token_was_stored"] = msBetween(e.sentNs, stored);
+    }
+    if (p && p->lastCarryResultNs) {
+        // Positive: sent this long after the player's last carry result on this
+        // session. Negative: that result (the new token's) came this long after.
+        ev["sent_ms_after_the_last_carry_result_here"] = msBetween(e.sentNs, p->lastCarryResultNs);
+    }
+    const auto finish = [&](const char* cls, const char* kind) {
+        ev["class"] = cls;
+        st.events.add(kind, std::move(ev));
+    };
+
+    // 1. Around a token refresh. The update named the token id a refresh was
+    //    replacing or has replaced: it was sent while the carry with the new token
+    //    was unanswered (the realtime server moves the player to the new id when
+    //    it accepts that carry, and the client learns it from the result), or
+    //    while the API was answering the refresh.
+    uint8_t newestToken[hmac::TOKEN_OCTETS];
+    int64_t newestId = 0;
+    uint32_t newestVersion = 0;
+    const bool haveNewest =
+        world_.creds[static_cast<size_t>(e.player)].load(newestToken, newestId, newestVersion);
+    const bool namedReplacedToken = haveNewest && newestId != e.id;
+    ev["named_a_token_id_replaced_since"] = namedReplacedToken;
+    ev["newest_token_came_from_a_refresh"] = refreshed;
+    if (e.tokenCarryPending || e.refreshInFlight || namedReplacedToken) {
+        inc(st.unauthTokenRefresh);
+        const bool afterResult = p ? p->curId != e.id : true;
+        inc(afterResult ? st.unauthTokenRefreshAfterResult : st.unauthTokenRefreshBeforeResult);
+        ev["new_carry_answered_when_the_refusal_arrived"] = afterResult;
+        ev["player_still_on_this_session"] = p != nullptr;
+        finish("during_token_refresh", "unauthorized_during_token_refresh");
         return;
     }
-    Player& p = *it->second;
-    const int64_t cx = world_.grid.chunkX(p.walk.x), cy = world_.grid.chunkY(p.walk.y);
-    if (now - p.carriedSinceNs < static_cast<int64_t>(cfg.firstContactGraceMs) * MS) {
-        // As for a player's own session: the first message makes the server load
-        // the player's permissions, and the messages sent meanwhile are refused.
+
+    // 2. The player has left this session since: its last update crossed the new
+    //    session's carry on the way.
+    if (!p) {
+        inc(st.unauthAfterHandoff);
+        const int64_t leftAt = shared.leftAtNs.load(std::memory_order_relaxed);
+        if (leftAt && shared.leftSession.load(std::memory_order_relaxed) == s.index)
+            ev["sent_ms_before_the_player_left"] = msBetween(leftAt, e.sentNs);
+        finish("after_handoff", "unauthorized_after_handoff");
+        return;
+    }
+    // 3. The session stopped carrying the player after the update was sent (a
+    //    FLEET_RELEASED for a player it held, or the session moved).
+    if (!p->carried || p->curId != e.id) {
+        inc(st.unauthAfterCarryEnded);
+        if (p->carryEndedNs) ev["sent_ms_before_the_carry_ended"] = msBetween(p->carryEndedNs, e.sentNs);
+        finish("after_the_carry_ended", "unauthorized_after_the_carry_ended");
+        return;
+    }
+
+    const int64_t cx = world_.grid.chunkX(p->walk.x), cy = world_.grid.chunkY(p->walk.y);
+    if (e.sentNs - p->carriedSinceNs < static_cast<int64_t>(cfg.firstContactGraceMs) * MS) {
+        // 4. As for a player's own session: the first message makes the server load
+        //    the player's permissions, and the messages sent meanwhile are refused.
         inc(st.unauthFirstContact);
+        finish("first_contact", "unauthorized_first_contact");
         return;
     }
     const bool sameEpisode =
-        p.permReloadNs && now - p.permReloadNs < static_cast<int64_t>(cfg.permReloadGraceMs) * MS;
+        p->permReloadNs && now - p->permReloadNs < static_cast<int64_t>(cfg.permReloadGraceMs) * MS;
     const int64_t r = cfg.permWindowRadiusChunks;
-    if (sameEpisode || std::llabs(cx - p.permCenterX) > r || std::llabs(cy - p.permCenterY) > r) {
-        // The player walked out of the box of chunks its permissions were loaded
-        // for; the server loads the next one (the existing harness's model).
+    if (sameEpisode || std::llabs(cx - p->permCenterX) > r || std::llabs(cy - p->permCenterY) > r) {
+        // 5. The player walked out of the box of chunks its permissions were loaded
+        //    for; the server loads the next one (the existing harness's model).
         inc(st.unauthWindowReload);
+        ev["chunks_from_the_window_centre"] =
+            std::max(std::llabs(cx - p->permCenterX), std::llabs(cy - p->permCenterY));
         if (!sameEpisode) {
-            p.permCenterX = cx;
-            p.permCenterY = cy;
-            p.permReloadNs = now;
+            p->permCenterX = cx;
+            p->permCenterY = cy;
+            p->permReloadNs = now;
         }
+        finish("window_reload", "unauthorized_window_reload");
         return;
     }
+    // 6. None of those: the session carried the player under this id when it sent
+    //    the update, and still does.
     inc(st.unauthUnexplained);
+    finish("unexplained", "unauthorized_unexplained");
     // A steady stream means the realtime servers no longer hold this carry (a
     // lost FLEET_RELEASED, a server that restarted): carry the player again.
     const int limit = std::max(5, static_cast<int>(5 * cfg.updateHz));
-    if (++p.unauthStreak >= limit && !p.carry.active) {
-        p.unauthStreak = 0;
+    if (++p->unauthStreak >= limit && !p->carry.active) {
+        p->unauthStreak = 0;
         inc(st.recarriedAfterUnauthorized);
-        startCarry(s, p, CarryCause::Recarry, now);
+        startCarry(s, *p, CarryCause::Recarry, now);
     }
 }
 

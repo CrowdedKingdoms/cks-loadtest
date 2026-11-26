@@ -27,6 +27,38 @@ int64_t epochMs() {
         .count();
 }
 
+EventLog::EventLog() : startNs_(nowNs()) {}
+
+void EventLog::add(const std::string& kind, nlohmann::json event) {
+    // `t_s` (the caller's) counts from the start of the measured phase and is null
+    // during the setup; `since_start_s` counts from the start of the run.
+    if (event.is_object()) {
+        event["since_start_s"] =
+            std::round(static_cast<double>(nowNs() - startNs_) / 1e6) / 1000.0;
+        auto t = event.find("t_s");
+        if (t != event.end() && t->is_number() && t->get<double>() < 0) *t = nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto& list = events_[kind];
+    if (list.size() < PER_KIND) {
+        list.push_back(std::move(event));
+    } else {
+        ++dropped_[kind];
+    }
+}
+
+nlohmann::json EventLog::toJson() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    nlohmann::json out = nlohmann::json::object();
+    for (const auto& [kind, list] : events_) {
+        const auto dropped = dropped_.find(kind);
+        out[kind] = {{"recorded", list.size()},
+                     {"not_recorded", dropped == dropped_.end() ? 0 : dropped->second},
+                     {"events", list}};
+    }
+    return out;
+}
+
 double Hist::boundUs(int i) { return kFirstBoundUs * std::pow(kRatio, i); }
 
 void Hist::record(int64_t us) {

@@ -84,7 +84,7 @@ void wireChecks() {
                                      "0123456789ABCDEF0123456789ABCDEF", APP, PLAYER_ID, 8,
                                      wire::DecayRate::EXPONENTIAL);
     wire::ActorPose pose;
-    pose.pitch = markerCode(3, 0xBEEF, true);
+    pose.pitch = markerCode(3, 0x2EF, true, 2999);
     pose.yaw = 123456789.0;
     const bool built =
         wire::finalizeActorUpdateFmt(update, wire::PoseFormat::UE5, 1, -2, 0, pose, 4, fleet);
@@ -94,9 +94,9 @@ void wireChecks() {
           "wire: a carried player's update names the player and is signed with the fleet token");
     const auto payload = notificationPayload(view);
     const auto marker = payload ? readMarker(payload->data, payload->len) : std::nullopt;
-    check(marker && marker->session == 3 && marker->runTag == 0xBEEF && marker->sampled &&
-              marker->sendUs == 123456789,
-          "wire: the marker in the update's payload reads back");
+    check(marker && marker->session == 3 && marker->runTag == 0x2EF && marker->sampled &&
+              marker->player == 2999 && marker->sendUs == 123456789,
+          "wire: the marker in the update's payload reads back (sending session, player, time)");
 
     // The contract's golden proof (fleet id 9001, player id 4242, app 7).
     // The contract's two fixture strings, each 64 octets: a 12- or 13-character
@@ -262,8 +262,39 @@ void runChecks() {
         FakeRealtime::Options broken;
         broken.ownStateBug = true;
         const FakeRunResult r = runAgainstFake(cfg, broken, stop, nullptr);
-        check(r.exitCode == 1 && r.summary["own_state"]["received"].get<uint64_t>() > 0,
-              "detect: own state sent back unasked fails the run");
+        const auto& own = r.summary["own_state"];
+        check(r.exitCode == 1 && own["received"].get<uint64_t>() > 0 &&
+                  own["sent_by_the_receiving_session"]["total"] == own["received"],
+              "detect: an update that came back to the session that sent it fails the run");
+    }
+    {
+        // A copy with no HMAC, alone in a datagram, at its sender or at a session
+        // out of range: counted by type, by arrival and by who sent it.
+        FakeRealtime::Options stray;
+        stray.strayUnsignedEvery = 40;
+        const FakeRunResult r = runAgainstFake(cfg, stray, stop, nullptr);
+        const auto& t = r.summary["traffic"];
+        check(t["unsigned_notifications"].get<uint64_t>() == r.fake.at("strayUnsigned") &&
+                  t["unsigned_notifications"].get<uint64_t>() > 0 &&
+                  t["unsigned_notifications_were"]["an_update_the_receiving_session_sent"]
+                          .get<uint64_t>() == r.fake.at("strayUnsignedToSender"),
+              "detect: a notification with no HMAC outside a signed bundle is counted, with who sent it");
+    }
+    {
+        // A token refresh whose new token the realtime side learns late: status 1
+        // is waited out and the carry sent again.
+        FakeRealtime::Options late;
+        late.playerTokenTtlMs = 4000;
+        late.newTokenLagMs = 300;
+        FleetConfig refresh = cfg;
+        refresh.dryRunS = 3.0;
+        refresh.tokenRefreshLeadS = 2;
+        const FakeRunResult r = runAgainstFake(refresh, late, stop, nullptr);
+        const auto& c = r.summary["carries"];
+        check(r.exitCode == 0 && c["retried_after_refresh"].get<uint64_t>() > 0 &&
+                  c["retried_after_refresh"] == c["by_status"]["1_no_live_token"] &&
+                  r.summary["players"]["signed_in_again"].get<uint64_t>() == 0,
+              "refresh: status 1 after a token refresh is sent again, and nobody signs in again");
     }
     {
         // The per-player rule checks, against the stand-in.

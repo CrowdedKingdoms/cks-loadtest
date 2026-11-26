@@ -69,7 +69,7 @@ private:
     void onApiRequest(const ApiRequest& r);
     void setFatal(const std::string& why);
     void admit(int player);
-    void storeToken(int player, const PlayerToken& t);
+    void storeToken(int player, const PlayerToken& t, bool fromRefresh = false);
     void housekeeping();
     void progress(double windowS);
     void buildSummary(int exitCode, const std::vector<std::string>& failures);

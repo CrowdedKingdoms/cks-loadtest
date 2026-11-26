@@ -5,7 +5,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,25 @@ private:
 };
 
 using Counter = std::atomic<uint64_t>;
+
+/// What happened, for the events a counter alone does not explain: a refusal,
+/// a carry answered "no live token", state that came back to its sender, a
+/// notification outside a signed bundle. Each kind keeps its first 200, as JSON
+/// objects, for the summary; the counters keep the totals.
+class EventLog {
+public:
+    static constexpr size_t PER_KIND = 200;
+    EventLog();
+    void add(const std::string& kind, nlohmann::json event);
+    /// {kind: {"recorded": n, "not_recorded": n, "events": [...]}}
+    nlohmann::json toJson() const;
+
+private:
+    mutable std::mutex mu_;
+    int64_t startNs_ = 0;
+    std::map<std::string, std::vector<nlohmann::json>> events_;
+    std::map<std::string, uint64_t> dropped_;
+};
 
 enum class ApiKind : uint8_t {
     OpenFleetSession,
@@ -159,6 +180,14 @@ struct FleetStats {
     std::array<Counter, static_cast<int>(CarryCause::COUNT)> carryCarried{};
     Counter carryDatagrams{0};
     std::array<Counter, 256> carryRefused{};   // by status (1 and up)
+    // Status 1 (no such live token) around a token refresh or a sign-in: the
+    // carry is sent again before it counts as a refusal.
+    Counter carryTookNewerToken{0};             // a waiting or resent carry named a token stored meanwhile
+    Counter carryRetriedAfterRefresh{0};        // all such retries
+    Counter carryRetriedWithNewerToken{0};      // the carry named the token a refresh had replaced
+    Counter carryRetriedAfterWait{0};           // the realtime server did not know the new token yet
+    Counter carryStatus1Refusals{0};            // not explained by a refresh: the player signs in again
+    Hist tokenCarryDelay;                       // from the refresh's answer to the carry with the new token
     Counter carryTimedOut{0};
     Counter carryAbandoned{0};        // the player moved on before the result
     Counter carryRetries{0};          // carries started again after giving up
@@ -183,6 +212,7 @@ struct FleetStats {
     Counter releaseBeforeResult{0};   // it arrived before the new session's result
     Counter releaseMissing{0};        // it had not arrived 5 s after the new session's result
     Counter releaseUnpaired{0};       // the expectation ended with no result to pair with
+    Counter releaseNamedNewerToken{0}; // it named the token id of a carry the player left behind unanswered
     Hist releaseDelay;                // after the new session's result
     Counter releasedUnexpected{0};    // reason 1 for a player the session holds
     Counter releasedAfterLateCarry{0};
@@ -197,9 +227,13 @@ struct FleetStats {
     // Refusals (GENERIC_ERROR_MESSAGE).
     std::array<Counter, 256> errorCodes{};
     Counter playerMessagesRefused{0}; // UNAUTHORIZED answering a message sent for a player
+    Counter unauthTokenRefresh{0};            // the message named the token id a refresh was replacing
+    Counter unauthTokenRefreshBeforeResult{0}; // of those: before the carry with the new token was answered
+    Counter unauthTokenRefreshAfterResult{0};  // of those: after it
     Counter unauthFirstContact{0};
     Counter unauthWindowReload{0};
     Counter unauthAfterHandoff{0};
+    Counter unauthAfterCarryEnded{0};         // sent before a FLEET_RELEASED or a session move ended the carry
     Counter unauthUnexplained{0};
     Counter unauthSessionMessages{0}; // UNAUTHORIZED answering a session's own message
     Counter recarriedAfterUnauthorized{0};
@@ -231,10 +265,56 @@ struct FleetStats {
     Counter deliveryForUncarried{0};
     std::array<Counter, 256> deliveryByType{};
 
-    // Replication latency and own state.
+    // Where each message arrived, by type: as a member of a verified signed
+    // bundle, as a member of a plain bundle, or alone in its datagram. And for the
+    // two last, how it was authenticated.
+    std::array<Counter, 256> rxInSignedBundle{};
+    std::array<Counter, 256> rxInPlainBundle{};
+    std::array<Counter, 256> rxStandalone{};
+    std::array<Counter, 256> rxOutsideOwnHmacOk{};      // its own HMAC verified
+    std::array<Counter, 256> rxOutsideOwnHmacFailed{};  // its own HMAC did not verify
+    std::array<Counter, 256> rxOutsideNoHmac{};         // it carried none
+    Counter plainBundleMembers{0};
+
+    // ACTOR_LEFT (145).
+    std::array<Counter, 256> actorLeftByReason{};
+    Counter actorLeftForCarriedPlayer{0};   // the actor's player was carried by a session at that moment
+    Counter actorLeftForUncarriedPlayer{0};
+    Counter actorLeftUnknownActor{0};       // not one of this run's actors
+
+    // Actor updates that are not this run's.
+    Counter actorUpdatesOtherPayload{0};    // no marker: another payload
+    Counter actorUpdatesOtherRun{0};        // a marker of another run of this tool
+
+    // Replication latency and own state. Every update's marker names the session
+    // that SENT it and the player it is for.
     Counter markersSeen{0};
-    Counter ownStateReceived{0};
+    Counter ownStateReceived{0};            // a session received an update IT sent: must be 0
+    Counter ownSentWhileCarrying{0};        // of those: it still carried the player
+    Counter ownSentAfterPlayerLeft{0};      // of those: the player had crossed to another session
+    Counter ownSentFirstUpdate{0};          // of those: the session's first update after a carry result
+    Counter ownSentUnsigned{0};             // of those: outside a signed bundle, with no HMAC
+    // The first update a session sends for a player after a carry result, as the
+    // sessions that receive it see it.
+    Counter firstUpdatesSent{0};
+    Counter firstUpdatesReceived{0};
+    Counter firstUpdatesReceivedUnsigned{0};
+    // Notifications outside a signed bundle with no HMAC, by what they were.
+    Counter unsignedSentByReceiver{0};      // an update the receiving session sent
+    Counter unsignedSentByAnother{0};       // an update another session of this run sent
+    Counter unsignedFirstUpdate{0};         // an update that was its sender's first after a carry result
+    Counter unsignedNotThisRun{0};          // an update with no marker of this run
+    Counter unsignedOtherType{0};           // not an actor update
+    Counter unsignedOutOfRange{0};          // an update from beyond the replication distance of the
+                                            //   receiving session's whole region
+    Counter updatesOutOfRange{0};           // the same, for every update of this run received
+    Counter actorLeftOutOfRange{0};         // an ACTOR_LEFT from beyond it
+    Hist ownSentAge;                        // how old those updates were when they came back
+    Counter otherSentBeforeHandoff{0};      // sent by ANOTHER session before the receiver's carry result
+    Hist handoffLead;                       // how long before the receiver's carry result they were sent
+    Counter otherSentAfterCarry{0};         // sent by another session AFTER the receiver's carry result
     Hist replicationLatency;
+    EventLog events;
 
     // The generator itself.
     Hist sendLag;

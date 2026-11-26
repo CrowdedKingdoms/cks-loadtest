@@ -64,6 +64,29 @@ private:
     std::atomic<int64_t> expiresAtMs_{0};
 };
 
+/// What two threads know about a player beside its credentials: who carries it
+/// and since when (written by the worker that carries it), and when its token
+/// last changed (written by the API thread that changed it). All atomics.
+struct PlayerShared {
+    std::atomic<int32_t> holder{-1};           // the session that carries the player, -1 for none
+    std::atomic<int64_t> carriedAtNs{0};       // when that session's carry result arrived
+    std::atomic<int32_t> leftSession{-1};      // the session it last left at a crossing
+    std::atomic<int64_t> leftAtNs{0};          // and when
+    std::atomic<int64_t> tokenStoredAtNs{0};   // when the API's answer with its current token was stored
+    std::atomic<int64_t> refreshStartedAtNs{0}; // when a refreshAppToken for it was sent; 0 when none is in flight
+    std::atomic<bool> tokenRefreshed{false};   // its current token came from a refresh (and not a sign-in)
+    std::atomic<uint64_t> carriedBy[4] = {};   // the sessions that have carried it (session mod 256)
+
+    void noteCarriedBy(int session) {
+        carriedBy[(session >> 6) & 3].fetch_or(uint64_t{1} << (session & 63),
+                                               std::memory_order_relaxed);
+    }
+    bool wasCarriedBy(int session) const {
+        return (carriedBy[(session >> 6) & 3].load(std::memory_order_relaxed) >>
+                (session & 63)) & 1;
+    }
+};
+
 /// What a worker asks the API threads for.
 struct ApiRequest {
     enum class Kind : uint8_t { MoveSession, SignInAgain } kind = Kind::MoveSession;
@@ -85,6 +108,9 @@ struct World {
     Grid grid;
     int workers;
     std::vector<SharedCreds> creds;          // by player
+    std::vector<PlayerShared> shared;        // by player
+    std::unordered_map<std::string, int> playerOfActor; // actor UUID -> player; read-only after start
+    std::atomic<int64_t> windowStartNs{0};   // when the measured phase opened (0 before)
     std::atomic<double> speed{0.0};          // chunks a second
     std::atomic<bool> moving{true};          // false while the run drains
     uint16_t runTag;                         // marks this run's actor updates
@@ -99,6 +125,12 @@ struct World {
     }
     /// The player's actor UUID: 32 hex characters, the same in every run.
     void actorUuid(int player, char* out32) const;
+    /// Seconds since the measured phase opened, for an event's `t_s`. Negative
+    /// during the setup.
+    double phaseSeconds(int64_t now) const {
+        const int64_t start = windowStartNs.load(std::memory_order_relaxed);
+        return start ? static_cast<double>(now - start) * 1e-9 : -1.0;
+    }
 };
 
 class FleetWorker {
@@ -183,6 +215,11 @@ private:
         int64_t retryAtNs = 0;       // start a carry again at this time
         CarryCause retryCause = CarryCause::Join;
         int64_t lastCarryMs = 0;     // the time in its last FLEET_CARRY: the next is later
+        int64_t lastCarryResultNs = 0; // the last FLEET_CARRY_RESULT status 0 here, a token carry's too
+        int64_t carryEndedNs = 0;    // when a FLEET_RELEASED ended its carry here
+        CarryCause carriedCause = CarryCause::Join; // what the last carry result here was for
+        bool firstUpdateDue = false; // the next update is the first after a carry result
+        int status1Retries = 0;      // status 1 answers in a row that were sent again
         bool waitToken = false;      // waiting for the API threads to store a new token
         uint32_t waitVersion = 0;
         int64_t waitSinceNs = 0;
@@ -214,6 +251,8 @@ private:
         int64_t departNs = 0;
         int64_t resultNs = 0;        // when the new session's carry result arrived
         int64_t releasedNs = 0;      // when FLEET_RELEASED reason 1 arrived here
+        int64_t altId = 0;           // the id of a carry the player left behind unanswered (a token
+                                     //   carry): the server may name either id in its release
         bool late = false;           // made by a carry result that arrived after the player left
         bool releasedFirst = false;  // this session sent FLEET_RELEASE itself: no reason 1 is due
     };
@@ -223,7 +262,14 @@ private:
         int64_t id = 0;
         int64_t sentNs = 0;
         SendKind kind = SendKind::None;
+        uint8_t type = 0;            // the message type that was sent
+        int player = -1;             // the player it was for, -1 for the session's own
+        bool tokenCarryPending = false; // a carry with a refreshed token was unanswered when it was sent
+        bool refreshInFlight = false;   // a refreshAppToken for the player was unanswered when it was sent
     };
+
+    /// Where a message arrived.
+    enum class Where : uint8_t { SignedBundle, PlainBundle, Standalone };
 
     struct Session {
         enum class State : uint8_t { Unopened, Active, Moving } state = State::Unopened;
@@ -261,7 +307,12 @@ private:
         int sendErrStreak = 0;
         std::vector<std::unique_ptr<Player>> players;
         std::unordered_map<int64_t, Player*> byId;
+        std::unordered_map<int, Player*> byIndex;       // every player it holds, carried or not yet
         std::unordered_map<int64_t, Departed> departed;
+        std::unordered_map<int64_t, int64_t> departedAlias; // a left-behind carry's id -> the entry's key
+        int64_t firstCapsNs = 0;     // the first capabilities of this assignment
+        int64_t lastCarriedNs = 0;   // the last FLEET_CARRY_RESULT status 0, any player
+        int64_t lastReleasedNs = 0;  // the last FLEET_RELEASED, any player
         SeqEntry ring[256];
         SessionIo* io = nullptr;
     };
@@ -291,7 +342,8 @@ private:
     void sweep(int64_t now);
     void drainSocket(Session& s);
 
-    bool sendOn(Session& s, const uint8_t* buf, size_t len, SendKind kind, int64_t id, int64_t now);
+    bool sendOn(Session& s, const uint8_t* buf, size_t len, SendKind kind, int64_t id, int64_t now,
+                const Player* forPlayer = nullptr);
     void sendCapabilities(Session& s, int64_t now);
     void sendHeartbeat(Session& s, int64_t now);
     void sendCarry(Session& s, Player& p, int64_t now);
@@ -310,13 +362,21 @@ private:
     void requestApi(const ApiRequest& r);
 
     void handleDatagram(Session& s, const uint8_t* data, size_t len, int64_t now);
-    void handleMessage(Session& s, const wire::InboundView& m, bool trusted, int64_t now);
+    void handleMessage(Session& s, const wire::InboundView& m, Where where, int64_t now);
+    void countControl(uint8_t type, bool verified);
+    nlohmann::json* bundleMembers_ = nullptr; // the plain bundle being read, for its event
+    void onActorLeft(Session& s, const wire::InboundView& m, Where where, int64_t now);
+    void noteOutsideSignedBundle(Session& s, const wire::InboundView& m, Where where,
+                                 const char* ownHmac, int64_t now);
+    std::unordered_map<int64_t, Departed>::iterator findDeparted(Session& s, int64_t id,
+                                                                  bool* byAlias = nullptr);
+    void eraseDeparted(Session& s, std::unordered_map<int64_t, Departed>::iterator it);
     void plainCommunication(Session& s, uint8_t type);
     void noteSessionError(Session& s, int64_t now);
     void onCarryResult(Session& s, const CarryResult& r, int64_t now);
     void onReleased(Session& s, const Released& r, int64_t now);
     void onError(Session& s, const wire::InboundView& m, int64_t now);
-    void onActorNotification(Session& s, const wire::InboundView& m, int64_t now);
+    void onActorNotification(Session& s, const wire::InboundView& m, Where where, int64_t now);
     void onCrossingDone(Session& s, int64_t playerId, uint32_t crossingSeq, int64_t resultNs);
     void pairRelease(Session& s, std::unordered_map<int64_t, Departed>::iterator it);
 
