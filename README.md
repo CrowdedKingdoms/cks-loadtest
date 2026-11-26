@@ -562,6 +562,28 @@ loopback without `LT_CONTROL_TOKEN` is a refusal at startup.
 - Exit code 3 means the RX health check tripped: traffic was sent but nothing
   was received (bad address, UDP blocked, or sessions never installed).
 
+## Fleet sessions: `ck-fleet-load`
+
+A fleet session is one realtime session that an organization's game server opens for
+itself, in which it carries its players. `ck-fleet-load` is a second binary in this
+repository that simulates such servers: 100 sessions carrying 3,000 players who cross
+between servers about 75 times a second, by default. A run shows whether any crossing
+lost a player and how many Application API calls the crossings caused, which should be
+none. Fleet sessions are in development and run on the dev tier only.
+
+```bash
+./build/ck-fleet-load --self-test   # built-in checks, no network
+./build/ck-fleet-load --dry-run     # the full population against a stand-in, no network
+```
+
+`--rules-check` checks the per-player rules on carried players (a block, a player
+under 18's voice, the idle release, another player's actor), and `--delete-players`
+removes the players the client made.
+
+[docs/FLEET-LOAD.md](docs/FLEET-LOAD.md) says what a run proves, how to run one
+against a tier and what it needs set up first, what it leaves behind, what each number
+in the summary means, and when a run passes.
+
 ## Scope
 
 The tool exercises the public GraphQL APIs and the public UDP wire protocol —
@@ -584,7 +606,24 @@ src/
   Harness.*           long-lived generator: hot-add, rungs, workers
   ControlServer.*     HTTP JSON control port
   ctl.cpp             cks-loadtest-ctl (status/add/wait/rung/aggregate)
-tests/                wire, config, stats merge, hot-add, HTTP control
+  fleet/              ck-fleet-load, the fleet session load client
+    main.cpp          options, signals, live run or dry run
+    FleetConfig.*     the options
+    FleetWire.hpp     FLEET_CARRY / FLEET_RELEASE builders, 51/52/53 parsers, the marker
+    Grid.hpp          the region grid, the walk, crossing detection
+    CrossRate.hpp     the speed for a crossing rate, and its controller
+    FleetApi.*        the Application API calls, counted by kind and cause
+    Roster.*          the player-token roster file (mode 0600)
+    FleetWorker.*     worker threads: sessions, carries, crossings, epoll RX + tick TX
+    FleetRun.*        one run: setup, measured window, teardown, summary, exit code
+    FleetStats.*      counters and latency histograms
+    FakeRealtime.*    the in-process stand-in behind --dry-run, --self-test and the tests
+    DryRun.*          a run against the stand-in
+    Modes.*           --delete-players
+    RulesCheck.cpp    --rules-check: the per-player rules on carried players
+    SelfTest.cpp      --self-test
+tests/                wire, config, stats merge, hot-add, HTTP control; fleet_* for ck-fleet-load
+docs/FLEET-LOAD.md    ck-fleet-load: what it proves, how to run it, the summary
 ```
 
 ## Versioning

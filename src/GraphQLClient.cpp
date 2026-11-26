@@ -83,6 +83,7 @@ nlohmann::json GraphQLClient::request(const std::string& query,
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
 
+    ++requestCount_;
     CURLcode rc = curl_easy_perform(curl);
     long httpCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
@@ -108,10 +109,17 @@ nlohmann::json GraphQLClient::request(const std::string& query,
         const auto& first = parsed["errors"][0];
         std::string message = first.value("message", "unknown GraphQL error");
         std::string code;
+        int retryAfterMs = -1;
         if (first.contains("extensions") && first["extensions"].is_object()) {
-            code = first["extensions"].value("code", "");
+            const auto& ext = first["extensions"];
+            if (ext.contains("code") && ext["code"].is_string()) {
+                code = ext["code"].get<std::string>();
+            }
+            if (ext.contains("retryAfterMs") && ext["retryAfterMs"].is_number()) {
+                retryAfterMs = static_cast<int>(ext["retryAfterMs"].get<double>());
+            }
         }
-        throw GraphQLError(message, code, false);
+        throw GraphQLError(message, code, false, retryAfterMs);
     }
     if (httpCode < 200 || httpCode >= 300) {
         throw GraphQLError("HTTP " + std::to_string(httpCode) + " from " + url_ +
