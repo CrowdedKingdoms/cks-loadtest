@@ -172,7 +172,7 @@ stopped; `count` again says what is left.
   v2.88.0, ck-exec 0.24.0) the same run passed with nothing changed by hand, and a sign-in at every crossing held
   3,012 players once the server waited as CK said.
 - **A crowd in the middle of one cell holds to about 100**: a server ran 20 ticks a second with 105 players in an
-  80-block square and 3.4 with 135, and then the whole mesh joined again. Stop the bots before the next run: their
+  80-block square, 12.3 with 118 and 3.4 with 135, and then the whole mesh joined again. Stop the bots before the next run: their
   records all name that server, and the next ramp's first players are all sent there.
 - Start a sampling loop as its own background command. One started inside a command that ends is killed with it.
 - The bots fly above the clouds and cannot be hurt (`loadAccounts` in the server's config): the run measures servers
