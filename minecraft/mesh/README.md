@@ -4,13 +4,15 @@ The tools that put 3,009 players in one survival world on 2026-11-25: a grid of 
 `cks-minecraft-mod`), each running its own chunks, with the C++ load client's bots wandering across all of them and
 real game clients among them. What the mod had to change, and what was measured, is in the mod's
 `docs/seamless-handoff.md`, "A hundred servers, 3,000 players"; the platform team's handoff of that date has the
-rest of the record.
+rest of the record. The same mesh ran again that evening on dev's fixes (the mod's "The mesh again, on CK's fixes"),
+which added the wall of game windows, the sign-in totals in `watch` and `managed_players.py`.
 
 | File | What it does |
 | --- | --- |
 | `mesh.py` | Plans a grid, builds the payload, brings servers up (locally or on VMs over Tailscale SSH), reads every server's meter, adds bots through the generators |
 | `scenario.py` | Plays one of the mod's two-server scenarios on a pair of a running mesh's servers |
-| `meshcam/` | A Fabric client mod and launcher that film a crowd from a real game client with nobody at the keyboard |
+| `meshcam/` | A Fabric client mod and launcher that film a crowd from a real game client with nobody at the keyboard; `wall.py` places several of them side by side and records the screen |
+| `managed_players.py` | Counts or deletes the organization's managed players made in a time range (what a run of new players leaves behind) |
 | `../loadgen-fleet.mjs` | Creates and deletes the VMs (OVH) and keeps the state file that the teardown needs |
 | `../cpp/` | `ck-mc-load`, the load client (`CK-MC-LOAD.md` there) |
 | `sky-2026-11-24/` | The scripts of the run before this one, kept for the record |
@@ -42,6 +44,7 @@ python3 minecraft/mesh/mesh.py pregen --run $RUN          # once: every server m
 
 # 4. The load client on the generators, then the bots. --wave is per generator: 12 generators x 5 every 5 s is
 #    12 logins a second, which CK's dev tier took; 12 x 60 every 5 s is 144 a second, which it did not.
+#    The rate asked is a ceiling: --wave 20 on 12 generators asks 48 a second and made 38, --wave 30 asks 72 and made 59.
 python3 minecraft/mesh/mesh.py gen-install --run $RUN
 python3 minecraft/mesh/mesh.py bots --run $RUN --count 3012 --wave 5 --wave-seconds 5 --roam --start
 
@@ -65,6 +68,12 @@ and keeps it across later `up`s.
 `watch` reads the server mod's meter (`-Dcrowdedkingdoms.server.meter=true`, which `payload` sets): ticks a second and
 the whole tick's time, from the start of a server tick to the end of the mod's end-of-tick work. The game's own tick
 time ends before Fabric's end-of-tick handlers, so it leaves out most of what the mod does; do not use it.
+
+`watch` ends with two lines of sums. The second is the servers' sign-ins to CK since each started (the mod's
+`signin[...]` on the meter line, from the build that waits and resends): sent, let in, told to wait
+(`PLATFORM_BUSY`), let in after a wait, given up on, sessions that did not open, and the least and most
+`retryAfterMs` CK named. They are totals, so a step's numbers are the difference of two readings; a server that
+restarts starts again from zero. `--json` rows carry the same under `signin`.
 
 `botctl --sum stats` adds up the generators. `play` counts clients in the play state; `closed` are bots the servers
 refused at login (they are not retried); `rejoins` counts bots that lost their connection and joined again;
@@ -120,12 +129,51 @@ ffmpeg -framerate 20 -i <game folder>/meshcam/flyover/%05d.png -c:v libx264 -pix
 Frames are written once a game tick, so the movie is 20 frames a second whatever the game's frame rate; the frame
 rate is in `stats.csv` and on the F3 overlay in the frames.
 
+With the screen unlocked, `meshcam/wall.py` films several clients at once at the screen's own rate. It needs the
+Mac's Accessibility and Screen Recording permissions for the program that runs it, and `ffmpeg`.
+
+```
+python3 minecraft/mesh/meshcam/wall.py place  --names Cam1,Cam2,Cam3,Cam4      # a 2 by 2 wall of 1920x1080 windows, centred
+python3 minecraft/mesh/meshcam/wall.py record --names Cam1,Cam2,Cam3,Cam4 --seconds 120 --out <take>
+python3 minecraft/mesh/meshcam/wall.py split  <take>                           # one movie a window, cut from the take
+```
+
+`record` brings each window to the front first (anything over a game window is in the movie), captures the screen at
+60 frames a second cropped to the wall (the hardware H.264 encoder refuses a frame 5,120 wide) and writes
+`<take>.mp4` and `<take>.json` (when it began, UTC, and where each window is). `window.swift` moves and raises the
+windows through Accessibility; it is compiled on first use into `meshcam/build/`. Each client still plays its own
+`control.txt`, so a take is scripted the same way: `fly`, `walk`, `turn`, `hold tab`, `cmd tp @s ...`, `respawn`.
+Four clients at 1920 by 1080 on a Mac Studio ran at 118 to 120 frames a second each while recording. Things that
+spoiled takes: dusk (a day is 20 minutes; `time set` first), a survival camera drowned where its record left it
+(`respawn`, then `cmd tp`), and a walker that drifted off its path (`cmd tp` back to the middle before each walk).
+
+## Players a run made
+
+A run that signs in players CK has never seen (a fresh `CROWDY_ID_PEPPER`) leaves them in the organization. Note the
+time before the first joins, then:
+
+```
+python3 minecraft/mesh/managed_players.py count  --secrets-env <file> --org <organization id> --since <ISO time> [--until <ISO time>]
+python3 minecraft/mesh/managed_players.py delete --secrets-env <file> --org <organization id> --since <ISO time> --until <ISO time> --rate 10 --yes
+```
+
+It lists the organization's players with the org token (`players:manage`), keeps those made in the range and deletes
+them one call each, waiting when CK says it is busy. On dev that went at about 3 a second whatever `--rate` asked,
+so 3,000 players take a quarter of an hour. It prints its progress every 200 and its count when it ends or is
+stopped; `count` again says what is left.
+
 ## Limits found
 
 - About 30 to 45 wandering players a server (c3-8) keeps every server at 20 ticks a second. **A crowd called to a
   corner where four servers meet does not hold**: with 72 to 111 players on each of the four, two fell to 7 and 11
   ticks a second, their players timed out and joined again, and the burst of sign-ins slowed CK for everyone.
 - CK's dev tier took 12 sign-ins a second. Its service that runs hubs needed two settings changed to carry 3,000
-  players' hubs (the platform team's handoff of 2026-11-25 has them).
+  players' hubs (the platform team's handoff of 2026-11-25 has them). On dev's next versions (Application API
+  v2.88.0, ck-exec 0.24.0) the same run passed with nothing changed by hand, and a sign-in at every crossing held
+  3,012 players once the server waited as CK said.
+- **A crowd in the middle of one cell holds to about 100**: a server ran 20 ticks a second with 105 players in an
+  80-block square and 3.4 with 135, and then the whole mesh joined again. Stop the bots before the next run: their
+  records all name that server, and the next ramp's first players are all sent there.
+- Start a sampling loop as its own background command. One started inside a command that ends is killed with it.
 - The bots fly above the clouds and cannot be hurt (`loadAccounts` in the server's config): the run measures servers
   with mob spawning on, not players fighting mobs.
