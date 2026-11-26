@@ -20,6 +20,8 @@ load is not restarted for a test. With --pair, a scenario whose .args set identi
 
 --pair is one rebuilt pair, not a mesh. The json names dir, log and steps, and each server's id, ssh, host and port.
 The client joins that port. The 25599 in a step only chooses the west side. Do not commit the json: it holds addresses.
+The seam pair is not on Tailscale, so --pair connects with ordinary ssh (CK_SSH_KEY, or the cluster key if that file exists).
+A mesh --run still uses tailscale ssh.
 
 A wait a server's script gave up on ("not met after") is a miss; the scenario passes with none, both sides done.
 Prints one JSON line and exits 0 on a pass.
@@ -38,10 +40,23 @@ REMOTE_DIR = "/opt/mc-mesh"
 REMOTE_LOG = "/opt/mc-mesh/server.log"
 REMOTE_STEPS = "/opt/mc-mesh/steps.txt"
 UNSUPPORTED = ("start", "stop", "append", "admin")
+PAIR = False
 
 
 def ssh(server, command, timeout=60, input=None):
-    result = subprocess.run(["tailscale", "ssh", f"ubuntu@{server['ssh']}", command], capture_output=True, text=True, timeout=timeout, input=input)
+    # Mesh hosts are on Tailscale. The seam pair is not, so --pair uses ordinary ssh to the address the caller put in the json.
+    if PAIR:
+        key = os.environ.get("CK_SSH_KEY")
+        if not key:
+            fallback = Path.home() / ".local/state/cks-test-mc-cluster/id_ed25519"
+            key = str(fallback) if fallback.is_file() else None
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"]
+        if key:
+            argv += ["-i", key]
+        argv += [f"ubuntu@{server.get('ssh') or server.get('host')}", command]
+    else:
+        argv = ["tailscale", "ssh", f"ubuntu@{server['ssh']}", command]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input)
     if result.returncode != 0:
         raise RuntimeError(f"{server['id']}: {result.stderr.strip()[-300:] or result.stdout.strip()[-300:]}")
     return result.stdout
@@ -170,8 +185,9 @@ def main():
     if not args.run and not args.pair:
         p.error("name a mesh --run or a seam --pair")
 
-    global REMOTE_DIR, REMOTE_LOG, REMOTE_STEPS
+    global REMOTE_DIR, REMOTE_LOG, REMOTE_STEPS, PAIR
     if args.pair:
+        PAIR = True
         pair = json.loads(Path(args.pair).read_text())
         REMOTE_DIR = pair.get("dir", "/opt/mc")
         REMOTE_LOG = pair.get("log", f"{REMOTE_DIR}/logs/latest.log")
