@@ -256,7 +256,7 @@ void testCloseAndRefreshSession() {
         return a;
     });
     const FleetSessionInfo s = rig.api->refreshFleetSession(
-        7000000001LL, ServerAddr{"203.0.113.9", 7777}, ApiCause::SessionMove);
+        7000000001LL, ServerAddr{"203.0.113.9", 7777}, ApiCause::MoveErrorStreak);
     const Sent& r = rig.sent.at(1);
     check(r.query.find("mutation($i: RefreshFleetSessionInput!)") != std::string::npos &&
               r.query.find("refreshFleetSession(input: $i) { token gameTokenId expiresAt server { ip4 "
@@ -273,16 +273,18 @@ void testCloseAndRefreshSession() {
     check(s.server.ip4 == "203.0.113.20" && s.server.port == 7780 && s.token == kSessionKey &&
               s.gameTokenId == 7000000001LL,
           "refresh session: the server to reconnect to, with the same token and id");
-    check(rig.calls(ApiKind::RefreshFleetSession, ApiCause::SessionMove) == 1,
-          "refresh session: counted as refreshFleetSession for a session move");
+    check(rig.calls(ApiKind::RefreshFleetSession, ApiCause::MoveErrorStreak) == 1,
+          "refresh session: counted as refreshFleetSession for the errors that made the session ask");
 
     // After a realtime server told the session to move, currentServer is left
     // out, and the API names a new server.
     rig.transport->script.push_back([] { return sessionAnswer("refreshFleetSession"); });
-    rig.api->refreshFleetSession(7000000001LL, ServerAddr{}, ApiCause::SessionMove);
+    rig.api->refreshFleetSession(7000000001LL, ServerAddr{}, ApiCause::MoveReconnectCommand);
     check(rig.sent.at(2).variables ==
               nlohmann::json({{"i", {{"appId", "7"}, {"gameTokenId", "7000000001"}}}}),
           "refresh session: told to move, the input leaves currentServer out");
+    check(rig.calls(ApiKind::RefreshFleetSession, ApiCause::MoveReconnectCommand) == 1,
+          "refresh session: counted apart, as a move a realtime server asked for");
     check(rig.sent.at(0).bearer == kOrgBearer && rig.sent.at(1).bearer == kOrgBearer &&
               rig.sent.at(2).bearer == kOrgBearer,
           "refresh session: one org token opens, refreshes and closes");
@@ -395,6 +397,66 @@ void testCountingAndCrossingGuard() {
               guarded.counters.byCause(ApiCause::Setup) == 0 &&
               guarded.counters.requestsFromCrossingPath == 1,
           "guard: an API call from a crossing is counted as caused by a crossing");
+}
+
+void testMeasuredPhaseClasses() {
+    // What made a session go back to the API decides what its refreshFleetSession
+    // is counted as: a realtime server's word, or the session's own conclusion.
+    check(moveCause(MoveTrigger::ReconnectCommand) == ApiCause::MoveReconnectCommand &&
+              moveCause(MoveTrigger::SessionReleased) == ApiCause::MoveSessionReleased &&
+              moveCause(MoveTrigger::RxSilence) == ApiCause::MoveRxSilence &&
+              moveCause(MoveTrigger::SendErrors) == ApiCause::MoveSendErrors &&
+              moveCause(MoveTrigger::ErrorStreak) == ApiCause::MoveErrorStreak,
+          "classes: each trigger of a move has its own cause");
+    int due = 0, asked = 0, other = 0;
+    for (int c = 0; c < ApiCounters::C; ++c) {
+        switch (apiCallClass(static_cast<ApiCause>(c))) {
+            case ApiCallClass::RefreshDue: ++due; break;
+            case ApiCallClass::AskedByServer: ++asked; break;
+            case ApiCallClass::Other: ++other; break;
+        }
+    }
+    check(due == 2 && apiCallClass(ApiCause::TokenRefresh) == ApiCallClass::RefreshDue &&
+              apiCallClass(ApiCause::SessionKeep) == ApiCallClass::RefreshDue,
+          "classes: a token refresh and a session keep are the refreshes that fall due, and nothing else is");
+    check(asked == 3 && apiCallClass(ApiCause::MoveReconnectCommand) == ApiCallClass::AskedByServer &&
+              apiCallClass(ApiCause::MoveSessionReleased) == ApiCallClass::AskedByServer &&
+              apiCallClass(ApiCause::MoveRxSilence) == ApiCallClass::AskedByServer,
+          "classes: a reconnect command, a release and silence are a realtime server asking, and nothing else is");
+    check(other == ApiCounters::C - 5 && apiCallClass(ApiCause::MoveSendErrors) == ApiCallClass::Other &&
+              apiCallClass(ApiCause::MoveErrorStreak) == ApiCallClass::Other &&
+              apiCallClass(ApiCause::SignInAgain) == ApiCallClass::Other &&
+              apiCallClass(ApiCause::Crossing) == ApiCallClass::Other &&
+              apiCallClass(ApiCause::Setup) == ApiCallClass::Other,
+          "classes: every other cause, a session's own move included, is anything else");
+
+    // Counted while the measured window is open, each class apart.
+    ApiCounters counters;
+    counters.count(ApiKind::RefreshFleetSession, ApiCause::MoveReconnectCommand); // before the window
+    counters.windowOpen = true;
+    for (int i = 0; i < 24; ++i) counters.count(ApiKind::RefreshFleetSession, ApiCause::MoveReconnectCommand);
+    counters.count(ApiKind::RefreshFleetSession, ApiCause::MoveSessionReleased);
+    counters.count(ApiKind::RefreshFleetSession, ApiCause::MoveRxSilence);
+    for (int i = 0; i < 7; ++i) counters.count(ApiKind::RefreshAppToken, ApiCause::TokenRefresh);
+    counters.count(ApiKind::RefreshFleetSession, ApiCause::SessionKeep);
+    MeasuredPhaseCalls m = measuredPhaseCalls(counters);
+    check(m.total == 34 && m.refreshesDue == 8 && m.askedByServer == 26 && m.other == 0,
+          "classes: a drain's refreshes are counted apart from the due ones, and nothing is left over");
+    counters.count(ApiKind::RefreshFleetSession, ApiCause::MoveErrorStreak);
+    counters.count(ApiKind::RefreshFleetSession, ApiCause::MoveSendErrors);
+    counters.count(ApiKind::MintManagedPlayerToken, ApiCause::SignInAgain);
+    counters.windowOpen = false;
+    counters.count(ApiKind::CloseFleetSession, ApiCause::Teardown); // after the window
+    m = measuredPhaseCalls(counters);
+    check(m.total == 37 && m.refreshesDue == 8 && m.askedByServer == 26 && m.other == 3 &&
+              m.total == m.refreshesDue + m.askedByServer + m.other,
+          "classes: a session's own move and a sign-in again are the rest, and the three add up");
+    check(std::string(apiCauseName(ApiCause::MoveReconnectCommand)) == "session_move_reconnect_command" &&
+              std::string(apiCauseName(ApiCause::MoveSessionReleased)) == "session_move_session_released" &&
+              std::string(apiCauseName(ApiCause::MoveRxSilence)) == "session_move_rx_silence" &&
+              std::string(apiCauseName(ApiCause::MoveSendErrors)) == "session_move_send_errors" &&
+              std::string(apiCauseName(ApiCause::MoveErrorStreak)) == "session_move_error_streak",
+          "classes: the summary names each cause after its trigger");
 }
 
 void testOrgTokenNeverLeaks() {
@@ -558,6 +620,7 @@ int main() {
     testDeleteAndBlock();
     testRefreshAppToken();
     testCountingAndCrossingGuard();
+    testMeasuredPhaseClasses();
     testOrgTokenNeverLeaks();
     testGraphQLErrorCarriesRetryAfter();
     testRoster();

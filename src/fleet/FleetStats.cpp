@@ -135,7 +135,11 @@ const char* apiCauseName(ApiCause c) {
     switch (c) {
         case ApiCause::Setup: return "setup";
         case ApiCause::Teardown: return "teardown";
-        case ApiCause::SessionMove: return "session_move";
+        case ApiCause::MoveReconnectCommand: return "session_move_reconnect_command";
+        case ApiCause::MoveSessionReleased: return "session_move_session_released";
+        case ApiCause::MoveRxSilence: return "session_move_rx_silence";
+        case ApiCause::MoveSendErrors: return "session_move_send_errors";
+        case ApiCause::MoveErrorStreak: return "session_move_error_streak";
         case ApiCause::SessionKeep: return "session_keep";
         case ApiCause::TokenRefresh: return "token_refresh";
         case ApiCause::SignInAgain: return "sign_in_again";
@@ -143,6 +147,44 @@ const char* apiCauseName(ApiCause c) {
         case ApiCause::Cleanup: return "cleanup";
         case ApiCause::RulesCheck: return "rules_check";
         default: return "unknown";
+    }
+}
+
+ApiCallClass apiCallClass(ApiCause c) {
+    switch (c) {
+        case ApiCause::TokenRefresh:
+        case ApiCause::SessionKeep:
+            return ApiCallClass::RefreshDue;
+        case ApiCause::MoveReconnectCommand:
+        case ApiCause::MoveSessionReleased:
+        case ApiCause::MoveRxSilence:
+            return ApiCallClass::AskedByServer;
+        default:
+            return ApiCallClass::Other;
+    }
+}
+
+MeasuredPhaseCalls measuredPhaseCalls(const ApiCounters& api) {
+    MeasuredPhaseCalls m;
+    for (int c = 0; c < ApiCounters::C; ++c) {
+        const uint64_t n = api.duringWindowByCause[static_cast<size_t>(c)].load(std::memory_order_relaxed);
+        m.total += n;
+        switch (apiCallClass(static_cast<ApiCause>(c))) {
+            case ApiCallClass::RefreshDue: m.refreshesDue += n; break;
+            case ApiCallClass::AskedByServer: m.askedByServer += n; break;
+            case ApiCallClass::Other: m.other += n; break;
+        }
+    }
+    return m;
+}
+
+ApiCause moveCause(MoveTrigger t) {
+    switch (t) {
+        case MoveTrigger::ReconnectCommand: return ApiCause::MoveReconnectCommand;
+        case MoveTrigger::SessionReleased: return ApiCause::MoveSessionReleased;
+        case MoveTrigger::RxSilence: return ApiCause::MoveRxSilence;
+        case MoveTrigger::SendErrors: return ApiCause::MoveSendErrors;
+        default: return ApiCause::MoveErrorStreak;
     }
 }
 

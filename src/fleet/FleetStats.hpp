@@ -77,10 +77,22 @@ enum class ApiKind : uint8_t {
 };
 /// Why an API call was made. `Crossing` exists so the summary can state its
 /// count; nothing in the client makes a call with it.
+///
+/// A session that goes back to the API (refreshFleetSession) has one cause for
+/// each MoveTrigger, in two groups. A realtime server asked for the first three:
+/// it sent a reconnect command (a server that leaves the fleet sends one to each
+/// of its sessions), it released the session with a reason, or it went silent
+/// for --rx-silent-s. The session then does what the contract says, and the call
+/// does not fail a run. The other two are the session's own conclusion from
+/// errors, and they do.
 enum class ApiCause : uint8_t {
     Setup,          // opening the sessions and signing the players in
     Teardown,       // closing the sessions
-    SessionMove,    // a realtime server told a session to move
+    MoveReconnectCommand, // a realtime server sent the session a reconnect command
+    MoveSessionReleased,  // a realtime server released the session, with a reason
+    MoveRxSilence,        // nothing arrived from the realtime server for --rx-silent-s
+    MoveSendErrors,       // the session's sends were refused (the server's port answers nothing)
+    MoveErrorStreak,      // a run of errors that refuse the session itself
     SessionKeep,    // a session's token neared its expiry
     TokenRefresh,   // a player's app token neared its expiry
     SignInAgain,    // a player's sign-in ended and the player was signed in again
@@ -91,6 +103,14 @@ enum class ApiCause : uint8_t {
 };
 const char* apiKindName(ApiKind k);
 const char* apiCauseName(ApiCause c);
+
+/// What a call in the measured phase is judged as. A run fails on `Other` only.
+enum class ApiCallClass : uint8_t {
+    RefreshDue,     // a player's app token or a session's 24 hours neared its expiry
+    AskedByServer,  // a realtime server asked the session to move, and it refreshed
+    Other,          // anything else
+};
+ApiCallClass apiCallClass(ApiCause c);
 
 /// Why a carry was started.
 enum class CarryCause : uint8_t {
@@ -114,6 +134,8 @@ enum class MoveTrigger : uint8_t {
     COUNT
 };
 const char* moveTriggerName(MoveTrigger t);
+/// The cause of the refreshFleetSession a move makes.
+ApiCause moveCause(MoveTrigger t);
 
 struct SessionIo {
     Counter txBytes{0};
@@ -150,6 +172,16 @@ struct ApiCounters {
     uint64_t total() const;
     void count(ApiKind k, ApiCause c);
 };
+
+/// The calls made while the measured window was open, in the three classes a run
+/// is judged by: `total` is their sum, and a run fails when `other` is not 0.
+struct MeasuredPhaseCalls {
+    uint64_t total = 0;
+    uint64_t refreshesDue = 0;   // a player's app token, a session's 24 hours
+    uint64_t askedByServer = 0;  // a realtime server asked a session to move
+    uint64_t other = 0;          // anything else
+};
+MeasuredPhaseCalls measuredPhaseCalls(const ApiCounters& api);
 
 struct FleetStats {
     explicit FleetStats(int sessions);

@@ -494,6 +494,16 @@ void FakeRealtime::sendLegacyReconnect(int ordinal) {
     sendRaw(*s, frame, sizeof(frame));
 }
 
+void FakeRealtime::goSilent(int ordinal) {
+    std::lock_guard<std::mutex> lock(mu_);
+    Session* s = byOrdinal(ordinal);
+    if (!s) return;
+    // Gone without a command: nothing more is sent, and its carries went with it.
+    flush(*s);
+    s->moved = true;
+    dropCarriesOf(*s);
+}
+
 void FakeRealtime::deauthorize(int ordinal) {
     std::lock_guard<std::mutex> lock(mu_);
     if (Session* s = byOrdinal(ordinal)) s->deauthorized = true;

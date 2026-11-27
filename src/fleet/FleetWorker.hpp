@@ -97,6 +97,10 @@ struct ApiRequest {
     // session to move: the API then names a new one.
     ServerAddr current;
     int64_t gameTokenId = 0;     // MoveSession: the session's id
+    // MoveSession: what made the session go back to the API. The call is counted
+    // under it (moveCause), so a move a realtime server asked for is told apart
+    // from one the session decided on.
+    MoveTrigger trigger = MoveTrigger::ErrorStreak;
     bool fromCrossingPath = false;
 };
 
@@ -303,6 +307,7 @@ private:
         MoveTrigger pendingTrigger = MoveTrigger::ReconnectCommand;
         bool pendingToldToMove = false;
         bool toldToMove = false;     // the move in progress was asked for by a realtime server
+        MoveTrigger moveTrigger = MoveTrigger::ErrorStreak; // what started the move in progress
         int errStreak = 0;           // session-level errors in the current two seconds
         int64_t errWindowNs = 0;
         int sendErrStreak = 0;
