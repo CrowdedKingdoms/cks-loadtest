@@ -88,6 +88,7 @@ Bot::Bot(BotSpec spec, const Shared* shared, std::shared_ptr<BotView> view)
   parseWaypoints();
   parseWanderBox();
   wander_.reset(rng_);
+  javaRng_.setSeed(javaStringHash(spec_.name));
   statusOffset_ = static_cast<int>(seedFromName(spec_.name) % static_cast<uint64_t>(kStatusTicks));
   sink_ = Journal::get().openSink(spec_.logPath);
 }
@@ -100,14 +101,9 @@ Bot::~Bot() {
 }
 
 void Bot::parseWanderBox() {
-  if (spec_.path != "wander" || spec_.waypoints.empty() || spec_.waypoints == "-") return;
-  std::stringstream in(spec_.waypoints);
-  char comma;
-  WanderBox box;
-  if (!(in >> box.minX >> comma >> box.minZ >> comma >> box.maxX >> comma >> box.maxZ)) return;
-  if (box.minX >= box.maxX || box.minZ >= box.maxZ) return;
-  box.enabled = true;
-  box_ = box;
+  // LoadWalker.parseWaypoints("wander", ...) is empty. The old rectangle mirrored the
+  // heading at a cell edge, so a bot bounced inside its server instead of walking
+  // Benjamin's heading. Rally still has its own box.
 }
 
 void Bot::parseWaypoints() {
@@ -195,6 +191,9 @@ void Bot::resetConnection() {
   needLoaded_ = false;
   haveEntityId_ = false;
   cells_.reset();
+  ground_.clear();
+  groundSeeking_ = false;
+  fallVy_ = 0;
   in_.clear();
   out_.clear();
 }
@@ -281,8 +280,49 @@ void Bot::sendEmpty(int packetId) { send(packetId, {}); }
 
 void Bot::sendAbilities() {
   // FLAG_FLYING is bit 1 (value 2). That is the bit HeightmapSnap treats as abilities.flying.
-  send(pid(SbPlay::PLAYER_ABILITIES), std::vector<uint8_t>{0x02});
+  // A wander bot that should stand sends it clear. The server grants flight to load-test
+  // names on join; leaving the bit set keeps that flight, and the snap will not pull them down.
+  abilitiesFlying_ = !groundStand();
+  uint8_t flags = abilitiesFlying_ ? static_cast<uint8_t>(0x02) : static_cast<uint8_t>(0x00);
+  send(pid(SbPlay::PLAYER_ABILITIES), std::vector<uint8_t>{flags});
   sentAbilities_ = true;
+}
+
+bool Bot::groundStand() const {
+  return spec_.path == "wander" && !rally_.active && shared_ != nullptr && !shared_->altitudeOn && !ramping_;
+}
+
+bool Bot::columnFeet(double x, double z, int& feet) const {
+  int bx = static_cast<int>(std::floor(x));
+  int bz = static_cast<int>(std::floor(z));
+  int cx = static_cast<int>(std::floor(static_cast<double>(bx) / 16.0));
+  int cz = static_cast<int>(std::floor(static_cast<double>(bz) / 16.0));
+  int lx = bx - cx * 16;
+  int lz = bz - cz * 16;
+  uint64_t key = chunkKey(cx, cz);
+  auto it = ground_.find(key);
+  if (it == ground_.end()) return false;
+  int16_t y = it->second[static_cast<size_t>(lx + lz * 16)];
+  if (y == kNoColumn) return false;
+  feet = y;
+  return true;
+}
+
+bool Bot::supportFeet(double x, double z, double& feet) const {
+  constexpr double reach = 0.3 - 1e-5;
+  int top = 0;
+  bool any = false;
+  for (double dx : {-reach, reach}) {
+    for (double dz : {-reach, reach}) {
+      int y = 0;
+      if (!columnFeet(x + dx, z + dz, y)) return false;
+      if (!any || y > top) top = y;
+      any = true;
+    }
+  }
+  if (!any) return false;
+  feet = static_cast<double>(top);
+  return true;
 }
 
 void Bot::enterPlay() {
@@ -615,6 +655,21 @@ void Bot::handlePlay(int packetId, const uint8_t* body, size_t len) {
     send(pid(SbPlay::PONG), ans.b);
     return;
   }
+  if (packetId == pid(CbPlay::LEVEL_CHUNK_WITH_LIGHT)) {
+    if (spec_.path != "wander") return;
+    ChunkGround chunk;
+    if (!readChunkGround(body, len, chunk)) return;
+    ground_[chunkKey(chunk.x, chunk.z)] = chunk.feet;
+    return;
+  }
+  if (packetId == pid(CbPlay::FORGET_LEVEL_CHUNK)) {
+    // One packed chunk position, not two ints.
+    Buf b = bufFrom(body, len);
+    int64_t packed = b.rI64();
+    if (!b.ok) return;
+    ground_.erase(static_cast<uint64_t>(packed));
+    return;
+  }
   if (packetId == pid(CbPlay::CHUNK_BATCH_FINISHED)) {
     Buf ans;
     ans.wF32(20.f);
@@ -707,6 +762,9 @@ void Bot::onRespawnPacket() {
   // server both end the same way: the next position packet is where the bot is.
   placed_ = false;
   sentAbilities_ = false;
+  ground_.clear();
+  groundSeeking_ = false;
+  fallVy_ = 0;
   needLoaded_ = true;
   // Only a bot that already has a position on this connection may fly on without a new one.
   waitPosTicks_ = connPlaced_ ? kRespawnWaitTicks : 0;
@@ -771,12 +829,22 @@ void Bot::onPosition(const uint8_t* body, size_t len) {
 
   // Pulled down from where the bot was flying: the flying bit has to go out again.
   bool yanked = placed_ && ny < y_ - 2.0;
+  double prevX = x_;
+  double prevY = y_;
+  double prevZ = z_;
+  bool wasPlaced = placed_;
   surfaceY_ = ny;
   x_ = nx;
   z_ = nz;
   // On the clearance rule the first move is the whole clearance at once, as it always was.
   // With `altitude` on, or on the way back from it, the bot climbs from here 0.4 a tick.
+  // Wander does not add clearance. A later tick moves this Y onto the heightmap.
   if (shared_->altitudeOn || ramping_) y_ = ny;
+  else if (spec_.path == "wander" && !rally_.active) {
+    // A teleport is the new start. The next wander tick falls from here onto the heightmap.
+    y_ = ny;
+    fallVy_ = 0;
+  }
   else y_ = surfaceY_ + spec_.clearance;
   if (!progressSet_) {
     progressX_ = nx;
@@ -790,6 +858,13 @@ void Bot::onPosition(const uint8_t* body, size_t len) {
     stuck_ = 0;
   }
   serverX_ = nx;
+  serverZ_ = nz;
+  serverObserved_ = true;
+  if (spec_.path == "wander" && !rally_.active) {
+    bool moved = !wasPlaced || std::fabs(nx - prevX) > 0.05 || std::fabs(nz - prevZ) > 0.05 ||
+                 std::fabs(ny - prevY) > 0.01;
+    if (moved) wanderSettle_ = 2;
+  }
   if (yanked) sentAbilities_ = false;
 
   Buf ans;
@@ -856,6 +931,11 @@ double Bot::wanderStep() const {
 }
 
 void Bot::updateY() {
+  // Wander owns its own Y in tickJavaWander. Locking it here to the last server feet Y
+  // is what left the bots floating at the spawn height while they walked.
+  if (spec_.path == "wander" && !rally_.active && !shared_->altitudeOn && !ramping_) {
+    return;
+  }
   double clearanceY = surfaceY_ + spec_.clearance;
   if (shared_->altitudeOn) {
     ramping_ = true;
@@ -866,6 +946,18 @@ void Bot::updateY() {
   } else {
     y_ = clearanceY;
   }
+}
+
+void Bot::sendWalkPose(bool onGround) {
+  Buf move;
+  move.wF64(x_);
+  move.wF64(y_);
+  move.wF64(z_);
+  move.wF32(yaw_);
+  move.wF32(0.f);
+  move.wU8(onGround ? 1 : 0);
+  send(pid(SbPlay::MOVE_PLAYER_POS_ROT), move.b);
+  sendEmpty(pid(SbPlay::CLIENT_TICK_END));
 }
 
 void Bot::sendFlyPose(bool withInput) {
@@ -889,8 +981,84 @@ void Bot::sendFlyPose(bool withInput) {
   sendEmpty(pid(SbPlay::CLIENT_TICK_END));
 }
 
+void Bot::tickJavaWander(double step) {
+  constexpr int kJumpTicks = 12;
+  constexpr double kJumpHeight = 1.25;
+  auto standY = [&](double x, double z) {
+    double feet = 0;
+    if (!shared_->altitudeOn && !ramping_ && supportFeet(x, z, feet)) return feet;
+    return surfaceY_;
+  };
+  if (jumpUnstick_ > 0) {
+    int t = kJumpTicks - jumpUnstick_;
+    int half = kJumpTicks / 2;
+    double dx = 0;
+    double dz = 0;
+    javaWanderDelta(javaWander_.yaw, step, dx, dz);
+    x_ += dx;
+    z_ += dz;
+    yaw_ = javaWander_.yaw;
+    double base = standY(x_, z_);
+    double sendY = t < half ? base + kJumpHeight * (t + 1) / static_cast<double>(half)
+                            : base + kJumpHeight * (kJumpTicks - t) / static_cast<double>(half);
+    y_ = sendY;
+    fallVy_ = 0;
+    sendWalkPose(sendY <= base + 0.001);
+    jumpUnstick_--;
+    return;
+  }
+  double dx = 0;
+  double dz = 0;
+  bool opened = javaWander_.tick(javaRng_, step, dx, dz);
+  if (opened) {
+    say(spec_.name + " heading yaw=" + std::to_string(javaWander_.yaw));
+  }
+  x_ += dx;
+  z_ += dz;
+  yaw_ = javaWander_.yaw;
+  double feet = 0;
+  bool haveFeet = !shared_->altitudeOn && !ramping_ && supportFeet(x_, z_, feet);
+  if (haveFeet) {
+    groundSeeking_ = true;
+    approachGround(y_, fallVy_, feet);
+    if (std::fabs(y_ - feet) <= 0.001) surfaceY_ = feet;
+  } else if (!shared_->altitudeOn && !ramping_ && !groundSeeking_) {
+    y_ = surfaceY_;
+    fallVy_ = 0;
+  } else if (!shared_->altitudeOn && !ramping_) {
+    fallVy_ = 0;
+  }
+  double stand = haveFeet ? feet : surfaceY_;
+  bool onGround = !shared_->altitudeOn && !ramping_ && std::fabs(y_ - stand) <= 0.001;
+  sendWalkPose(onGround);
+  if (serverObserved_) {
+    if (!wanderStallSet_) {
+      wanderStallX_ = serverX_;
+      wanderStallZ_ = serverZ_;
+      wanderStallSet_ = true;
+      wanderStallTicks_ = 0;
+    } else if (std::hypot(serverX_ - wanderStallX_, serverZ_ - wanderStallZ_) > 2.0) {
+      wanderStallX_ = serverX_;
+      wanderStallZ_ = serverZ_;
+      wanderStallTicks_ = 0;
+    } else if (++wanderStallTicks_ >= 200) {
+      x_ = serverX_;
+      z_ = serverZ_;
+      jumpUnstick_ = kJumpTicks;
+      javaWander_.yaw = nextJavaWanderYaw(javaWander_.yaw, javaRng_);
+      javaWander_.legTicks = 160 + javaRng_.nextInt(240);
+      wanderStallTicks_ = 0;
+      say(spec_.name + " wander unstick");
+    }
+  }
+}
+
 void Bot::tickWander() {
   double step = wanderStep();
+  if (javaWanderPath()) {
+    tickJavaWander(step);
+    return;
+  }
   double dx = 0;
   double dz = 0;
   bool approaching = false;
@@ -916,6 +1084,11 @@ void Bot::tickWander() {
 }
 
 void Bot::tickMotion() {
+  if (javaWanderPath() && wanderSettle_ > 0) {
+    wanderSettle_--;
+    sendEmpty(pid(SbPlay::CLIENT_TICK_END));
+    return;
+  }
   updateY();
   if (rally_.active || spec_.path == "wander") {
     tickWander();
@@ -1033,7 +1206,9 @@ void Bot::tickMotion() {
 void Bot::sayStatus() {
   statusNow_ = false;
   say(spec_.name + " phase=play placed=1 x=" + f3(x_) + " y=" + f3(y_) + " z=" + f3(z_) +
-      " walkY=" + f3(surfaceY_) + " dir=" + (direction_ > 0 ? "east" : "west") +
+      " walkY=" + f3(surfaceY_) +
+      (spec_.path == "wander" ? " path=wander heading=" + std::to_string(javaWander_.yaw) : "") +
+      " dir=" + (direction_ > 0 ? "east" : "west") +
       (escaping_ ? " lane" : "") + " east_pauses=" + std::to_string(eastPauses_) +
       " west_pauses=" + std::to_string(westPauses_) + " north_pauses=" + std::to_string(northPauses_) +
       " transfers=" + std::to_string(transfersFollowed_) + " rejoins=" + std::to_string(rejoins_) +
@@ -1083,8 +1258,12 @@ void Bot::tick() {
     return;
   }
   if (rejoinAttempts_ > 0 && ticks_ - placedAtTick_ >= kRejoinResetTicks) rejoinAttempts_ = 0;
+  if (sentAbilities_ && abilitiesFlying_ != !groundStand()) sentAbilities_ = false;
   if (!sentAbilities_) sendAbilities();
   tickMotion();
+  if (javaWanderPath() && ticks_ % 40 == 0) {
+    say(spec_.name + " wander x=" + f3(x_) + " z=" + f3(z_) + " yaw=" + std::to_string(javaWander_.yaw));
+  }
   noteCell();
   if (statusNow_ || statusDue(ticks_, statusOffset_)) sayStatus();
   settle();

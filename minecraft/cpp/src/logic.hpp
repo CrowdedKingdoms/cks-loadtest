@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -66,6 +67,43 @@ struct Wander {
   // the heading is mirrored on the edge it would cross. Outside the box the step goes
   // straight toward the nearest spot inside.
   void step(Rng& rng, const WanderBox& box, double x, double z, double stepLen, double& dx, double& dz);
+};
+
+// java.util.Random. LoadWalker seeds it with the bot name's Java String.hashCode so the
+// same name walks the same headings the Java bots walk. splitmix64 does not.
+class JavaRandom {
+ public:
+  JavaRandom() = default;
+  explicit JavaRandom(int64_t seed) { setSeed(seed); }
+  void setSeed(int64_t seed);
+  int next(int bits);
+  bool nextBoolean();
+  double nextDouble();
+  // 0 .. bound-1. `bound` must be positive.
+  int nextInt(int bound);
+
+ private:
+  uint64_t seed_ = 0;
+};
+
+// Java String.hashCode, 32-bit signed. ASCII names match a Java string of the same bytes.
+int32_t javaStringHash(std::string_view name);
+
+// Next Minecraft yaw, at least 30 and less than 180 degrees off `previous`, either way.
+// Not aimed at a coordinate. LoadWalker.nextWanderYaw.
+float nextJavaWanderYaw(float previous, JavaRandom& rng);
+
+// One unguided step. `yawDeg` is Minecraft yaw (east -90, south 0).
+void javaWanderDelta(float yawDeg, double blocksPerTick, double& dx, double& dz);
+
+// LoadWalker's wander. yaw starts at 0 and legTicks at 0, so the first tick picks a heading.
+// A leg then lasts 160 + nextInt(240) ticks: 8 s to just under 20 s.
+struct JavaWander {
+  float yaw = 0.f;
+  int legTicks = 0;
+
+  // Writes this tick's step. True when the tick opened a new heading.
+  bool tick(JavaRandom& rng, double blocksPerTick, double& dx, double& dz);
 };
 
 inline constexpr double kMaxClimbPerTick = 0.4;
@@ -138,5 +176,39 @@ struct FleetStats {
 
 // The `stats` reply, without the newline.
 std::string formatStats(const FleetStats& stats);
+
+// Overworld MOTION_BLOCKING heightmap, as ClientboundLevelChunkWithLightPacket sends it.
+// 384 blocks of world height pack into 9 bits. The stored value plus the min build height
+// (-64) is the feet Y: the first block above the surface. An empty column stores 0.
+inline constexpr int kMotionBlockingId = 4;
+inline constexpr int kHeightmapBits = 9;
+inline constexpr int kHeightmapColumns = 256;
+inline constexpr int kHeightmapLongs = 37;  // ceil(256 / (64 / 9))
+inline constexpr int kOverworldMinY = -64;
+inline constexpr int16_t kNoColumn = static_cast<int16_t>(-32768);
+
+// Feet Y of one local column, or false when `count` is not an overworld heightmap or the
+// column has no motion-blocking block.
+bool motionColumnFeet(const uint64_t* data, int count, int localX, int localZ, int& feetY);
+
+// One tick toward `feet`. Vanilla gravity downward (0.08, then * 0.98), never past `feet`.
+// Upward at most 0.4, the same step the altitude ramp uses.
+void approachGround(double& y, double& vy, double feet);
+
+// ChunkPos as FriendlyByteBuf writes it: x in the low 32 bits, z in the high 32.
+inline uint64_t chunkKey(int cx, int cz) {
+  return static_cast<uint64_t>(static_cast<uint32_t>(cx)) |
+         (static_cast<uint64_t>(static_cast<uint32_t>(cz)) << 32);
+}
+
+// MOTION_BLOCKING columns from a level-chunk-with-light body (packet id already removed).
+struct ChunkGround {
+  int x = 0;
+  int z = 0;
+  std::array<int16_t, kHeightmapColumns> feet{};
+  bool ok = false;
+};
+
+bool readChunkGround(const uint8_t* body, size_t len, ChunkGround& out);
 
 }  // namespace ckmc

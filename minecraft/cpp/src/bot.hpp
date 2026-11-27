@@ -2,11 +2,13 @@
 
 #include "logic.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -21,7 +23,7 @@ struct BotSpec {
   // seam (east/west shuttle), triangle, or wander.
   std::string path = "seam";
   // "x,y,z,side;..." for triangle. The y is not a fly height.
-  // "minX,minZ,maxX,maxZ" for wander: this bot's own box.
+  // Wander ignores this. LoadWalker does not aim a wander at a rectangle.
   std::string waypoints;
   double bps = 2.0;
   double clearance = 8.0;
@@ -130,6 +132,9 @@ class Bot {
   const Shared* shared_;
   std::shared_ptr<BotView> view_;
   Rng rng_;
+  // LoadWalker's wander: Java Random(name.hashCode()), not the rally box wander.
+  JavaRandom javaRng_{};
+  JavaWander javaWander_{};
   std::shared_ptr<LogSink> sink_;
 
   Phase phase_ = Phase::Login;
@@ -194,9 +199,29 @@ class Bot {
   double y_ = 0;
   double z_ = 0;
   double surfaceY_ = 0;
+  // Vertical speed while a wander bot is falling onto the heightmap. 0 when standing.
+  double fallVy_ = 0;
+  // True once a chunk has given this bot a place to stand, so a missing column does not
+  // pop it back up to the server Y it spawned at.
+  bool groundSeeking_ = false;
+  // The flying bit last sent. Ground wander sends it clear so the server will not keep
+  // the bot in the air.
+  bool abilitiesFlying_ = false;
+  // MOTION_BLOCKING feet Y per chunk. Missing columns are kNoColumn.
+  std::unordered_map<uint64_t, std::array<int16_t, kHeightmapColumns>> ground_;
   // Set while `altitude` is on, and afterwards until the bot is back at the clearance height.
   bool ramping_ = false;
   double serverX_ = 0;
+  double serverZ_ = 0;
+  bool serverObserved_ = false;
+  // Ticks to wait after a server position before the next wander step. LoadWalker holds 2.
+  int wanderSettle_ = 0;
+  // Recovery hop after the server position has not moved for 10 s.
+  int jumpUnstick_ = 0;
+  double wanderStallX_ = 0;
+  double wanderStallZ_ = 0;
+  bool wanderStallSet_ = false;
+  int wanderStallTicks_ = 0;
   double progressX_ = 0;
   bool progressSet_ = false;
   float yaw_ = -90.f;
@@ -238,14 +263,24 @@ class Bot {
   void settle();
   void publish();
   void sendFlyPose(bool withInput);
+  // LoadWalker's move: position and yaw, no input and no punch. onGround when the feet are on walk Y.
+  void sendWalkPose(bool onGround);
   void tickMotion();
   void tickWander();
+  void tickJavaWander(double step);
+  bool javaWanderPath() const { return spec_.path == "wander" && !rally_.active; }
   void updateY();
   void noteCell();
   void sayStatus();
   double wanderStep() const;
   const WanderBox& activeBox() const;
   void sendAbilities();
+  // path=wander, not rallied, not climbing to an altitude. Those bots stand on the ground.
+  bool groundStand() const;
+  bool columnFeet(double x, double z, int& feet) const;
+  // Highest motion-blocking feet under the bot's corners, or false while a corner's chunk
+  // is not in yet. Same reach HeightmapSnap uses (0.3).
+  bool supportFeet(double x, double z, double& feet) const;
   // Ends the bot and logs `closed: why`.
   void fail(const std::string& why);
   // The connection is gone. Schedules a rejoin when the bot has been placed and has attempts left.

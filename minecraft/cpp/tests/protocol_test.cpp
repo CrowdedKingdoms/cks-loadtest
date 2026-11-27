@@ -335,6 +335,7 @@ struct Seen {
   bool abilities = false;
   bool flyingBit = false;
   bool moveAir = false;
+  bool moveGround = false;
   bool forward = false;
   bool sprint = false;
   bool punch = false;
@@ -360,19 +361,24 @@ static void note(Seen& seen, int id, const Buf& body) {
     if (readMove(body, m)) {
       seen.moveY = m.y;
       if (m.airborne) seen.moveAir = true;
+      else seen.moveGround = true;
     }
   }
 }
 
-static void serveOne(int client, Seen& seen, bool playLongEnoughForPunch) {
+static void serveOne(int client, Seen& seen, bool playLongEnoughForPunch, bool wantAir = true) {
   Peer p;
   p.fd = client;
   JoinOptions o;
   joinWorld(p, o);
   // Ends as soon as everything was seen: about 3 s with the arm swing, well under 1 s without.
+  // Seam and altitude bots fly. A wander bot with no altitude stands: abilities with the
+  // flying bit clear, and a move that says its feet are on the ground.
   collect(p, kPatienceMs, [&](int id, Buf& body) {
     note(seen, id, body);
-    return seen.loaded && seen.accept && seen.abilities && seen.flyingBit && seen.moveAir && seen.forward &&
+    bool pose = wantAir ? (seen.flyingBit && seen.moveAir && seen.forward)
+                        : (!seen.flyingBit && seen.moveGround);
+    return seen.loaded && seen.accept && seen.abilities && pose &&
            (!playLongEnoughForPunch || (seen.sprint && seen.punch));
   });
 }
@@ -532,6 +538,200 @@ static double angleBetween(double a, double b) {
   double d = std::fabs(std::fmod(a - b, 2.0 * kPi));
   if (d > kPi) d = 2.0 * kPi - d;
   return d;
+}
+
+static void packColumn(uint64_t* data, int localX, int localZ, int raw) {
+  int index = localX + localZ * 16;
+  int per = 64 / kHeightmapBits;
+  int cell = index / per;
+  int bit = (index - cell * per) * kHeightmapBits;
+  data[cell] |= static_cast<uint64_t>(raw) << bit;
+}
+
+static Buf flatChunk(int cx, int cz, int feetY) {
+  uint64_t data[kHeightmapLongs] = {};
+  int raw = feetY - kOverworldMinY;
+  for (int lz = 0; lz < 16; lz++) {
+    for (int lx = 0; lx < 16; lx++) packColumn(data, lx, lz, raw);
+  }
+  Buf body;
+  body.wI32(cx);
+  body.wI32(cz);
+  body.wVar(1);
+  body.wVar(static_cast<uint32_t>(kMotionBlockingId));
+  body.wVar(static_cast<uint32_t>(kHeightmapLongs));
+  for (int i = 0; i < kHeightmapLongs; i++) body.wI64(static_cast<int64_t>(data[i]));
+  return body;
+}
+
+static void testGroundColumns() {
+  uint64_t data[kHeightmapLongs] = {};
+  packColumn(data, 6, 9, 128);
+  int feet = 0;
+  check(motionColumnFeet(data, kHeightmapLongs, 6, 9, feet) && feet == 64, "heightmap: column feet " + std::to_string(feet));
+  check(!motionColumnFeet(data, kHeightmapLongs, 0, 0, feet), "heightmap: an empty column is not ground");
+  Buf chunk = flatChunk(124, -4, 70);
+  ChunkGround got;
+  check(readChunkGround(chunk.b.data(), chunk.b.size(), got) && got.ok && got.x == 124 && got.z == -4,
+        "heightmap: chunk was not read");
+  check(got.feet[6 + 9 * 16] == 70, "heightmap: packed feet " + std::to_string(got.feet[6 + 9 * 16]));
+  check(chunkKey(124, -4) == (static_cast<uint64_t>(static_cast<uint32_t>(124)) |
+                              (static_cast<uint64_t>(static_cast<uint32_t>(-4)) << 32)),
+        "heightmap: chunk key packs x low and z high");
+
+  double y = 90;
+  double vy = 0;
+  approachGround(y, vy, 84);
+  check(y < 90 && y > 84, "ground: a drop starts falling, y=" + std::to_string(y));
+  for (int i = 0; i < 80 && std::fabs(y - 84) > 1e-6; i++) approachGround(y, vy, 84);
+  check(y == 84 && vy == 0, "ground: the fall stops on the surface, y=" + std::to_string(y));
+  y = 40;
+  vy = 0;
+  approachGround(y, vy, 64);
+  check(std::fabs(y - 40.4) < 1e-9, "ground: a climb is 0.4, y=" + std::to_string(y));
+}
+
+// A wander bot given a chunk stands on that motion-blocking surface, and does not
+// keep the flying bit that would stop the server from agreeing.
+static void testWanderLands() {
+  int port = 0;
+  int lst = listenEphemeral(port);
+  Fleet fleet(1);
+  fleet.start();
+  BotSpec spec;
+  spec.name = "Ground1";
+  spec.host = "127.0.0.1";
+  spec.port = port;
+  spec.path = "wander";
+  spec.bps = 2;
+  spec.clearance = 8;
+  spec.maxSeconds = 30;
+  spec.logPath = "/dev/null";
+  fleet.add(spec);
+
+  Peer p;
+  p.fd = acceptWithin(lst, kPatienceMs);
+  if (p.fd < 0) fail("ground: no connection");
+  JoinOptions o;
+  o.x = 8.5;
+  o.y = 100.0;
+  o.z = 8.5;
+  joinWorld(p, o);
+  sendPacket(p, pid(CbPlay::LEVEL_CHUNK_WITH_LIGHT), flatChunk(0, 0, 64));
+
+  bool flying = false;
+  bool landed = false;
+  double lowest = 1000;
+  collect(p, kPatienceMs, [&](int id, Buf& body) {
+    if (id == pid(SbPlay::PLAYER_ABILITIES) && !body.b.empty() && (body.b[0] & 0x02)) flying = true;
+    Move m;
+    if (id == pid(SbPlay::MOVE_PLAYER_POS_ROT) && readMove(body, m)) {
+      if (m.y < lowest) lowest = m.y;
+      if (std::fabs(m.y - 64.0) < 1e-6 && !m.airborne) landed = true;
+    }
+    return landed;
+  });
+  check(!flying, "ground: wander sent the flying bit");
+  check(landed, "ground: did not stand on the heightmap, lowest y=" + std::to_string(lowest));
+
+  fleet.stopAll();
+  fleet.stop();
+  ::close(p.fd);
+  ::close(lst);
+}
+
+static void testJavaWander() {
+  check(javaStringHash("Load1") == 73590763, "java hash Load1");
+  check(javaStringHash("") == 0, "java hash empty");
+  JavaRandom rng(javaStringHash("Load1"));
+  JavaWander w;
+  double x = 2000.5;
+  double z = 2000.5;
+  const double step = 0.1;
+  const double wantX[5] = {2000.4803908604342, 2000.4607817208685, 2000.4411725813027, 2000.421563441737,
+                           2000.4019543021711};
+  const double wantZ[5] = {2000.4019414376737, 2000.3038828753474, 2000.2058243130211, 2000.1077657506949,
+                           2000.0097071883686};
+  for (int t = 0; t < 5; t++) {
+    double dx = 0;
+    double dz = 0;
+    bool opened = w.tick(rng, step, dx, dz);
+    x += dx;
+    z += dz;
+    if (t == 0) {
+      check(opened, "java wander: the first tick opens a heading");
+      check(std::fabs(w.yaw - 168.69151f) < 0.001f, "java wander: first yaw " + std::to_string(w.yaw));
+    } else {
+      check(!opened, "java wander: the leg holds");
+    }
+    check(std::fabs(x - wantX[t]) < 1e-6 && std::fabs(z - wantZ[t]) < 1e-6,
+          "java wander: step " + std::to_string(t) + " at " + std::to_string(x) + " " + std::to_string(z));
+  }
+  check(w.legTicks == 288, "java wander: leg ticks left " + std::to_string(w.legTicks));
+  JavaRandom turns(7);
+  float yaw = 0.f;
+  bool past90 = false;
+  for (int i = 0; i < 40; i++) {
+    float next = nextJavaWanderYaw(yaw, turns);
+    float turn = std::fabs(next - yaw);
+    if (turn > 180.f) turn = 360.f - turn;
+    check(turn + 1e-3f >= 30.f, "java wander: turn " + std::to_string(turn));
+    if (turn > 90.f) past90 = true;
+    yaw = next;
+  }
+  check(past90, "java wander: a turn can be more than 90 degrees");
+}
+
+static void testGround() {
+  uint64_t data[kHeightmapLongs] = {};
+  auto put = [&](int lx, int lz, int raw) {
+    int index = lx + lz * 16;
+    int per = 64 / kHeightmapBits;
+    int cell = index / per;
+    int bit = (index - cell * per) * kHeightmapBits;
+    data[cell] |= static_cast<uint64_t>(raw) << bit;
+  };
+  put(3, 5, 156);
+  int feet = 0;
+  check(motionColumnFeet(data, kHeightmapLongs, 3, 5, feet) && feet == 92,
+        "ground: column feet " + std::to_string(feet));
+  check(!motionColumnFeet(data, kHeightmapLongs, 0, 0, feet), "ground: an empty column is not ground");
+  check(!motionColumnFeet(data, 3, 3, 5, feet), "ground: a short heightmap is ignored");
+
+  double y = 100;
+  double vy = 0;
+  bool sank = false;
+  for (int i = 0; i < 400; i++) {
+    double prev = y;
+    approachGround(y, vy, 64);
+    if (y < prev - 1e-9) sank = true;
+    check(y + 1e-6 >= 64.0, "ground: fell through the floor to " + std::to_string(y));
+  }
+  check(sank, "ground: did not fall");
+  check(std::fabs(y - 64.0) < 1e-6 && vy == 0.0, "ground: landed at " + std::to_string(y));
+  approachGround(y, vy, 64);
+  check(std::fabs(y - 64.0) < 1e-6, "ground: did not stay down");
+
+  y = 64;
+  vy = 1;
+  approachGround(y, vy, 66);
+  check(std::fabs(y - 64.4) < 1e-9 && vy == 0.0, "ground: step up " + std::to_string(y));
+
+  Buf body;
+  body.wI32(4);
+  body.wI32(-2);
+  body.wVar(2);
+  body.wVar(1);
+  body.wVar(1);
+  body.wI64(0);
+  body.wVar(static_cast<uint32_t>(kMotionBlockingId));
+  body.wVar(static_cast<uint32_t>(kHeightmapLongs));
+  for (int i = 0; i < kHeightmapLongs; i++) body.wI64(static_cast<int64_t>(data[i]));
+  ChunkGround chunk;
+  check(readChunkGround(body.b.data(), body.b.size(), chunk), "ground: chunk parsed");
+  check(chunk.ok && chunk.x == 4 && chunk.z == -2, "ground: chunk coords");
+  check(chunk.feet[static_cast<size_t>(3 + 5 * 16)] == 92, "ground: stored feet");
+  check(chunk.feet[0] == kNoColumn, "ground: empty stored as none");
 }
 
 static void testWander() {
@@ -879,9 +1079,8 @@ static void testSurvival() {
   for (size_t i = 1; i < moves.size(); i++) {
     check(std::fabs(moves[i].y - moves[i - 1].y) <= 0.4 + 1e-9, "survival: climbed more than 0.4 in one tick");
     check(moves[i].airborne, "survival: on the ground");
-  }
-  for (const Move& m : moves) {
-    check(m.x >= 1985 && m.x <= 1995 && m.z >= -60 && m.z <= -50, "survival: left its own box");
+    double dist = std::hypot(moves[i].x - moves[i - 1].x, moves[i].z - moves[i - 1].z);
+    check(std::fabs(dist - 0.1) < 1e-6, "survival: wander step " + std::to_string(dist));
   }
   // 64.4, 64.8, ... 70.0 is fifteen moves, and four more at 70 make the five that end the wait.
   check(moves.size() >= 19, "survival: the 6-block climb took " + std::to_string(moves.size() - 4) + " moves, not 15");
@@ -950,8 +1149,8 @@ static void testSurvival() {
   check(moves.front().y <= 64.4 + 1e-9, "survival: after the respawn the climb starts from the server Y");
   for (size_t i = 1; i < moves.size(); i++) {
     check(std::fabs(moves[i].y - moves[i - 1].y) <= 0.4 + 1e-9, "survival: climbed more than 0.4 after the respawn");
-    // 55 blocks east of its box: every step goes back west.
-    check(moves[i].x < moves[i - 1].x, "survival: outside its box the bot flies straight back");
+    double dist = std::hypot(moves[i].x - moves[i - 1].x, moves[i].z - moves[i - 1].z);
+    check(std::fabs(dist - 0.1) < 1e-6, "survival: wander step after respawn " + std::to_string(dist));
   }
 
   // A respawn packet with no death. The keep-alive answer marks the point the bot has read it.
@@ -1014,7 +1213,7 @@ static void testSurvival() {
   check(journalCount("Surv1 crossed c1559->c1560") == 1, "survival: the crossed line");
   check(journalCount("Surv1 respawn packet, waiting for a position") == 2, "survival: the respawn packet lines");
   check(journalCount("Surv1 no position after respawn, flying on") == 1, "survival: the fly-on line");
-  check(journalCount("Surv1 box 1985.0000 -60.0000 1995.0000 -50.0000") == 1, "survival: the box line");
+  check(journalCount("Surv1 box off") == 1, "survival: wander has no box");
 
   fleet.stopAll();
   waitFor([&] { return fleet.stats().closed == 1; }, kPatienceMs, "survival: stop-all");
@@ -1328,8 +1527,8 @@ static void testBasics() {
     noDelay(c);
     servers.emplace_back([c, &joined] {
       Seen local;
-      serveOne(c, local, false);
-      if (local.moveAir && local.flyingBit) joined.fetch_add(1);
+      serveOne(c, local, false, false);
+      if (local.moveGround && local.abilities && !local.flyingBit) joined.fetch_add(1);
       ::close(c);
     });
   }
@@ -1366,6 +1565,10 @@ int main(int argc, char** argv) {
   if (wanted("unit")) {
     testControlLines();
     testStatsFormat();
+    testGroundColumns();
+    testWanderLands();
+    testJavaWander();
+    testGround();
     testWander();
     testAltitudeRamp();
     testRejoinBackoff();
