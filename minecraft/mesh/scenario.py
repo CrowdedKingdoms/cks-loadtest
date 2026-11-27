@@ -14,7 +14,14 @@ logs. The steps' notes drive it as they drive the mod's own runner: "note client
 here that joins the west server (port 25599) or the east one (25600), "note expect <user> <seconds> <text>" wants that
 text in the client's log in time, "note done" ends a side. Shots and bursts are skipped (no screen is assumed). A
 scenario that starts or stops a server, or asks for the admin tool, is refused before anything is sent: a mesh under
-load is not restarted for a test.
+load is not restarted for a test. With --pair, a scenario whose .args set identity=fake is refused too.
+
+    scenario.py --pair pair.json --tests <mod>/tools/cluster-tests --scenario handoff --west test-mc-p5-4 --east test-mc-p5-5 --names Tester1=A,Tester2=B --no-home --client-script ...
+
+--pair is one rebuilt pair, not a mesh. The json names dir, log and steps, and each server's id, ssh, host and port.
+The client joins that port. The 25599 in a step only chooses the west side. Do not commit the json: it holds addresses.
+The seam pair is not on Tailscale, so --pair connects with ordinary ssh (CK_SSH_KEY, or the cluster key if that file exists).
+A mesh --run still uses tailscale ssh.
 
 A wait a server's script gave up on ("not met after") is a miss; the scenario passes with none, both sides done.
 Prints one JSON line and exits 0 on a pass.
@@ -30,11 +37,26 @@ import time
 from pathlib import Path
 
 REMOTE_DIR = "/opt/mc-mesh"
+REMOTE_LOG = "/opt/mc-mesh/server.log"
+REMOTE_STEPS = "/opt/mc-mesh/steps.txt"
 UNSUPPORTED = ("start", "stop", "append", "admin")
+PAIR = False
 
 
 def ssh(server, command, timeout=60, input=None):
-    result = subprocess.run(["tailscale", "ssh", f"ubuntu@{server['ssh']}", command], capture_output=True, text=True, timeout=timeout, input=input)
+    # Mesh hosts are on Tailscale. The seam pair is not, so --pair uses ordinary ssh to the address the caller put in the json.
+    if PAIR:
+        key = os.environ.get("CK_SSH_KEY")
+        if not key:
+            fallback = Path.home() / ".local/state/cks-test-mc-cluster/id_ed25519"
+            key = str(fallback) if fallback.is_file() else None
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"]
+        if key:
+            argv += ["-i", key]
+        argv += [f"ubuntu@{server.get('ssh') or server.get('host')}", command]
+    else:
+        argv = ["tailscale", "ssh", f"ubuntu@{server['ssh']}", command]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input)
     if result.returncode != 0:
         raise RuntimeError(f"{server['id']}: {result.stderr.strip()[-300:] or result.stdout.strip()[-300:]}")
     return result.stdout
@@ -83,12 +105,43 @@ def shift_z(line, dz, unshifted):
     return " ".join(words)
 
 
+# On this pair the line is block x 2000 and the margin is 8. A teleport to 2012 crossed.
+# A step aimed at 2009 did not. Coordinates already at or past 2012 stay. Coordinates still
+# west of the margin (below 2008), including the band the handoff scenario stands in, stay.
+CROSS_X = 2012
+CROSS_FROM = 2008
+CROSS_PAIRS = PAIRS | {"drive"}
+
+
+def nudge_cross_x(line, nudged):
+    """Land a step that means cross east at x 2012, the teleport that crossed on this pair."""
+    words = line.split(" ")
+    kind = words[0] if words[0] != "console" else " ".join(words[:2])
+    step = 3 if kind in TRIPLES else 2 if kind in CROSS_PAIRS else 0
+    if not step:
+        return line
+    i = 0
+    while i < len(words):
+        if NUMBER.match(words[i]) and 1880 <= float(words[i]) <= 2300:
+            at = i + step - 1
+            if at < len(words) and all(NUMBER.match(w) for w in words[i:at + 1]):
+                x = float(words[i])
+                if CROSS_FROM <= x < CROSS_X:
+                    was = words[i]
+                    words[i] = str(CROSS_X) if "." not in was else f"{float(CROSS_X):.1f}"
+                    nudged.append(f"{was} -> {words[i]}")
+                i = at + 1
+                continue
+        i += 1
+    return " ".join(words)
+
+
 def follow(server, offset, pattern, seconds):
     """The first line of the server's log past that offset that matches, or None after that long."""
     until = time.time() + seconds
     while time.time() < until:
         try:
-            text = ssh(server, f"tail -c +{offset + 1} {REMOTE_DIR}/server.log | grep -a -E '{pattern}' | head -3")
+            text = ssh(server, f"tail -c +{offset + 1} {REMOTE_LOG} | grep -a -E '{pattern}' | head -3")
         except (RuntimeError, subprocess.TimeoutExpired):
             text = ""
         if text.strip():
@@ -112,8 +165,8 @@ def home(mesh, sides, names, seconds):
     west = sides["west"]
     spot_x, spot_z = home_spot(west)
     token = time.strftime("%H%M%S")
-    offset = int(ssh(west, f"stat -c %s {REMOTE_DIR}/server.log").strip())
-    ssh(west, f"cat >> {REMOTE_DIR}/steps.txt", input="\n".join([f"client {name} 25599" for name in names] + ["wait 15", f"note joined {token}"]) + "\n")
+    offset = int(ssh(west, f"stat -c %s {REMOTE_LOG}").strip())
+    ssh(west, f"cat >> {REMOTE_STEPS}", input="\n".join([f"client {name} 25599" for name in names] + ["wait 15", f"note joined {token}"]) + "\n")
     if follow(west, offset, f"note joined {token}", 90) is None:
         return f"{west['id']} did not start the test players' clients (its script may be busy with an earlier scenario)"
     moves = []
@@ -123,7 +176,7 @@ def home(mesh, sides, names, seconds):
 
     def move(server):
         try:
-            ssh(server, f"cat >> {REMOTE_DIR}/steps.txt", input="\n".join(moves) + "\n")
+            ssh(server, f"cat >> {REMOTE_STEPS}", input="\n".join(moves) + "\n")
         except (RuntimeError, subprocess.TimeoutExpired):
             pass
 
@@ -133,7 +186,7 @@ def home(mesh, sides, names, seconds):
     for i, name in enumerate(names):
         steps += [f"client {name} 25599", f"?home {name} {spot_x + 2 * i} {spot_z}", "wait 2", f"quit {name}", f"?gone {name}", f"?released {name}"]
     steps += ["waitlimit 120", f"note homed {token}"]
-    ssh(west, f"cat >> {REMOTE_DIR}/steps.txt", input="\n".join(steps) + "\n")
+    ssh(west, f"cat >> {REMOTE_STEPS}", input="\n".join(steps) + "\n")
     line = follow(west, offset, f"note homed {token}|not met after", seconds * len(names) + 120)
     if line is None:
         return f"{west['id']} did not finish putting {', '.join(names)} home"
@@ -144,7 +197,8 @@ def home(mesh, sides, names, seconds):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run", required=True)
+    p.add_argument("--run", help="a mesh run directory (mesh.json). Not used with --pair")
+    p.add_argument("--pair", help="json for one seam pair: dir, log, steps, and servers with id, ssh, host, port")
     p.add_argument("--tests", required=True, help="the mod's tools/cluster-tests folder")
     p.add_argument("--scenario", required=True)
     p.add_argument("--west", required=True, help="the id of the server west of the line")
@@ -159,12 +213,31 @@ def main():
     p.add_argument("--no-home", action="store_true", help="do not put the scenario's test players on the west server first")
     p.add_argument("--home-seconds", type=int, default=40)
     args = p.parse_args()
+    if not args.run and not args.pair:
+        p.error("name a mesh --run or a seam --pair")
 
-    run = Path(args.run)
-    mesh = json.loads((run / "mesh.json").read_text())
-    by_id = {s["id"]: s for s in mesh["servers"]}
+    global REMOTE_DIR, REMOTE_LOG, REMOTE_STEPS, PAIR
+    if args.pair:
+        PAIR = True
+        pair = json.loads(Path(args.pair).read_text())
+        REMOTE_DIR = pair.get("dir", "/opt/mc")
+        REMOTE_LOG = pair.get("log", f"{REMOTE_DIR}/logs/latest.log")
+        REMOTE_STEPS = pair.get("steps", f"{REMOTE_DIR}/steps.txt")
+        by_id = {s["id"]: s for s in pair["servers"]}
+        mesh = {"servers": pair["servers"]}
+        run = Path(args.out).parent if args.out else Path(args.pair).resolve().parent
+    else:
+        run = Path(args.run)
+        mesh = json.loads((run / "mesh.json").read_text())
+        by_id = {s["id"]: s for s in mesh["servers"]}
     sides = {"west": by_id[args.west], "east": by_id[args.east]}
+    for server in sides.values():
+        server.setdefault("port", 25565 if args.pair else server.get("port"))
     tests = Path(args.tests)
+    args_file = tests / f"{args.scenario}.args"
+    if args.pair and args_file.exists() and re.search(r"(?m)^identity=fake\b", args_file.read_text()):
+        print(json.dumps({"scenario": args.scenario, "result": "refused", "why": "identity=fake is the in-memory CK, not this fabric"}))
+        return 2
     out = Path(args.out) if args.out else run / "scenarios" / args.scenario
     out.mkdir(parents=True, exist_ok=True)
     token = time.strftime("r%H%M%S")
@@ -203,6 +276,70 @@ def main():
         else:
             for side in steps:
                 steps[side] = [re.sub(r"\bTester([0-9]+)\b", rf"{args.names}\1", line) for line in steps[side]]
+    if args.pair:
+        # The step's 25599 or 25600 chooses the side. On this pair the headless client joins that side's own port,
+        # and ?client waits for the same port. A "note client" line is left as it is: the runner reads 25600 as east.
+        for side in steps:
+            join = str(sides[side].get("port") or 25565)
+            rewritten = []
+            for line in steps[side]:
+                words = line.split()
+                if words and words[0] in ("client", "?client") and len(words) >= 3 and words[2] in ("25599", "25600"):
+                    words[2] = join
+                    line = " ".join(words)
+                rewritten.append(line)
+            steps[side] = rewritten
+        # This pair's east chunks start at block x 2000. A cross has to finish at 2012, as handoff's
+        # teleport did. 2008 and 2009 are still short of that. The step files stay written for the
+        # local cluster; only this pair's copy of a step moves.
+        nudged = []
+        for side in steps:
+            steps[side] = [nudge_cross_x(line, nudged) for line in steps[side]]
+        # A real viewer is started only by "note client". The other named player, on seen and
+        # busysignin, joins from this server as the headless client now that a country is set.
+        lead = "Tester1"
+        if args.names:
+            lead = dict(pair.split("=", 1) for pair in args.names.split(",")).get("Tester1", "Tester1") if "=" in args.names else args.names + "1"
+        started_names = set()
+        for lines in steps.values():
+            for line in lines:
+                words = line.split()
+                if len(words) >= 2 and words[0] == "note" and words[1] == "client":
+                    started_names.add(words[3] if len(words) > 3 else lead)
+                elif words and words[0] == "client" and len(words) > 1:
+                    started_names.add(words[1])
+        mentioned = set()
+        for lines in steps.values():
+            mentioned.update(re.findall(r"\b(?:Tester[0-9]+|Seam[A-Za-z0-9]+)\b", "\n".join(lines)))
+
+        def arrival_index(lines, name):
+            for i, line in enumerate(lines):
+                words = line.split()
+                if words and words[0] == "?arrived" and name in words:
+                    return i
+            return None
+
+        def on_index(lines, name):
+            for i, line in enumerate(lines):
+                words = line.split()
+                if words and words[0] == "?on" and name in words:
+                    return i
+            return None
+
+        for name in sorted(mentioned - started_names):
+            ons = {side: on_index(lines, name) for side, lines in steps.items()}
+            present = [side for side, index in ons.items() if index is not None]
+            if not present:
+                continue
+            if len(present) == 1:
+                side = present[0]
+            else:
+                fresh = [side for side in present if (arrival := arrival_index(steps[side], name)) is None or arrival > ons[side]]
+                side = fresh[0] if len(fresh) == 1 else present[0]
+            port = str(sides[side].get("port") or 25565)
+            steps[side] = [f"client {name} {port}"] + steps[side]
+    else:
+        nudged = []
     for side, lines in steps.items():
         for line in lines:
             words = line.split()
@@ -227,9 +364,9 @@ def main():
             return 2
 
     # Where each log stands now: only what comes after belongs to this run.
-    offset = {side: int(ssh(server, f"stat -c %s {REMOTE_DIR}/server.log").strip()) for side, server in sides.items()}
+    offset = {side: int(ssh(server, f"stat -c %s {REMOTE_LOG}").strip()) for side, server in sides.items()}
     for side, server in sides.items():
-        ssh(server, f"cat >> {REMOTE_DIR}/steps.txt", input="\n".join(steps[side]) + "\n")
+        ssh(server, f"cat >> {REMOTE_STEPS}", input="\n".join(steps[side]) + "\n")
 
     first_player = "Tester1"
     if args.names:
@@ -258,7 +395,7 @@ def main():
         while time.time() - started < args.timeout and len(done) < len(sides):
             for side, server in sides.items():
                 try:
-                    text = ssh(server, f"tail -c +{offset[side] + 1} {REMOTE_DIR}/server.log | head -c 4000000")
+                    text = ssh(server, f"tail -c +{offset[side] + 1} {REMOTE_LOG} | head -c 4000000")
                 except (RuntimeError, subprocess.TimeoutExpired):
                     continue
                 offset[side] += len(text.encode("utf-8", errors="replace"))
@@ -314,11 +451,11 @@ def main():
         # What is left of it would hold the pair's scripts until every wait had run out.
         for server in sides.values():
             try:
-                ssh(server, f"echo abort >> {REMOTE_DIR}/steps.txt")
+                ssh(server, f"echo abort >> {REMOTE_STEPS}")
             except (RuntimeError, subprocess.TimeoutExpired):
                 pass
     record = {"scenario": args.scenario, "west": args.west, "east": args.east, "result": "pass" if not misses else "fail", "seconds": seconds,
-              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "shiftZ": args.shift_z, "unshifted": unshifted[:20], "stepsThatFailed": len(noted), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
+              "steps": {side: len(lines) for side, lines in steps.items()}, "misses": misses[:20], "dropped": dropped, "shiftZ": args.shift_z, "unshifted": unshifted[:20], "nudgedX": nudged[:20], "stepsThatFailed": len(noted), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started))}
     (out / "result.json").write_text(json.dumps(record, indent=1) + "\n")
     print(json.dumps(record))
     return 0 if not misses else 1
