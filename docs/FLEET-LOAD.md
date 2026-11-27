@@ -43,7 +43,8 @@ A passing run shows six things about the population it carried:
 2. No crossing lost a player.
 3. The Application API received no call because of a crossing.
 4. During the measured phase the API received no call at all, apart from refreshes
-   that fell due (a player's app token, a session's 24 hours).
+   that fell due (a player's app token, a session's 24 hours) and the refreshes a
+   realtime server asked for when it told a session to move.
 5. No server was sent state that one of its own carried players sent, while the
    `FLEET_OWN_STATE` capability was off.
 6. Every communication arrived inside a `FLEET_DELIVERY`.
@@ -347,8 +348,8 @@ The exit code is 0 when all seven hold:
    `players.not_carried_at_end` and `players.refused_for_good` are 0.
 2. No crossing lost a player: `crossings.lost` and `crossings.unaccounted` are 0.
 3. No API call was made because of a crossing: `api.calls_caused_by_crossing` is 0.
-4. No API call in the measured phase was anything but a refresh that fell due:
-   `api.calls_in_measured_phase_other` is 0.
+4. No API call in the measured phase was anything but a refresh that fell due or a
+   refresh a realtime server asked for: `api.calls_in_measured_phase_other` is 0.
 5. No session received an update it sent itself:
    `own_state.sent_by_the_receiving_session.total` is 0, unless you ran with
    `--own-state`. An update another session sent for a player the receiver carries
@@ -376,16 +377,30 @@ under `refused` below). `proof.nothing_refused` says whether the run saw any ref
   ended.
 - **Every call has a cause.** `api.calls_by_cause` splits the calls into setup,
   teardown, session moves, session keeps, token refreshes, and sign-ins again. A
-  request raised while a crossing is being handled is counted under `crossing`, and
-  that count fails the run.
-- **The measured phase is counted on its own.** `api.calls_in_measured_phase` is every
-  call made while the players crossed. `api.calls_in_measured_phase_refreshes_due` is
-  the part that refreshed a player's app token or kept a session's 24 hours. In a
-  30-minute run that part is about 3,000 `refreshAppToken` calls, one for each
-  player's token. `api.calls_in_measured_phase_other` is the rest and must be 0. A
-  session that a realtime server told to move, and a player who had to sign in again,
-  each make a call that lands there: the run then fails, and `fail_reasons` names the
-  cause.
+  session move has five causes, one for each entry of `sessions.moves_by_trigger`:
+  `session_move_reconnect_command`, `session_move_session_released`,
+  `session_move_rx_silence`, `session_move_send_errors` and
+  `session_move_error_streak`. A request raised while a crossing is being handled is
+  counted under `crossing`, and that count fails the run.
+- **The measured phase is counted on its own, in three parts.**
+  `api.calls_in_measured_phase` is every call made while the players crossed.
+  1. `api.calls_in_measured_phase_refreshes_due` is the part that refreshed a
+     player's app token or kept a session's 24 hours. In a 30-minute run that part is
+     about 3,000 `refreshAppToken` calls, one for each player's token.
+  2. `api.calls_in_measured_phase_refreshes_asked_by_a_server` is the
+     `refreshFleetSession` calls a realtime server asked for: it sent the session a
+     reconnect command, it released the session with a reason, or it went silent for
+     `--rx-silent-s`. A realtime server that leaves the fleet tells every session it
+     serves to reconnect, so a tier that scales in during a run shows one call here
+     for each of that server's sessions. The session is doing what the contract
+     says, and these calls do not fail a run.
+  3. `api.calls_in_measured_phase_other` is the rest and must be 0. A player who had
+     to sign in again lands there, and so does a session that went back to the API on
+     its own account (its sends were refused, or its messages were refused in a
+     streak): the run then fails, and `fail_reasons` names the cause.
+
+  Read the second part before you compare two runs. A run with calls there was
+  measured on a fleet that changed size while it ran.
 
 ## The summary, number by number
 
@@ -411,7 +426,7 @@ The headline numbers in one object:
 | `crossings_attempted`, `crossings_completed`, `crossings_lost`, `crossings_per_s` | Crossings, and the rate achieved over the measured phase |
 | `crossing_plan` | `carry` or `release-first` |
 | `carry_retries` | `FLEET_CARRY` sent again, plus carries started again after giving up |
-| `api_calls_in_measured_phase`, `api_calls_in_measured_phase_refreshes_due`, `api_calls_in_measured_phase_other`, `api_calls_caused_by_crossing` | The API calls made while the players crossed |
+| `api_calls_in_measured_phase`, `api_calls_in_measured_phase_refreshes_due`, `api_calls_in_measured_phase_refreshes_asked_by_a_server`, `api_calls_in_measured_phase_other`, `api_calls_caused_by_crossing` | The API calls made while the players crossed |
 | `hmac_failures` | Datagrams, notifications, and fleet frames whose HMAC failed |
 | `unauthorized_answers` | `UNAUTHORIZED` error messages received |
 | `refused`, `nothing_refused` | Carries refused, `UNAUTHORIZED` answers, other errors, their total, and whether the total is 0 |
@@ -691,6 +706,7 @@ missing here.
 | `calls`, `calls_by_kind`, `calls_by_cause` | Every HTTP request to the Application API, including retries |
 | `calls_in_measured_phase`, `calls_in_measured_phase_by_kind`, `calls_in_measured_phase_by_cause` | The calls made while the players crossed |
 | `calls_in_measured_phase_refreshes_due` | Of those, token refreshes and session keeps |
+| `calls_in_measured_phase_refreshes_asked_by_a_server` | Of those, `refreshFleetSession` calls made because a realtime server sent a reconnect command, released the session, or went silent. They do not fail a run |
 | `calls_in_measured_phase_other` | The rest. Must be 0 |
 | `platform_busy_by_kind`, `rate_limited_by_kind`, `failures_by_kind` | Answers that were retried, and calls that failed |
 | `calls_caused_by_crossing` | Must be 0 |

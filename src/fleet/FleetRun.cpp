@@ -275,7 +275,7 @@ void FleetRun::onApiRequest(const ApiRequest& r) {
         j.kind = Job::Kind::MoveSession;
         j.current = r.current;
         j.gameTokenId = r.gameTokenId;
-        j.cause = ApiCause::SessionMove;
+        j.cause = moveCause(r.trigger);
     } else {
         j.kind = Job::Kind::SignInAgain;
         j.cause = ApiCause::SignInAgain;
@@ -751,35 +751,35 @@ int FleetRun::run() {
     }
     // And its wider form: while the players crossed, the API was called for
     // nothing but the refreshes that fell due (a player's app token, a session's
-    // 24 hours). Anything else is named, so the reader can see what it was.
-    {
+    // 24 hours) and the refreshes a realtime server asked for (it told a session
+    // to reconnect, released it, or went silent: a server that leaves the fleet
+    // tells every session it serves to reconnect, and the session calls
+    // refreshFleetSession, as the contract says). Anything else is named, so the
+    // reader can see what it was.
+    const MeasuredPhaseCalls inPhase = measuredPhaseCalls(stats_.api);
+    if (inPhase.other != 0) {
         std::string what;
-        uint64_t other = 0;
         for (int c = 0; c < ApiCounters::C; ++c) {
             const ApiCause cause = static_cast<ApiCause>(c);
-            if (cause == ApiCause::TokenRefresh || cause == ApiCause::SessionKeep) continue;
+            if (apiCallClass(cause) != ApiCallClass::Other) continue;
             const uint64_t n = get(stats_.api.duringWindowByCause[static_cast<size_t>(c)]);
             if (!n) continue;
-            other += n;
             what += (what.empty() ? "" : ", ") + std::to_string(n) + " for " + apiCauseName(cause);
         }
-        if (other != 0) {
-            failures.push_back(std::to_string(other) +
-                               " Application API call(s) in the measured phase were not "
-                               "refreshes that fell due: " + what);
-        }
+        failures.push_back(std::to_string(inPhase.other) +
+                           " Application API call(s) in the measured phase were neither "
+                           "refreshes that fell due nor refreshes a realtime server asked for: " +
+                           what);
     }
     if (log_ && ranWindow) {
-        const uint64_t inPhase = sum(stats_.api.duringWindow);
-        const uint64_t due =
-            get(stats_.api.duringWindowByCause[static_cast<size_t>(ApiCause::TokenRefresh)]) +
-            get(stats_.api.duringWindowByCause[static_cast<size_t>(ApiCause::SessionKeep)]);
         std::fprintf(log_,
                      "[fleet] Application API calls in the measured phase: %" PRIu64
-                     " (refreshes that fell due: %" PRIu64 ", anything else: %" PRIu64
-                     ", because of a crossing: %" PRIu64 ") over %" PRIu64 " crossings\n",
-                     inPhase, due, inPhase - due, crossingCalls,
-                     crossingsAtWindowEnd_ - crossingsAtWindowStart_);
+                     " (refreshes that fell due: %" PRIu64
+                     ", refreshes a realtime server asked for: %" PRIu64
+                     ", anything else: %" PRIu64 ", because of a crossing: %" PRIu64
+                     ") over %" PRIu64 " crossings\n",
+                     inPhase.total, inPhase.refreshesDue, inPhase.askedByServer, inPhase.other,
+                     crossingCalls, crossingsAtWindowEnd_ - crossingsAtWindowStart_);
     }
     if (get(stats_.plainCommunications) > 0) {
         failures.push_back(std::to_string(get(stats_.plainCommunications)) +
@@ -1200,18 +1200,17 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         windowCauses[apiCauseName(static_cast<ApiCause>(c))] =
             get(st.api.duringWindowByCause[static_cast<size_t>(c)]);
     }
-    const uint64_t refreshesDue =
-        get(st.api.duringWindowByCause[static_cast<size_t>(ApiCause::TokenRefresh)]) +
-        get(st.api.duringWindowByCause[static_cast<size_t>(ApiCause::SessionKeep)]);
+    const MeasuredPhaseCalls inPhase = measuredPhaseCalls(st.api);
     j["api"] = {
         {"calls", st.api.total()},
         {"calls_by_kind", kinds},
         {"calls_by_cause", causes},
-        {"calls_in_measured_phase", sum(st.api.duringWindow)},
+        {"calls_in_measured_phase", inPhase.total},
         {"calls_in_measured_phase_by_kind", window},
         {"calls_in_measured_phase_by_cause", windowCauses},
-        {"calls_in_measured_phase_refreshes_due", refreshesDue},
-        {"calls_in_measured_phase_other", sum(st.api.duringWindow) - refreshesDue},
+        {"calls_in_measured_phase_refreshes_due", inPhase.refreshesDue},
+        {"calls_in_measured_phase_refreshes_asked_by_a_server", inPhase.askedByServer},
+        {"calls_in_measured_phase_other", inPhase.other},
         {"platform_busy_by_kind", busy},
         {"rate_limited_by_kind", limited},
         {"failures_by_kind", failed},
@@ -1272,9 +1271,10 @@ void FleetRun::buildSummary(int exitCode, const std::vector<std::string>& failur
         {"crossings_per_s", rate(crossingsAtWindowEnd_, crossingsAtWindowStart_)},
         {"crossing_plan", cfg_.releaseFirst ? "release-first" : "carry"},
         {"carry_retries", get(st.carryResends) + get(st.carryRetries)},
-        {"api_calls_in_measured_phase", sum(st.api.duringWindow)},
-        {"api_calls_in_measured_phase_refreshes_due", refreshesDue},
-        {"api_calls_in_measured_phase_other", sum(st.api.duringWindow) - refreshesDue},
+        {"api_calls_in_measured_phase", inPhase.total},
+        {"api_calls_in_measured_phase_refreshes_due", inPhase.refreshesDue},
+        {"api_calls_in_measured_phase_refreshes_asked_by_a_server", inPhase.askedByServer},
+        {"api_calls_in_measured_phase_other", inPhase.other},
         {"api_calls_caused_by_crossing",
          st.api.byCause(ApiCause::Crossing) + get(st.api.requestsFromCrossingPath)},
         {"hmac_failures", hmacFailures},

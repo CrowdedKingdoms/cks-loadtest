@@ -227,7 +227,9 @@ void runChecks() {
     }
     {
         // A session told to move and a sign-in that ends: both are handled, and
-        // both are API calls in the measured phase, so the run does not pass.
+        // both are API calls in the measured phase. The move is a refresh a
+        // realtime server asked for and is counted apart; the sign-in again is
+        // what fails the run.
         bool moved = false, ended = false;
         const FakeRunResult r = runAgainstFake(
             cfg, FakeRealtime::Options{}, stop, nullptr, [&](double t, FakeRealtime& fake) {
@@ -253,10 +255,18 @@ void runChecks() {
         check(s["players"]["signed_in_again"].get<uint64_t>() == 1 &&
                   s["players"]["not_carried_at_end"].get<int>() == 0,
               "faults: an ended sign-in was signed in again, and everyone was carried at the end");
+        const uint64_t signInsAgain =
+            s["api"]["calls_in_measured_phase_by_cause"]["sign_in_again"].get<uint64_t>();
+        check(s["api"]["calls_in_measured_phase_refreshes_asked_by_a_server"].get<uint64_t>() == 1 &&
+                  s["api"]["calls_in_measured_phase_refreshes_due"].get<uint64_t>() == 0 &&
+                  s["api"]["calls_in_measured_phase_other"].get<uint64_t>() == signInsAgain &&
+                  signInsAgain >= 1,
+              "faults: the move is counted as a refresh a realtime server asked for, apart from the sign-in again");
         check(r.exitCode == 1 && s["fail_reasons"].size() == 1 &&
-                  s["api"]["calls_in_measured_phase_other"].get<uint64_t>() >= 2 &&
+                  s["fail_reasons"][0].get<std::string>().find("sign_in_again") != std::string::npos &&
+                  s["fail_reasons"][0].get<std::string>().find("session_move") == std::string::npos &&
                   s["api"]["calls_caused_by_crossing"].get<uint64_t>() == 0,
-              "faults: those API calls in the measured phase are counted and fail the run; none was for a crossing");
+              "faults: the sign-in again fails the run, the move does not, and none was for a crossing");
     }
     {
         FakeRealtime::Options broken;

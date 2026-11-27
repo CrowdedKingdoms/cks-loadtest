@@ -638,6 +638,7 @@ void FleetWorker::sweep(int64_t now) {
             r.index = s.index;
             if (!s.toldToMove) r.current = s.info.server;
             r.gameTokenId = s.info.gameTokenId;
+            r.trigger = s.moveTrigger; // the same move, asked again
             requestApi(r);
         }
     }
@@ -992,6 +993,7 @@ void FleetWorker::requestMove(Session& s, MoveTrigger trigger, int64_t now, bool
     s.state = Session::State::Moving;
     s.moveRetryAtNs = 0;
     s.toldToMove = toldToMove;
+    s.moveTrigger = trigger;
     ApiRequest r;
     r.kind = ApiRequest::Kind::MoveSession;
     r.index = s.index;
@@ -999,6 +1001,7 @@ void FleetWorker::requestMove(Session& s, MoveTrigger trigger, int64_t now, bool
     // Otherwise name it, and the session stays if the API still has it serve the app.
     if (!toldToMove) r.current = s.info.server;
     r.gameTokenId = s.info.gameTokenId;
+    r.trigger = trigger;
     requestApi(r);
 }
 

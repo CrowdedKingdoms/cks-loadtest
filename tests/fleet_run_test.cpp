@@ -298,7 +298,10 @@ void testFaults() {
     check(u(s["api"]["calls_by_kind"]["refreshFleetSession"]) == 2 && r.apiRefreshSession == 2 &&
               r.apiRefreshSessionWithoutServer == 2,
           "faults: refreshFleetSession once for each, leaving currentServer out so the API names a new one");
-    check(u(s["api"]["calls_by_cause"]["session_move"]) == 2, "faults: counted as session moves");
+    check(u(s["api"]["calls_by_cause"]["session_move_reconnect_command"]) == 1 &&
+              u(s["api"]["calls_by_cause"]["session_move_session_released"]) == 1 &&
+              !s["api"]["calls_by_cause"].contains("session_move"),
+          "faults: each is counted under what the realtime server sent to ask for the move");
     check(u(s["carries"]["carried_by_cause"]["session_move"]) > 0,
           "faults: a moved session carried its players again");
 
@@ -325,23 +328,189 @@ void testFaults() {
     check(u(s["api"]["calls"]) == r.apiCalls, "faults: the client counted every call the API answered");
     check(u(s["api"]["calls_caused_by_crossing"]) == 0 && u(s["crossings"]["completed"]) > 0,
           "faults: still no API call because of a crossing");
+    const uint64_t signInsAgain = u(s["api"]["calls_in_measured_phase_by_cause"]["sign_in_again"]);
     check(u(s["api"]["calls_in_measured_phase_by_kind"]["refreshFleetSession"]) == 2 &&
               u(s["api"]["calls_in_measured_phase_by_kind"]["mintManagedPlayerToken"]) >= 1 &&
-              u(s["api"]["calls_in_measured_phase_by_cause"]["session_move"]) == 2 &&
-              u(s["api"]["calls_in_measured_phase_by_cause"]["sign_in_again"]) >= 1 &&
-              u(s["api"]["calls_in_measured_phase_refreshes_due"]) == 0 &&
-              u(s["api"]["calls_in_measured_phase_other"]) >= 3,
+              u(s["api"]["calls_in_measured_phase_by_cause"]["session_move_reconnect_command"]) == 1 &&
+              u(s["api"]["calls_in_measured_phase_by_cause"]["session_move_session_released"]) == 1 &&
+              signInsAgain >= 1,
           "faults: the calls in the measured phase are the two moves and the one sign-in again");
-    bool named = false;
+    check(u(s["api"]["calls_in_measured_phase_refreshes_due"]) == 0 &&
+              u(s["api"]["calls_in_measured_phase_refreshes_asked_by_a_server"]) == 2 &&
+              u(s["api"]["calls_in_measured_phase_other"]) == signInsAgain,
+          "faults: the two moves are refreshes a realtime server asked for, and the sign-in again is the rest");
+    bool named = false, blamedTheMoves = false;
     for (const auto& why : s["fail_reasons"]) {
         const std::string text = why.get<std::string>();
         named = named || (text.find("measured phase") != std::string::npos &&
-                          text.find("session_move") != std::string::npos &&
-                          text.find("sign_in_again") != std::string::npos);
+                          text.find(std::to_string(signInsAgain) + " for sign_in_again") != std::string::npos);
+        blamedTheMoves = blamedTheMoves || text.find("session_move") != std::string::npos;
     }
-    check(r.exitCode == 1 && s["fail_reasons"].size() == 1 && named,
-          "faults: API calls in the measured phase that are not refreshes fail the run, and are named");
+    check(r.exitCode == 1 && s["fail_reasons"].size() == 1 && named && !blamedTheMoves,
+          "faults: the sign-in again fails the run and is named; the moves a server asked for do not");
     dumpOnFailure(r, before);
+}
+
+void testAServerLeavesTheFleet() {
+    std::atomic<bool> stop{false};
+    {
+        // A realtime server that leaves the fleet tells every fleet session it
+        // serves to reconnect, and each calls refreshFleetSession, as the contract
+        // says. On the dev tier a scale-in did that to 24 sessions in the middle of
+        // a run, and the run failed on calls that were the client behaving
+        // correctly. They are counted apart, and the run passes.
+        const int before = g_failures;
+        FleetConfig cfg = base();
+        cfg.crossRate = 6;
+        cfg.dryRunS = 3.0;
+        char* captured = nullptr;
+        size_t capturedLen = 0;
+        FILE* log = open_memstream(&captured, &capturedLen);
+        int step = 0;
+        const FakeRunResult r =
+            runAgainstFake(cfg, FakeRealtime::Options{}, stop, log, [&](double t, FakeRealtime& fake) {
+                if (step == 0 && t > 0.3) {
+                    ++step;
+                    for (int ordinal : {1, 4, 7}) fake.tellSessionToMove(ordinal, false, 0); // COMMAND_RECONNECT
+                } else if (step == 1 && t > 0.6) {
+                    ++step;
+                    fake.tellSessionToMove(2, true, 4); // COMMAND_SESSION_RELEASED, rebalance
+                }
+            });
+        std::fclose(log);
+        const std::string logged(captured ? captured : "", capturedLen);
+        std::free(captured);
+        const json& s = r.summary;
+        const json& api = s["api"];
+        check(step == 2 && u(s["sessions"]["moves_by_trigger"]["reconnect_command"]) == 3 &&
+                  u(s["sessions"]["moves_by_trigger"]["session_released"]) == 1 &&
+                  u(s["sessions"]["came_back_to_another_server"]) == 4,
+              "leaving: three sessions were told to reconnect and one was released, and all four moved");
+        check(u(api["calls_in_measured_phase_by_kind"]["refreshFleetSession"]) == 4 && r.apiRefreshSession == 4 &&
+                  u(api["calls_in_measured_phase_by_cause"]["session_move_reconnect_command"]) == 3 &&
+                  u(api["calls_in_measured_phase_by_cause"]["session_move_session_released"]) == 1,
+              "leaving: refreshFleetSession once for each, counted under what the server sent");
+        check(u(api["calls_in_measured_phase"]) == 4 &&
+                  u(api["calls_in_measured_phase_refreshes_asked_by_a_server"]) == 4 &&
+                  u(api["calls_in_measured_phase_refreshes_due"]) == 0 &&
+                  u(api["calls_in_measured_phase_other"]) == 0,
+              "leaving: the summary reports the three classes: 0 due, 4 a server asked for, 0 anything else");
+        check(u(s["proof"]["api_calls_in_measured_phase"]) == 4 &&
+                  u(s["proof"]["api_calls_in_measured_phase_refreshes_asked_by_a_server"]) == 4 &&
+                  u(s["proof"]["api_calls_in_measured_phase_refreshes_due"]) == 0 &&
+                  u(s["proof"]["api_calls_in_measured_phase_other"]) == 0,
+              "leaving: the proof section reports the same three");
+        check(logged.find("refreshes that fell due: 0, refreshes a realtime server asked for: 4, "
+                          "anything else: 0, because of a crossing: 0") != std::string::npos,
+              "leaving: the log line reports the three classes");
+        check(r.exitCode == 0 && s["pass"] == true && s["fail_reasons"].empty(),
+              "leaving: refreshes a realtime server asked for do not fail the run");
+        check(s["players"]["not_carried_at_end"] == 0 && s["crossings"]["lost"] == 0 &&
+                  u(api["calls_caused_by_crossing"]) == 0 && u(s["crossings"]["completed"]) > 0 &&
+                  u(s["carries"]["carried_by_cause"]["session_move"]) > 0,
+              "leaving: every player was carried again on the new servers, and no crossing made a call");
+        dumpOnFailure(r, before);
+    }
+    {
+        // A server that goes away without a word: the session hears nothing for
+        // --rx-silent-s and asks the API. Counted as the server's doing as well.
+        const int before = g_failures;
+        FleetConfig cfg = base();
+        cfg.crossRate = 6;
+        cfg.dryRunS = 3.0;
+        cfg.rxSilentS = 1;
+        bool done = false;
+        const FakeRunResult r =
+            runAgainstFake(cfg, FakeRealtime::Options{}, stop, nullptr, [&](double t, FakeRealtime& fake) {
+                if (!done && t > 0.3) {
+                    done = true;
+                    fake.goSilent(5);
+                }
+            });
+        const json& s = r.summary;
+        const json& api = s["api"];
+        const uint64_t silent = u(api["calls_in_measured_phase_by_cause"]["session_move_rx_silence"]);
+        check(done && u(s["sessions"]["moves_by_trigger"]["rx_silence"]) >= 1 && silent >= 1 &&
+                  u(s["sessions"]["came_back_to_another_server"]) >= 1,
+              "silence: a session whose server stopped answering asked the API and came back on another");
+        check(u(api["calls_in_measured_phase_refreshes_asked_by_a_server"]) == silent &&
+                  u(api["calls_in_measured_phase_by_kind"]["refreshFleetSession"]) == silent &&
+                  u(api["calls_in_measured_phase_other"]) == 0 && r.exitCode == 0 && s["fail_reasons"].empty(),
+              "silence: its refresh is counted with those a server asked for, and the run passes");
+        check(s["players"]["not_carried_at_end"] == 0 && s["crossings"]["lost"] == 0,
+              "silence: every player was carried again");
+        dumpOnFailure(r, before);
+    }
+    {
+        // What a session decides on its own account is still the third class: a
+        // session whose token is refused in a streak asks the API to authorize it
+        // again, and that call fails the run beside a drain's, which does not.
+        const int before = g_failures;
+        FleetConfig cfg = base();
+        cfg.crossRate = 6;
+        cfg.dryRunS = 3.0;
+        int step = 0;
+        const FakeRunResult r =
+            runAgainstFake(cfg, FakeRealtime::Options{}, stop, nullptr, [&](double t, FakeRealtime& fake) {
+                if (step == 0 && t > 0.3) {
+                    ++step;
+                    fake.tellSessionToMove(4, false, 0); // COMMAND_RECONNECT
+                } else if (step == 1 && t > 0.6) {
+                    ++step;
+                    fake.deauthorize(3); // INVALID_TOKEN until the API refreshes the session
+                }
+            });
+        const json& s = r.summary;
+        const json& api = s["api"];
+        check(step == 2 && u(s["sessions"]["moves_by_trigger"]["reconnect_command"]) == 1 &&
+                  u(s["sessions"]["moves_by_trigger"]["error_streak"]) == 1 &&
+                  u(api["calls_in_measured_phase_by_cause"]["session_move_error_streak"]) == 1,
+              "own move: one session was told to reconnect and another gave up on a streak of errors");
+        check(u(api["calls_in_measured_phase"]) == 2 &&
+                  u(api["calls_in_measured_phase_refreshes_asked_by_a_server"]) == 1 &&
+                  u(api["calls_in_measured_phase_refreshes_due"]) == 0 &&
+                  u(api["calls_in_measured_phase_other"]) == 1,
+              "own move: the three classes are 0 due, 1 a server asked for, 1 anything else");
+        bool named = false, blamedTheServer = false;
+        for (const auto& why : s["fail_reasons"]) {
+            const std::string text = why.get<std::string>();
+            named = named || (text.find("1 Application API call(s) in the measured phase") != std::string::npos &&
+                              text.find("1 for session_move_error_streak") != std::string::npos);
+            blamedTheServer = blamedTheServer || text.find("reconnect_command") != std::string::npos;
+        }
+        check(r.exitCode == 1 && s["fail_reasons"].size() == 1 && named && !blamedTheServer,
+              "own move: the run fails on the session's own move alone, and names it");
+        dumpOnFailure(r, before);
+    }
+    {
+        // Due refreshes and a drain in one run: each in its own count, and the
+        // run passes.
+        const int before = g_failures;
+        FleetConfig cfg = base();
+        cfg.dryRunS = 4.5;
+        cfg.tokenRefreshLeadS = 2;
+        FakeRealtime::Options opt;
+        opt.playerTokenTtlMs = 4000; // a player's token lasts 4 s here, so it is refreshed in the run
+        bool done = false;
+        const FakeRunResult r = runAgainstFake(cfg, opt, stop, nullptr, [&](double t, FakeRealtime& fake) {
+            if (!done && t > 3.6) {
+                done = true;
+                for (int ordinal : {0, 8}) fake.tellSessionToMove(ordinal, false, 0);
+            }
+        });
+        const json& s = r.summary;
+        const json& api = s["api"];
+        const uint64_t due = u(api["calls_in_measured_phase_refreshes_due"]);
+        check(done && due > 0 && due == u(api["calls_in_measured_phase_by_kind"]["refreshAppToken"]) &&
+                  u(api["calls_in_measured_phase_refreshes_asked_by_a_server"]) == 2 &&
+                  u(api["calls_in_measured_phase_by_kind"]["refreshFleetSession"]) == 2 &&
+                  u(api["calls_in_measured_phase_other"]) == 0 &&
+                  u(api["calls_in_measured_phase"]) == due + 2,
+              "both: the due refreshes and the drain's are each in their own count, and they add up");
+        check(r.exitCode == 0 && s["fail_reasons"].empty() && s["players"]["not_carried_at_end"] == 0,
+              "both: the run passes");
+        dumpOnFailure(r, before);
+    }
 }
 
 void testLoss() {
@@ -938,7 +1107,7 @@ void testOrgTokenOwnsItsSessions() {
               kept.server == session.server,
           "org token: the token that opened it refreshes it, on the same server");
     const FleetSessionInfo moved =
-        opener.refreshFleetSession(session.gameTokenId, ServerAddr{}, ApiCause::SessionMove);
+        opener.refreshFleetSession(session.gameTokenId, ServerAddr{}, ApiCause::MoveReconnectCommand);
     check(!(moved.server == session.server), "org token: with no current server named, the answer names a new one");
     check(opener.closeFleetSession(session.gameTokenId, ApiCause::Teardown) && fake.openSessions() == 0,
           "org token: the token that opened it closes it");
@@ -1223,6 +1392,7 @@ void testSecretsStayOut() {
 int main() {
     testCleanRun();
     testFaults();
+    testAServerLeavesTheFleet();
     testLoss();
     testTokenRefresh();
     testAroundATokenRefresh();

@@ -96,6 +96,7 @@ public:
     // `player` is the n of fleet-load-<n>.
     void tellSessionToMove(int ordinal, bool sessionReleased, uint8_t reason);
     void sendLegacyReconnect(int ordinal);  // a valid 22, though the session's control is bound
+    void goSilent(int ordinal);             // the server stops answering the session, without a word
     void deauthorize(int ordinal);          // the token must be refreshed; the carries stand
     void endSignIn(int player);             // FLEET_RELEASED reason 2 to whoever carries the player
     void idleRelease(int player);           // FLEET_RELEASED reason 5
