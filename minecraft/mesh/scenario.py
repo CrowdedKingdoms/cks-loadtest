@@ -277,13 +277,14 @@ def main():
             for side in steps:
                 steps[side] = [re.sub(r"\bTester([0-9]+)\b", rf"{args.names}\1", line) for line in steps[side]]
     if args.pair:
-        # The step's 25599 or 25600 chooses the side. On this pair the headless client joins that side's own port.
+        # The step's 25599 or 25600 chooses the side. On this pair the headless client joins that side's own port,
+        # and ?client waits for the same port. A "note client" line is left as it is: the runner reads 25600 as east.
         for side in steps:
             join = str(sides[side].get("port") or 25565)
             rewritten = []
             for line in steps[side]:
                 words = line.split()
-                if words and words[0] == "client" and len(words) >= 3 and words[2] in ("25599", "25600"):
+                if words and words[0] in ("client", "?client") and len(words) >= 3 and words[2] in ("25599", "25600"):
                     words[2] = join
                     line = " ".join(words)
                 rewritten.append(line)
