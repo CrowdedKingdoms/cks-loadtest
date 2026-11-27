@@ -294,6 +294,49 @@ def main():
         nudged = []
         for side in steps:
             steps[side] = [nudge_cross_x(line, nudged) for line in steps[side]]
+        # A real viewer is started only by "note client". The other named player, on seen and
+        # busysignin, joins from this server as the headless client now that a country is set.
+        lead = "Tester1"
+        if args.names:
+            lead = dict(pair.split("=", 1) for pair in args.names.split(",")).get("Tester1", "Tester1") if "=" in args.names else args.names + "1"
+        started_names = set()
+        for lines in steps.values():
+            for line in lines:
+                words = line.split()
+                if len(words) >= 2 and words[0] == "note" and words[1] == "client":
+                    started_names.add(words[3] if len(words) > 3 else lead)
+                elif words and words[0] == "client" and len(words) > 1:
+                    started_names.add(words[1])
+        mentioned = set()
+        for lines in steps.values():
+            mentioned.update(re.findall(r"\b(?:Tester[0-9]+|Seam[A-Za-z0-9]+)\b", "\n".join(lines)))
+
+        def arrival_index(lines, name):
+            for i, line in enumerate(lines):
+                words = line.split()
+                if words and words[0] == "?arrived" and name in words:
+                    return i
+            return None
+
+        def on_index(lines, name):
+            for i, line in enumerate(lines):
+                words = line.split()
+                if words and words[0] == "?on" and name in words:
+                    return i
+            return None
+
+        for name in sorted(mentioned - started_names):
+            ons = {side: on_index(lines, name) for side, lines in steps.items()}
+            present = [side for side, index in ons.items() if index is not None]
+            if not present:
+                continue
+            if len(present) == 1:
+                side = present[0]
+            else:
+                fresh = [side for side in present if (arrival := arrival_index(steps[side], name)) is None or arrival > ons[side]]
+                side = fresh[0] if len(fresh) == 1 else present[0]
+            port = str(sides[side].get("port") or 25565)
+            steps[side] = [f"client {name} {port}"] + steps[side]
     else:
         nudged = []
     for side, lines in steps.items():
